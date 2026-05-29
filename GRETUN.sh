@@ -310,15 +310,13 @@ gre_create_tunnel() {
   echo "Remote GRE IP: $REMOTE_GRE_IP"
 
   if [ "$interactive" -eq 1 ]; then
-    if confirm_default_yes "Save this GRE tunnel configuration?"; then
-      gre_save_config
-    else
-      echo "Configuration not saved."
-    fi
-
-    if [ -f "$(gre_config_file "$TUNNEL_ID")" ]; then
-      if confirm_default_yes "Install/start persistent systemd service for GRE tunnel $TUNNEL_ID?"; then
-        gre_install_service "$TUNNEL_ID" || echo "Failed to install GRE service."
+    # Fewer questions: save and enable persistence automatically.
+    gre_save_config
+    if [ -f "$(gre_config_file "$TUNNEL_ID")" ] && command -v systemctl >/dev/null 2>&1; then
+      if gre_install_service "$TUNNEL_ID"; then
+        echo "GRE persistence enabled for $(gre_service_name "$TUNNEL_ID")."
+      else
+        echo "Failed to enable GRE persistence. Tunnel is currently created, but it may not survive reboot." >&2
       fi
     fi
   fi
@@ -503,8 +501,8 @@ EOF_SERVICE
   fi
 
   systemctl daemon-reload
-  systemctl enable --now "$(gre_service_name "$id")"
-  echo "GRE service installed and started ($(gre_service_name "$id"))"
+  systemctl enable "$(gre_service_name "$id")"
+  echo "GRE service installed and enabled for boot ($(gre_service_name "$id"))"
 }
 
 gre_service_start() {
@@ -555,6 +553,26 @@ wg_service_name() {
   echo "wg-quick@$(wg_iface_name "$1").service"
 }
 
+validate_wg_public_key() {
+  local key="${1:-}"
+  # WireGuard public keys are base64 strings, usually 44 chars ending with '='.
+  [[ "$key" =~ ^[A-Za-z0-9+/]{43}=$ ]]
+}
+
+wg_print_service_failure() {
+  local id="$1"
+  local svc
+  svc="$(wg_service_name "$id")"
+  echo "WireGuard service failed to start: $svc" >&2
+  echo "Useful debug commands:" >&2
+  echo "  systemctl status $svc --no-pager -l" >&2
+  echo "  journalctl -xeu $svc --no-pager" >&2
+  echo >&2
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl status "$svc" --no-pager -l 2>/dev/null || true
+  fi
+}
+
 wg_print_ip_plan() {
   local id="$1"
   local port
@@ -576,21 +594,16 @@ wg_ensure_tools() {
     return 0
   fi
 
-  echo "WireGuard tools are not installed."
-  if confirm_default_yes "Install wireguard/wireguard-tools now?"; then
-    if command -v apt-get >/dev/null 2>&1; then
-      apt-get update
-      DEBIAN_FRONTEND=noninteractive apt-get install -y wireguard wireguard-tools iproute2 iptables
-    elif command -v dnf >/dev/null 2>&1; then
-      dnf install -y wireguard-tools iproute iptables
-    elif command -v yum >/dev/null 2>&1; then
-      yum install -y wireguard-tools iproute iptables
-    else
-      echo "No supported package manager found. Install WireGuard manually and run the script again." >&2
-      return 1
-    fi
+  echo "WireGuard tools are not installed. Installing automatically..."
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y wireguard wireguard-tools iproute2 iptables
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y wireguard-tools iproute iptables
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y wireguard-tools iproute iptables
   else
-    echo "WireGuard installation skipped." >&2
+    echo "No supported package manager found. Install WireGuard manually and run the script again." >&2
     return 1
   fi
 
@@ -815,10 +828,17 @@ wg_create_tunnel() {
   echo
 
   if [ -z "$REMOTE_WG_PUBLIC_KEY" ]; then
-    echo "Remote public key is empty. Metadata/key files can be saved now, but the tunnel cannot start until peer key is entered."
+    echo "Remote public key is empty. Metadata/key files will be saved, but the tunnel cannot start until the peer key is entered."
     wg_save_meta
+    echo
     echo "Run this script on the other server, copy its public key, then run this WireGuard config again and paste the key."
+    echo "Nothing was started yet, so no broken wg-quick service will be created."
     return 0
+  fi
+
+  if ! validate_wg_public_key "$REMOTE_WG_PUBLIC_KEY"; then
+    echo "Invalid WireGuard public key format. It should be a 44-character base64 public key ending with '='." >&2
+    return 1
   fi
 
   wg_write_config "$TUNNEL_ID"
@@ -830,20 +850,22 @@ wg_create_tunnel() {
     iptables -C OUTPUT -p udp -d "$REMOTE_PUBLIC_IP" --dport "$REMOTE_WG_PORT" -j ACCEPT 2>/dev/null || iptables -A OUTPUT -p udp -d "$REMOTE_PUBLIC_IP" --dport "$REMOTE_WG_PORT" -j ACCEPT
   fi
 
-  wg-quick down "$WG_IFACE" >/dev/null 2>&1 || true
-  wg-quick up "$WG_IFACE"
+  # Start through one path only. Prefer systemd for persistence; otherwise use wg-quick directly.
+  if command -v systemctl >/dev/null 2>&1; then
+    if wg_install_service "$TUNNEL_ID"; then
+      echo "[OK] WireGuard tunnel created and started as $WG_IFACE"
+    else
+      wg_print_service_failure "$TUNNEL_ID"
+      return 1
+    fi
+  else
+    wg-quick down "$WG_IFACE" >/dev/null 2>&1 || true
+    wg-quick up "$WG_IFACE"
+    echo "[OK] WireGuard tunnel created and started as $WG_IFACE"
+  fi
 
-  echo "[OK] WireGuard tunnel created as $WG_IFACE"
   echo "Local WG IP : $LOCAL_WG_IP"
   echo "Remote WG IP: $REMOTE_WG_IP"
-
-  if [ "$interactive" -eq 1 ]; then
-    if command -v systemctl >/dev/null 2>&1; then
-      if confirm_default_yes "Enable/start persistent WireGuard service $(wg_service_name "$TUNNEL_ID")?"; then
-        wg_install_service "$TUNNEL_ID" || echo "Failed to enable WireGuard service."
-      fi
-    fi
-  fi
 }
 
 wg_menu_config_tunnel() {
@@ -863,27 +885,20 @@ wg_menu_config_tunnel() {
     return
   fi
 
-  local default_local_port default_remote_port
-  default_local_port="$(wg_default_port "$TUNNEL_ID")"
-  read -rp "Local UDP ListenPort [$default_local_port]: " LOCAL_WG_PORT
-  LOCAL_WG_PORT="${LOCAL_WG_PORT:-$default_local_port}"
-  if ! [[ "$LOCAL_WG_PORT" =~ ^[0-9]+$ ]] || [ "$LOCAL_WG_PORT" -lt 1 ] || [ "$LOCAL_WG_PORT" -gt 65535 ]; then
-    echo "Invalid local UDP port."
-    return
-  fi
+  # Fewer questions: ports and AllowedIPs are generated from the tunnel number.
+  # Tunnel N uses UDP 51800+N on both sides and allows only the peer /32 by default.
+  LOCAL_WG_PORT="$(wg_default_port "$TUNNEL_ID")"
+  REMOTE_WG_PORT="$LOCAL_WG_PORT"
+  EXTRA_ALLOWED_IPS=""
 
-  default_remote_port="$LOCAL_WG_PORT"
-  read -rp "Remote UDP endpoint port [$default_remote_port]: " REMOTE_WG_PORT
-  REMOTE_WG_PORT="${REMOTE_WG_PORT:-$default_remote_port}"
-  if ! [[ "$REMOTE_WG_PORT" =~ ^[0-9]+$ ]] || [ "$REMOTE_WG_PORT" -lt 1 ] || [ "$REMOTE_WG_PORT" -gt 65535 ]; then
-    echo "Invalid remote UDP port."
-    return
-  fi
-
+  echo
+  echo "Auto WireGuard values for tunnel $TUNNEL_ID:"
+  echo "  Local UDP ListenPort : $LOCAL_WG_PORT"
+  echo "  Remote endpoint port : $REMOTE_WG_PORT"
+  echo "  AllowedIPs           : peer /32 only"
   echo
   echo "If you do not have the remote WireGuard public key yet, leave this empty."
   read -rp "Enter REMOTE WireGuard public key: " REMOTE_WG_PUBLIC_KEY
-  read -rp "Optional extra AllowedIPs through this tunnel, comma-separated (leave empty for only peer /32): " EXTRA_ALLOWED_IPS
   echo
 
   wg_create_tunnel 1 || echo "WireGuard tunnel creation failed"
@@ -953,6 +968,7 @@ wg_status_check() {
 
 wg_install_service() {
   local id="${1:-${TUNNEL_ID:-}}"
+  local ifc svc
   if ! validate_tunnel_id "$id"; then
     echo "Cannot enable WireGuard service: invalid tunnel number" >&2
     return 1
@@ -965,9 +981,23 @@ wg_install_service() {
     echo "WireGuard config not found: $(wg_config_file "$id")" >&2
     return 1
   fi
+
+  ifc="$(wg_iface_name "$id")"
+  svc="$(wg_service_name "$id")"
   systemctl daemon-reload
-  systemctl enable --now "$(wg_service_name "$id")"
-  echo "WireGuard service enabled and started ($(wg_service_name "$id"))"
+
+  # Avoid the previous bug: if wg-quick already created the interface, systemd start fails.
+  # Bring only this WireGuard interface down first, then let systemd own it.
+  wg-quick down "$ifc" >/dev/null 2>&1 || true
+  ip link delete "$ifc" 2>/dev/null || true
+
+  systemctl enable "$svc" || return 1
+  if systemctl restart "$svc"; then
+    echo "WireGuard service enabled and started ($svc)"
+    return 0
+  fi
+
+  return 1
 }
 
 wg_remove_firewall_rules() {
