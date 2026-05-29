@@ -1,9 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + WireGuard multi-tunnel manager
+# GRE + WireGuard multi-tunnel manager v5
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
+# - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -132,6 +133,26 @@ gre_print_ip_plan() {
   echo "  GRE key         : $id"
   echo "  Iran role IP    : 10.10.$id.1/30"
   echo "  Kharej role IP  : 10.10.$id.2/30"
+}
+
+gre_inner_ip_for_role() {
+  local id="$1"
+  local role="$2"
+  if [ "$role" = "1" ]; then
+    echo "10.10.$id.1"
+  else
+    echo "10.10.$id.2"
+  fi
+}
+
+gre_remote_inner_ip_for_role() {
+  local id="$1"
+  local role="$2"
+  if [ "$role" = "1" ]; then
+    echo "10.10.$id.2"
+  else
+    echo "10.10.$id.1"
+  fi
 }
 
 gre_save_config() {
@@ -549,6 +570,23 @@ wg_default_port() {
   echo $((51800 + id))
 }
 
+wg_transport_iface() {
+  local id="$1"
+  echo "gre$id"
+}
+
+wg_default_public_endpoint_ip() {
+  printf '%s' "${REMOTE_PUBLIC_IP:-}"
+}
+
+wg_auto_endpoint_ip() {
+  if [ "${WG_ENDPOINT_MODE:-public}" = "gre" ]; then
+    printf '%s' "${WG_ENDPOINT_IP:-}"
+  else
+    wg_default_public_endpoint_ip
+  fi
+}
+
 wg_service_name() {
   echo "wg-quick@$(wg_iface_name "$1").service"
 }
@@ -595,6 +633,7 @@ wg_print_ip_plan() {
   echo "  Default UDP port: $port"
   echo "  Iran role IP    : 10.20.$id.1/30"
   echo "  Kharej role IP  : 10.20.$id.2/30"
+  echo "  GRE fallback    : if gre$id is already up, WireGuard will auto-use 10.10.$id.x as its endpoint"
   echo
   echo "GRE uses 10.10.N.x and greN. WireGuard uses 10.20.N.x and wgtunN, so they do not conflict."
 }
@@ -658,12 +697,17 @@ wg_save_meta() {
     write_var TUNNEL_ID "$TUNNEL_ID"
     write_var WG_IFACE "$WG_IFACE"
     write_var ROLE "$ROLE"
+    write_var SERVER_ROLE "${SERVER_ROLE:-}"
     write_var LOCAL_PUBLIC_IP "$LOCAL_PUBLIC_IP"
     write_var REMOTE_PUBLIC_IP "$REMOTE_PUBLIC_IP"
     write_var LOCAL_WG_IP "$LOCAL_WG_IP"
     write_var REMOTE_WG_IP "$REMOTE_WG_IP"
     write_var LOCAL_WG_PORT "$LOCAL_WG_PORT"
     write_var REMOTE_WG_PORT "$REMOTE_WG_PORT"
+    write_var WG_ENDPOINT_MODE "${WG_ENDPOINT_MODE:-public}"
+    write_var WG_ENDPOINT_IP "${WG_ENDPOINT_IP:-${REMOTE_PUBLIC_IP:-}}"
+    write_var WG_TRANSPORT_IFACE "${WG_TRANSPORT_IFACE:-}"
+    write_var WG_MTU "${WG_MTU:-1420}"
     write_var REMOTE_WG_PUBLIC_KEY "$REMOTE_WG_PUBLIC_KEY"
     write_var WG_PENDING "${WG_PENDING:-0}"
     write_var EXTRA_ALLOWED_IPS "$EXTRA_ALLOWED_IPS"
@@ -719,7 +763,7 @@ wg_collect_ids() {
 
 wg_list_tunnels() {
   echo "WireGuard tunnels:"
-  local ids id ifc meta conf service_state remote port local_ip peer_state link_state
+  local ids id ifc meta conf service_state remote port local_ip peer_state link_state endpoint_mode endpoint_ip
   ids="$(wg_collect_ids || true)"
   if [ -z "$ids" ]; then
     echo "  none"
@@ -733,12 +777,16 @@ wg_list_tunnels() {
     conf="$(wg_config_file "$id")"
     service_state="not-installed"
     remote="unknown"
+    endpoint_mode="public"
+    endpoint_ip="unknown"
     port="$(wg_default_port "$id")"
     local_ip="unknown"
     peer_state="peer-key: unknown"
 
     if wg_load_meta "$id"; then
       remote="${REMOTE_PUBLIC_IP:-unknown}"
+      endpoint_mode="${WG_ENDPOINT_MODE:-public}"
+      endpoint_ip="${WG_ENDPOINT_IP:-${REMOTE_PUBLIC_IP:-unknown}}"
       port="${LOCAL_WG_PORT:-$port}"
       local_ip="${LOCAL_WG_IP:-unknown}"
       if [ -n "${REMOTE_WG_PUBLIC_KEY:-}" ]; then
@@ -762,17 +810,27 @@ wg_list_tunnels() {
     else
       link_state="inactive"
     fi
-    echo "  - tunnel $id | iface $ifc | $link_state | $peer_state | local IP: $local_ip | UDP: $port | remote public: $remote | config: $conf | service: $service_state"
+    echo "  - tunnel $id | iface $ifc | $link_state | $peer_state | local IP: $local_ip | UDP: $port | endpoint: $endpoint_mode/$endpoint_ip | remote public: $remote | config: $conf | service: $service_state"
   done <<< "$ids"
 }
 
 wg_write_config() {
   local id="$1"
-  local private_file conf allowed_ips private_key
+  local private_file conf allowed_ips private_key endpoint_ip endpoint_mode_note mtu_value
   private_file="$(wg_private_key_file "$id")"
   conf="$(wg_config_file "$id")"
   private_key="$(cat "$private_file")"
   allowed_ips="$REMOTE_WG_IP/32"
+  endpoint_ip="$(wg_auto_endpoint_ip)"
+  endpoint_mode_note="${WG_ENDPOINT_MODE:-public}"
+  mtu_value="${WG_MTU:-1420}"
+  if [ "$endpoint_mode_note" = "gre" ]; then
+    mtu_value="${WG_MTU:-1280}"
+  fi
+  if [ -z "$endpoint_ip" ]; then
+    echo "WireGuard endpoint IP is empty. Cannot write config." >&2
+    return 1
+  fi
   if [ -n "${EXTRA_ALLOWED_IPS:-}" ]; then
     allowed_ips="$allowed_ips, $EXTRA_ALLOWED_IPS"
   fi
@@ -785,16 +843,18 @@ wg_write_config() {
 PrivateKey = $private_key
 Address = $LOCAL_WG_IP
 ListenPort = $LOCAL_WG_PORT
-MTU = 1420
+MTU = $mtu_value
 
 [Peer]
 PublicKey = $REMOTE_WG_PUBLIC_KEY
-Endpoint = $REMOTE_PUBLIC_IP:$REMOTE_WG_PORT
+Endpoint = $endpoint_ip:$REMOTE_WG_PORT
 AllowedIPs = $allowed_ips
 PersistentKeepalive = 25
 EOF_CONF
   chmod 600 "$conf"
   echo "WireGuard config written: $conf"
+  echo "WireGuard endpoint mode: $endpoint_mode_note -> $endpoint_ip:$REMOTE_WG_PORT"
+  echo "WireGuard MTU: $mtu_value"
 }
 
 wg_create_tunnel() {
@@ -826,6 +886,16 @@ wg_create_tunnel() {
 
   LOCAL_WG_PORT="${LOCAL_WG_PORT:-$(wg_default_port "$TUNNEL_ID")}"
   REMOTE_WG_PORT="${REMOTE_WG_PORT:-$LOCAL_WG_PORT}"
+  WG_ENDPOINT_MODE="${WG_ENDPOINT_MODE:-public}"
+  WG_ENDPOINT_IP="${WG_ENDPOINT_IP:-${REMOTE_PUBLIC_IP:-}}"
+  WG_TRANSPORT_IFACE="${WG_TRANSPORT_IFACE:-}"
+  if [ -z "${WG_MTU:-}" ]; then
+    if [ "$WG_ENDPOINT_MODE" = "gre" ]; then
+      WG_MTU="1280"
+    else
+      WG_MTU="1420"
+    fi
+  fi
   EXTRA_ALLOWED_IPS="${EXTRA_ALLOWED_IPS:-}"
   REMOTE_WG_PUBLIC_KEY="$(normalize_wg_public_key "${REMOTE_WG_PUBLIC_KEY:-}")"
   WG_PENDING=0
@@ -842,7 +912,12 @@ wg_create_tunnel() {
   echo "[*] Local WireGuard IP: $LOCAL_WG_IP"
   echo "[*] Remote WireGuard IP: $REMOTE_WG_IP"
   echo "[*] Local UDP ListenPort: $LOCAL_WG_PORT"
-  echo "[*] Remote endpoint: $REMOTE_PUBLIC_IP:$REMOTE_WG_PORT"
+  echo "[*] WireGuard endpoint mode: ${WG_ENDPOINT_MODE:-public}"
+  echo "[*] WireGuard endpoint: ${WG_ENDPOINT_IP:-${REMOTE_PUBLIC_IP:-UNKNOWN}}:$REMOTE_WG_PORT"
+  echo "[*] WireGuard MTU: ${WG_MTU:-1420}"
+  if [ "${WG_ENDPOINT_MODE:-public}" = "gre" ]; then
+    echo "[*] WireGuard transport: inside GRE interface ${WG_TRANSPORT_IFACE:-gre$TUNNEL_ID}"
+  fi
   echo
   echo "Your LOCAL WireGuard public key for tunnel $TUNNEL_ID:"
   echo "$local_pub"
@@ -890,11 +965,7 @@ wg_create_tunnel() {
   wg_write_config "$TUNNEL_ID"
   wg_save_meta
   enable_ip_forward
-
-  if command -v iptables >/dev/null 2>&1; then
-    iptables -C INPUT -p udp --dport "$LOCAL_WG_PORT" -j ACCEPT 2>/dev/null || iptables -A INPUT -p udp --dport "$LOCAL_WG_PORT" -j ACCEPT
-    iptables -C OUTPUT -p udp -d "$REMOTE_PUBLIC_IP" --dport "$REMOTE_WG_PORT" -j ACCEPT 2>/dev/null || iptables -A OUTPUT -p udp -d "$REMOTE_PUBLIC_IP" --dport "$REMOTE_WG_PORT" -j ACCEPT
-  fi
+  wg_apply_firewall_rules "$TUNNEL_ID"
 
   # Start through one path only. Prefer systemd for persistence; otherwise use wg-quick directly.
   if command -v systemctl >/dev/null 2>&1; then
@@ -917,6 +988,39 @@ wg_create_tunnel() {
   echo "  ping $REMOTE_WG_IP"
 }
 
+wg_choose_auto_endpoint() {
+  local id="$1"
+  local role="$2"
+  local gre_ifc gre_remote_ip gre_remote_ok
+  gre_ifc="$(wg_transport_iface "$id")"
+  gre_remote_ip="$(gre_remote_inner_ip_for_role "$id" "$role")"
+
+  WG_ENDPOINT_MODE="public"
+  WG_ENDPOINT_IP="${REMOTE_PUBLIC_IP:-}"
+  WG_TRANSPORT_IFACE=""
+
+  # If a same-number GRE tunnel is already up and its inner IP replies, use it as WireGuard transport.
+  # This is useful when public UDP/WireGuard is blocked but GRE is reachable.
+  if ip link show "$gre_ifc" >/dev/null 2>&1; then
+    gre_remote_ok=0
+    if ping -c 1 -W 1 "$gre_remote_ip" >/dev/null 2>&1; then
+      gre_remote_ok=1
+    fi
+    if [ "$gre_remote_ok" -eq 1 ]; then
+      WG_ENDPOINT_MODE="gre"
+      WG_ENDPOINT_IP="$gre_remote_ip"
+      WG_TRANSPORT_IFACE="$gre_ifc"
+      return 0
+    fi
+  fi
+
+  # If a previous WireGuard config used GRE transport, keep that choice when the GRE interface still exists.
+  if [ "${WG_ENDPOINT_MODE:-public}" = "gre" ] && ip link show "$gre_ifc" >/dev/null 2>&1; then
+    WG_ENDPOINT_IP="$gre_remote_ip"
+    WG_TRANSPORT_IFACE="$gre_ifc"
+  fi
+}
+
 wg_menu_config_tunnel() {
   show_header "Configure WireGuard Tunnel"
   prompt_role || return
@@ -927,12 +1031,27 @@ wg_menu_config_tunnel() {
 
   existing_remote_ip=""
   existing_peer_key=""
+  local previous_endpoint_mode previous_endpoint_ip previous_transport_iface gre_saved_remote
+  previous_endpoint_mode=""
+  previous_endpoint_ip=""
+  previous_transport_iface=""
+  gre_saved_remote=""
   if wg_load_meta "$TUNNEL_ID"; then
     existing_remote_ip="${REMOTE_PUBLIC_IP:-}"
     existing_peer_key="${REMOTE_WG_PUBLIC_KEY:-}"
+    previous_endpoint_mode="${WG_ENDPOINT_MODE:-}"
+    previous_endpoint_ip="${WG_ENDPOINT_IP:-}"
+    previous_transport_iface="${WG_TRANSPORT_IFACE:-}"
   fi
   ROLE="$selected_role"
   REMOTE_WG_PUBLIC_KEY="$existing_peer_key"
+
+  # Try to reuse the remote public IP saved by the same-number GRE tunnel.
+  # Run this in a subshell so GRE variables do not overwrite the selected WireGuard role.
+  gre_saved_remote="$(bash -c 'set -e; f="'"$GRE_CONFIG_DIR"'/tunnel-'"$TUNNEL_ID"'.conf"; [ -f "$f" ] && . "$f" && printf "%s" "${REMOTE_PUBLIC_IP:-}"' 2>/dev/null || true)"
+  if [ -z "$existing_remote_ip" ] && [ -n "$gre_saved_remote" ]; then
+    existing_remote_ip="$gre_saved_remote"
+  fi
 
   echo
   wg_print_ip_plan "$TUNNEL_ID"
@@ -940,16 +1059,6 @@ wg_menu_config_tunnel() {
 
   LOCAL_PUBLIC_IP="$(detect_local_public_ip || true)"
   echo "Local server public IP: ${LOCAL_PUBLIC_IP:-UNKNOWN}"
-  if [ -n "$existing_remote_ip" ]; then
-    read -rp "Enter REMOTE server Public IPv4 [$existing_remote_ip]: " remote_ip_input
-    REMOTE_PUBLIC_IP="${remote_ip_input:-$existing_remote_ip}"
-  else
-    read -rp "Enter REMOTE server Public IPv4: " REMOTE_PUBLIC_IP
-  fi
-  if [ -z "$REMOTE_PUBLIC_IP" ]; then
-    echo "Remote IP cannot be empty"
-    return
-  fi
 
   # Fewer questions: ports and AllowedIPs are generated from the tunnel number.
   # Tunnel N uses UDP 51800+N on both sides and allows only the peer /32 by default.
@@ -957,13 +1066,61 @@ wg_menu_config_tunnel() {
   REMOTE_WG_PORT="$LOCAL_WG_PORT"
   EXTRA_ALLOWED_IPS=""
 
+  REMOTE_PUBLIC_IP="$existing_remote_ip"
+  WG_ENDPOINT_MODE="$previous_endpoint_mode"
+  WG_ENDPOINT_IP="$previous_endpoint_ip"
+  WG_TRANSPORT_IFACE="$previous_transport_iface"
+  wg_choose_auto_endpoint "$TUNNEL_ID" "$ROLE"
+
+  if [ "${WG_ENDPOINT_MODE:-public}" != "gre" ]; then
+    if [ -n "$existing_remote_ip" ]; then
+      read -rp "Enter REMOTE server Public IPv4 [$existing_remote_ip]: " remote_ip_input
+      REMOTE_PUBLIC_IP="${remote_ip_input:-$existing_remote_ip}"
+    else
+      read -rp "Enter REMOTE server Public IPv4: " REMOTE_PUBLIC_IP
+    fi
+    if [ -z "$REMOTE_PUBLIC_IP" ]; then
+      echo "Remote IP cannot be empty when WireGuard uses public UDP endpoint."
+      return
+    fi
+    WG_ENDPOINT_MODE="public"
+    WG_ENDPOINT_IP="$REMOTE_PUBLIC_IP"
+    WG_TRANSPORT_IFACE=""
+  else
+    echo "Same-number GRE tunnel is active and reachable."
+    echo "WireGuard will automatically use GRE as transport to avoid public UDP/WireGuard blocking."
+    echo "No remote public IP is needed for the WireGuard endpoint in this mode."
+  fi
+
+  if [ "${WG_ENDPOINT_MODE:-public}" = "gre" ]; then
+    WG_MTU="1280"
+  else
+    WG_MTU="1420"
+  fi
+
   echo
   echo "Auto WireGuard values for tunnel $TUNNEL_ID:"
   echo "  Local UDP ListenPort : $LOCAL_WG_PORT"
   echo "  Remote endpoint port : $REMOTE_WG_PORT"
+  echo "  Endpoint mode        : ${WG_ENDPOINT_MODE:-public}"
+  echo "  Endpoint IP          : ${WG_ENDPOINT_IP:-${REMOTE_PUBLIC_IP:-UNKNOWN}}"
+  echo "  MTU                  : $WG_MTU"
+  if [ "${WG_ENDPOINT_MODE:-public}" = "gre" ]; then
+    echo "  Transport interface  : ${WG_TRANSPORT_IFACE:-gre$TUNNEL_ID}"
+  fi
   echo "  AllowedIPs           : peer /32 only"
   if [ -n "$REMOTE_WG_PUBLIC_KEY" ]; then
-    echo "  Remote public key    : already saved and will be reused"
+    echo "  Remote public key    : already saved"
+    echo
+    echo "Saved remote peer key found."
+    echo "Press Enter to keep it, paste a new peer public key to replace it, or type CLEAR to reset this tunnel to pending."
+    local peer_key_input
+    read -rp "REMOTE WireGuard public key [keep/CLEAR/new]: " peer_key_input
+    if [ "${peer_key_input^^}" = "CLEAR" ]; then
+      REMOTE_WG_PUBLIC_KEY=""
+    elif [ -n "$peer_key_input" ]; then
+      REMOTE_WG_PUBLIC_KEY="$(normalize_wg_public_key "$peer_key_input")"
+    fi
   fi
   echo
 
@@ -972,40 +1129,104 @@ wg_menu_config_tunnel() {
 
 wg_check_one_tunnel() {
   local id="$1"
-  local ifc
+  local ifc svc last age now endpoint_line transfer_line
   ifc="$(wg_iface_name "$id")"
+  svc="$(wg_service_name "$id")"
 
   echo
   echo "WireGuard tunnel $id ($ifc) status"
   echo "------------------------------------"
+
+  if wg_load_meta "$id"; then
+    echo "Saved role           : ${SERVER_ROLE:-unknown}"
+    echo "Local WG IP         : ${LOCAL_WG_IP:-unknown}"
+    echo "Remote WG IP        : ${REMOTE_WG_IP:-unknown}"
+    echo "Endpoint mode       : ${WG_ENDPOINT_MODE:-public}"
+    echo "Remote endpoint     : ${WG_ENDPOINT_IP:-${REMOTE_PUBLIC_IP:-unknown}}:${REMOTE_WG_PORT:-$(wg_default_port "$id")}" 
+    if [ "${WG_ENDPOINT_MODE:-public}" = "gre" ]; then
+      echo "Transport interface : ${WG_TRANSPORT_IFACE:-gre$id}"
+    fi
+    echo "Local UDP port      : ${LOCAL_WG_PORT:-$(wg_default_port "$id")}" 
+    echo "WireGuard MTU       : ${WG_MTU:-unknown}" 
+    if [ -n "${REMOTE_WG_PUBLIC_KEY:-}" ]; then
+      echo "Remote peer key     : set"
+    else
+      echo "Remote peer key     : PENDING"
+    fi
+  else
+    echo "No metadata found for tunnel $id."
+  fi
+
+  if command -v systemctl >/dev/null 2>&1; then
+    echo "Systemd service     : $(systemctl is-active "$svc" 2>/dev/null || true) / $(systemctl is-enabled "$svc" 2>/dev/null || true)"
+  fi
+
   if ip link show "$ifc" >/dev/null 2>&1; then
-    echo "$ifc: exists"
+    echo "$ifc interface      : exists"
     ip -br addr show "$ifc" 2>/dev/null || true
+
     if command -v wg >/dev/null 2>&1; then
+      echo
+      echo "wg show summary:"
       wg show "$ifc" || true
+      endpoint_line="$(wg show "$ifc" endpoints 2>/dev/null || true)"
+      transfer_line="$(wg show "$ifc" transfer 2>/dev/null || true)"
+      last="$(wg show "$ifc" latest-handshakes 2>/dev/null | awk 'NR==1{print $2}' || true)"
+      echo
+      echo "Endpoint       : ${endpoint_line:-unknown}"
+      echo "Transfer       : ${transfer_line:-unknown}"
+      if [ -z "$last" ] || [ "$last" = "0" ]; then
+        echo "Latest handshake: never"
+      else
+        now="$(date +%s)"
+        age=$((now - last))
+        echo "Latest handshake: ${age}s ago"
+      fi
     fi
 
     if wg_load_meta "$id" && [ -n "${REMOTE_WG_IP:-}" ]; then
+      echo
       echo "Pinging remote WireGuard inner IP $REMOTE_WG_IP (4 tries)..."
       if ping -c 4 "$REMOTE_WG_IP" >/tmp/wg_ping_$$.log 2>&1; then
         cat /tmp/wg_ping_$$.log
-        echo "WireGuard inner tunnel is UP"
+        echo "[OK] WireGuard inner tunnel is UP"
       else
         cat /tmp/wg_ping_$$.log
-        echo "WireGuard inner tunnel seems DOWN"
+        echo "[WARN] WireGuard inner ping failed"
+        last="$(wg show "$ifc" latest-handshakes 2>/dev/null | awk 'NR==1{print $2}' || true)"
+        if [ -z "$last" ] || [ "$last" = "0" ]; then
+          if [ "${WG_ENDPOINT_MODE:-public}" = "gre" ]; then
+            echo "Diagnosis: no WireGuard handshake yet. WireGuard is using GRE transport. Check that GRE tunnel $id still pings, the peer public key is correct, and UDP $(wg_default_port "$id") is allowed over gre$id on both servers."
+          else
+            echo "Diagnosis: no WireGuard handshake yet. Check the peer public key, remote public IP, UDP port $(wg_default_port "$id"), and firewall/NAT on both servers. If public UDP/WireGuard is blocked but GRE works, re-run create/update after GRE is up; v5 will auto-use GRE as WireGuard transport."
+          fi
+        else
+          now="$(date +%s)"
+          age=$((now - last))
+          if [ "$age" -gt 180 ]; then
+            echo "Diagnosis: last handshake is old (${age}s). The UDP path or endpoint may have changed, or the peer service may be down."
+          else
+            echo "Diagnosis: handshake exists but ping failed. Check AllowedIPs, firewall on the WireGuard interface, and rp_filter. The repair option can re-apply firewall rules and restart the service."
+          fi
+        fi
       fi
       rm -f /tmp/wg_ping_$$.log
     else
       echo "No saved WireGuard metadata for tunnel $id; save config first for inner ping test."
     fi
   else
-    echo "$ifc interface not found"
+    echo "$ifc interface      : not found"
     if wg_load_meta "$id" && [ -z "${REMOTE_WG_PUBLIC_KEY:-}" ]; then
       echo "This tunnel is PENDING because the remote peer public key has not been added yet."
       echo "Ping will not work until both sides have each other's public keys and the service starts."
     fi
     if [ -f "$(wg_config_file "$id")" ]; then
       echo "Config exists: $(wg_config_file "$id")"
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+      echo
+      echo "Last service log lines:"
+      journalctl -u "$svc" -n 20 --no-pager 2>/dev/null || true
     fi
   fi
 }
@@ -1070,26 +1291,183 @@ wg_install_service() {
   return 1
 }
 
-wg_remove_firewall_rules() {
+
+
+wg_restart_one_tunnel() {
   local id="$1"
-  local port remote_ip remote_port
+  local ifc svc
+  if ! validate_tunnel_id "$id"; then
+    echo "Invalid WireGuard tunnel number." >&2
+    return 1
+  fi
+  ifc="$(wg_iface_name "$id")"
+  svc="$(wg_service_name "$id")"
+
+  if ! wg_load_meta "$id"; then
+    echo "No saved WireGuard metadata found for tunnel $id." >&2
+    return 1
+  fi
+  if [ -z "${REMOTE_WG_PUBLIC_KEY:-}" ]; then
+    echo "Tunnel $id is pending. Add the OTHER server public key first." >&2
+    return 1
+  fi
+  if [ ! -f "$(wg_config_file "$id")" ]; then
+    echo "WireGuard config file is missing. Re-run create/update for tunnel $id." >&2
+    return 1
+  fi
+
+  wg_ensure_tools || return 1
+  enable_ip_forward
+  wg_apply_firewall_rules "$id"
+
+  echo "Restarting WireGuard tunnel $id ($ifc)..."
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload || true
+    wg-quick down "$ifc" >/dev/null 2>&1 || true
+    ip link delete "$ifc" 2>/dev/null || true
+    systemctl enable "$svc" >/dev/null 2>&1 || true
+    if ! systemctl restart "$svc"; then
+      wg_print_service_failure "$id"
+      return 1
+    fi
+  else
+    wg-quick down "$ifc" >/dev/null 2>&1 || true
+    ip link delete "$ifc" 2>/dev/null || true
+    wg-quick up "$ifc"
+  fi
+
+  echo "[OK] Restarted $ifc"
+  wg_check_one_tunnel "$id"
+}
+
+wg_repair_menu() {
+  show_header "WireGuard Repair / Restart"
+  wg_list_tunnels
+  echo
+  local ids selected_id
+  ids="$(wg_collect_ids || true)"
+  if [ -z "$ids" ]; then
+    echo "No WireGuard tunnels found."
+    return
+  fi
+  read -rp "Enter WireGuard tunnel number to repair/restart, for example 1: " selected_id
+  if ! validate_tunnel_id "$selected_id"; then
+    echo "Invalid tunnel number."
+    return
+  fi
+  if ! echo "$ids" | grep -qx "$selected_id"; then
+    echo "WireGuard tunnel $selected_id was not found in the list."
+    return
+  fi
+  wg_restart_one_tunnel "$selected_id"
+}
+
+wg_apply_firewall_rules() {
+  local id="$1"
+  local port endpoint_ip remote_port ifc transport_ifc endpoint_mode
   port="$(wg_default_port "$id")"
-  remote_ip=""
+  endpoint_ip=""
   remote_port=""
+  ifc="$(wg_iface_name "$id")"
+  transport_ifc=""
+  endpoint_mode="public"
+
   if wg_load_meta "$id"; then
     port="${LOCAL_WG_PORT:-$port}"
-    remote_ip="${REMOTE_PUBLIC_IP:-}"
+    endpoint_mode="${WG_ENDPOINT_MODE:-public}"
+    endpoint_ip="${WG_ENDPOINT_IP:-${REMOTE_PUBLIC_IP:-}}"
+    remote_port="${REMOTE_WG_PORT:-$port}"
+    transport_ifc="${WG_TRANSPORT_IFACE:-}"
+  fi
+
+  # Linux reverse-path filtering can break asymmetric/encapsulated traffic on some providers.
+  # Disable it for WireGuard and GRE-transport use.
+  for rp in /proc/sys/net/ipv4/conf/all/rp_filter /proc/sys/net/ipv4/conf/default/rp_filter "/proc/sys/net/ipv4/conf/$ifc/rp_filter" "/proc/sys/net/ipv4/conf/$transport_ifc/rp_filter"; do
+    [ -e "$rp" ] && echo 0 > "$rp" 2>/dev/null || true
+  done
+
+  if command -v iptables >/dev/null 2>&1; then
+    iptables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || iptables -A INPUT -p udp --dport "$port" -j ACCEPT || true
+    iptables -C INPUT -i "$ifc" -j ACCEPT 2>/dev/null || iptables -A INPUT -i "$ifc" -j ACCEPT || true
+    iptables -C OUTPUT -o "$ifc" -j ACCEPT 2>/dev/null || iptables -A OUTPUT -o "$ifc" -j ACCEPT || true
+    if [ -n "$endpoint_ip" ] && [ -n "$remote_port" ]; then
+      iptables -C OUTPUT -p udp -d "$endpoint_ip" --dport "$remote_port" -j ACCEPT 2>/dev/null || iptables -A OUTPUT -p udp -d "$endpoint_ip" --dport "$remote_port" -j ACCEPT || true
+    fi
+    if [ "$endpoint_mode" = "gre" ] && [ -n "$transport_ifc" ]; then
+      iptables -C INPUT -i "$transport_ifc" -p udp --dport "$port" -j ACCEPT 2>/dev/null || iptables -A INPUT -i "$transport_ifc" -p udp --dport "$port" -j ACCEPT || true
+      if [ -n "$endpoint_ip" ]; then
+        iptables -C OUTPUT -o "$transport_ifc" -p udp -d "$endpoint_ip" --dport "$remote_port" -j ACCEPT 2>/dev/null || iptables -A OUTPUT -o "$transport_ifc" -p udp -d "$endpoint_ip" --dport "$remote_port" -j ACCEPT || true
+      fi
+    fi
+  fi
+
+  if command -v ufw >/dev/null 2>&1; then
+    ufw allow "$port/udp" comment "wgtun$id" >/dev/null 2>&1 || true
+    ufw allow in on "$ifc" >/dev/null 2>&1 || true
+    if [ "$endpoint_mode" = "gre" ] && [ -n "$transport_ifc" ]; then
+      ufw allow in on "$transport_ifc" to any port "$port" proto udp >/dev/null 2>&1 || true
+    fi
+  fi
+
+  if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    firewall-cmd --permanent --add-port="$port/udp" >/dev/null 2>&1 || true
+    firewall-cmd --permanent --add-interface="$ifc" >/dev/null 2>&1 || true
+    if [ "$endpoint_mode" = "gre" ] && [ -n "$transport_ifc" ]; then
+      firewall-cmd --permanent --add-interface="$transport_ifc" >/dev/null 2>&1 || true
+    fi
+    firewall-cmd --reload >/dev/null 2>&1 || true
+  fi
+}
+
+wg_remove_firewall_rules() {
+  local id="$1"
+  local port endpoint_ip remote_port transport_ifc
+  port="$(wg_default_port "$id")"
+  endpoint_ip=""
+  remote_port=""
+  transport_ifc=""
+  if wg_load_meta "$id"; then
+    port="${LOCAL_WG_PORT:-$port}"
+    endpoint_ip="${WG_ENDPOINT_IP:-${REMOTE_PUBLIC_IP:-}}"
     remote_port="${REMOTE_WG_PORT:-}"
+    transport_ifc="${WG_TRANSPORT_IFACE:-}"
   fi
   if command -v iptables >/dev/null 2>&1; then
+    local ifc
+    ifc="$(wg_iface_name "$id")"
     while iptables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null; do
       iptables -D INPUT -p udp --dport "$port" -j ACCEPT || break
     done
-    if [ -n "$remote_ip" ] && [ -n "$remote_port" ]; then
-      while iptables -C OUTPUT -p udp -d "$remote_ip" --dport "$remote_port" -j ACCEPT 2>/dev/null; do
-        iptables -D OUTPUT -p udp -d "$remote_ip" --dport "$remote_port" -j ACCEPT || break
+    while iptables -C INPUT -i "$ifc" -j ACCEPT 2>/dev/null; do
+      iptables -D INPUT -i "$ifc" -j ACCEPT || break
+    done
+    while iptables -C OUTPUT -o "$ifc" -j ACCEPT 2>/dev/null; do
+      iptables -D OUTPUT -o "$ifc" -j ACCEPT || break
+    done
+    if [ -n "$endpoint_ip" ] && [ -n "$remote_port" ]; then
+      while iptables -C OUTPUT -p udp -d "$endpoint_ip" --dport "$remote_port" -j ACCEPT 2>/dev/null; do
+        iptables -D OUTPUT -p udp -d "$endpoint_ip" --dport "$remote_port" -j ACCEPT || break
       done
     fi
+    if [ -n "$transport_ifc" ]; then
+      while iptables -C INPUT -i "$transport_ifc" -p udp --dport "$port" -j ACCEPT 2>/dev/null; do
+        iptables -D INPUT -i "$transport_ifc" -p udp --dport "$port" -j ACCEPT || break
+      done
+      if [ -n "$endpoint_ip" ] && [ -n "$remote_port" ]; then
+        while iptables -C OUTPUT -o "$transport_ifc" -p udp -d "$endpoint_ip" --dport "$remote_port" -j ACCEPT 2>/dev/null; do
+          iptables -D OUTPUT -o "$transport_ifc" -p udp -d "$endpoint_ip" --dport "$remote_port" -j ACCEPT || break
+        done
+      fi
+    fi
+  fi
+
+  if command -v ufw >/dev/null 2>&1; then
+    ufw delete allow "$port/udp" >/dev/null 2>&1 || true
+  fi
+
+  if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    firewall-cmd --permanent --remove-port="$port/udp" >/dev/null 2>&1 || true
+    firewall-cmd --reload >/dev/null 2>&1 || true
   fi
 }
 
@@ -1208,14 +1586,17 @@ show_menu() {
   echo "2) status"
   echo "3) remove tunnel"
   echo "4) list saved/active tunnels"
+  echo "5) repair/restart WireGuard tunnel"
+  echo "   (v5: if GRE tunnel with same number is up, create/update WireGuard auto-runs over GRE)"
   echo "0) Exit"
   echo
-  read -rp "Choose an option [0-4]: " CHOICE
+  read -rp "Choose an option [0-5]: " CHOICE
   case "$CHOICE" in
     1) menu_config_tunnel ; pause ;;
     2) status_check ; pause ;;
     3) remove_tun ; pause ;;
     4) list_saved_tunnels ; pause ;;
+    5) wg_repair_menu ; pause ;;
     0) echo "Bye"; exit 0 ;;
     *) echo "Invalid option"; sleep 1 ;;
   esac
