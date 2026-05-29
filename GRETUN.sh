@@ -553,9 +553,19 @@ wg_service_name() {
   echo "wg-quick@$(wg_iface_name "$1").service"
 }
 
-validate_wg_public_key() {
+normalize_wg_public_key() {
   local key="${1:-}"
-  # WireGuard public keys are base64 strings, usually 44 chars ending with '='.
+  # Accept either the raw key or a copied config line like: PublicKey = xxx=
+  key="$(printf '%s' "$key" | sed -E 's/^[[:space:]]*[Pp]ublic[Kk]ey[[:space:]]*=[[:space:]]*//; s/[[:space:]]*$//')"
+  # WireGuard keys never contain whitespace; remove accidental pasted spaces, tabs, or CR/LF.
+  key="$(printf '%s' "$key" | tr -d '[:space:]')"
+  printf '%s' "$key"
+}
+
+validate_wg_public_key() {
+  local key
+  key="$(normalize_wg_public_key "${1:-}")"
+  # WireGuard public keys are 44-character base64 strings that normally end with '='.
   [[ "$key" =~ ^[A-Za-z0-9+/]{43}=$ ]]
 }
 
@@ -655,6 +665,7 @@ wg_save_meta() {
     write_var LOCAL_WG_PORT "$LOCAL_WG_PORT"
     write_var REMOTE_WG_PORT "$REMOTE_WG_PORT"
     write_var REMOTE_WG_PUBLIC_KEY "$REMOTE_WG_PUBLIC_KEY"
+    write_var WG_PENDING "${WG_PENDING:-0}"
     write_var EXTRA_ALLOWED_IPS "$EXTRA_ALLOWED_IPS"
     write_var WG_CONFIG_FILE "$(wg_config_file "$TUNNEL_ID")"
     write_var WG_PRIVATE_KEY_FILE "$(wg_private_key_file "$TUNNEL_ID")"
@@ -708,7 +719,7 @@ wg_collect_ids() {
 
 wg_list_tunnels() {
   echo "WireGuard tunnels:"
-  local ids id ifc meta conf service_state remote port local_ip
+  local ids id ifc meta conf service_state remote port local_ip peer_state link_state
   ids="$(wg_collect_ids || true)"
   if [ -z "$ids" ]; then
     echo "  none"
@@ -724,11 +735,17 @@ wg_list_tunnels() {
     remote="unknown"
     port="$(wg_default_port "$id")"
     local_ip="unknown"
+    peer_state="peer-key: unknown"
 
     if wg_load_meta "$id"; then
       remote="${REMOTE_PUBLIC_IP:-unknown}"
       port="${LOCAL_WG_PORT:-$port}"
       local_ip="${LOCAL_WG_IP:-unknown}"
+      if [ -n "${REMOTE_WG_PUBLIC_KEY:-}" ]; then
+        peer_state="peer-key: set"
+      else
+        peer_state="peer-key: pending"
+      fi
     fi
 
     if command -v systemctl >/dev/null 2>&1; then
@@ -741,10 +758,11 @@ wg_list_tunnels() {
     fi
 
     if ip link show "$ifc" >/dev/null 2>&1; then
-      echo "  - tunnel $id | iface $ifc | active | local IP: $local_ip | UDP: $port | remote public: $remote | config: $conf | service: $service_state"
+      link_state="active"
     else
-      echo "  - tunnel $id | iface $ifc | inactive | local IP: $local_ip | UDP: $port | remote public: $remote | config: $conf | service: $service_state"
+      link_state="inactive"
     fi
+    echo "  - tunnel $id | iface $ifc | $link_state | $peer_state | local IP: $local_ip | UDP: $port | remote public: $remote | config: $conf | service: $service_state"
   done <<< "$ids"
 }
 
@@ -809,9 +827,12 @@ wg_create_tunnel() {
   LOCAL_WG_PORT="${LOCAL_WG_PORT:-$(wg_default_port "$TUNNEL_ID")}"
   REMOTE_WG_PORT="${REMOTE_WG_PORT:-$LOCAL_WG_PORT}"
   EXTRA_ALLOWED_IPS="${EXTRA_ALLOWED_IPS:-}"
-  REMOTE_WG_PUBLIC_KEY="${REMOTE_WG_PUBLIC_KEY:-}"
+  REMOTE_WG_PUBLIC_KEY="$(normalize_wg_public_key "${REMOTE_WG_PUBLIC_KEY:-}")"
+  WG_PENDING=0
 
   wg_generate_keys "$TUNNEL_ID"
+  local local_pub
+  local_pub="$(cat "$(wg_public_key_file "$TUNNEL_ID")")"
 
   echo "[*] Local server public IP: $LOCAL_PUBLIC_IP"
   echo "[*] Tunnel type: WireGuard"
@@ -823,22 +844,47 @@ wg_create_tunnel() {
   echo "[*] Local UDP ListenPort: $LOCAL_WG_PORT"
   echo "[*] Remote endpoint: $REMOTE_PUBLIC_IP:$REMOTE_WG_PORT"
   echo
-  echo "Your local WireGuard public key for tunnel $TUNNEL_ID:"
-  cat "$(wg_public_key_file "$TUNNEL_ID")"
+  echo "Your LOCAL WireGuard public key for tunnel $TUNNEL_ID:"
+  echo "$local_pub"
   echo
 
+  if [ "$interactive" -eq 1 ] && [ -z "$REMOTE_WG_PUBLIC_KEY" ]; then
+    echo "Paste the OTHER server public key here."
+    echo "If you do not have it yet, press Enter; this tunnel will be saved as pending."
+    read -rp "REMOTE WireGuard public key: " REMOTE_WG_PUBLIC_KEY
+    REMOTE_WG_PUBLIC_KEY="$(normalize_wg_public_key "$REMOTE_WG_PUBLIC_KEY")"
+    echo
+  fi
+
   if [ -z "$REMOTE_WG_PUBLIC_KEY" ]; then
-    echo "Remote public key is empty. Metadata/key files will be saved, but the tunnel cannot start until the peer key is entered."
+    WG_PENDING=1
+    echo "Remote public key is empty."
+    echo "Saved as PENDING. Nothing will be started yet, so ping will not work until you add the peer key."
     wg_save_meta
     echo
-    echo "Run this script on the other server, copy its public key, then run this WireGuard config again and paste the key."
-    echo "Nothing was started yet, so no broken wg-quick service will be created."
+    echo "Next step on the OTHER server: create the same WireGuard tunnel number and copy its public key."
+    echo "Then run this script again on this server with the same tunnel number and paste that peer key."
+    echo "Local public key file: $(wg_public_key_file "$TUNNEL_ID")"
     return 0
   fi
 
   if ! validate_wg_public_key "$REMOTE_WG_PUBLIC_KEY"; then
-    echo "Invalid WireGuard public key format. It should be a 44-character base64 public key ending with '='." >&2
-    return 1
+    WG_PENDING=1
+    echo "The remote public key you entered is not valid after cleanup." >&2
+    echo "Detected length: ${#REMOTE_WG_PUBLIC_KEY}. Expected: 44 characters, ending with '='." >&2
+    echo "Saved as PENDING. Paste only the peer public key, or a line like: PublicKey = xxxxx=" >&2
+    REMOTE_WG_PUBLIC_KEY=""
+    wg_save_meta
+    return 0
+  fi
+
+  if [ "$REMOTE_WG_PUBLIC_KEY" = "$local_pub" ]; then
+    WG_PENDING=1
+    echo "You pasted this server's own public key, not the OTHER server public key." >&2
+    echo "Saved as PENDING. Run the script on the other server and paste its public key here." >&2
+    REMOTE_WG_PUBLIC_KEY=""
+    wg_save_meta
+    return 0
   fi
 
   wg_write_config "$TUNNEL_ID"
@@ -866,20 +912,40 @@ wg_create_tunnel() {
 
   echo "Local WG IP : $LOCAL_WG_IP"
   echo "Remote WG IP: $REMOTE_WG_IP"
+  echo
+  echo "After both sides are started, test:"
+  echo "  ping $REMOTE_WG_IP"
 }
 
 wg_menu_config_tunnel() {
   show_header "Configure WireGuard Tunnel"
   prompt_role || return
+  local selected_role existing_remote_ip existing_peer_key remote_ip_input
+  selected_role="$ROLE"
   echo
   prompt_tunnel_id "Enter WireGuard tunnel number before IP [1-254]: " || return
+
+  existing_remote_ip=""
+  existing_peer_key=""
+  if wg_load_meta "$TUNNEL_ID"; then
+    existing_remote_ip="${REMOTE_PUBLIC_IP:-}"
+    existing_peer_key="${REMOTE_WG_PUBLIC_KEY:-}"
+  fi
+  ROLE="$selected_role"
+  REMOTE_WG_PUBLIC_KEY="$existing_peer_key"
+
   echo
   wg_print_ip_plan "$TUNNEL_ID"
   echo
 
   LOCAL_PUBLIC_IP="$(detect_local_public_ip || true)"
   echo "Local server public IP: ${LOCAL_PUBLIC_IP:-UNKNOWN}"
-  read -rp "Enter REMOTE server Public IPv4: " REMOTE_PUBLIC_IP
+  if [ -n "$existing_remote_ip" ]; then
+    read -rp "Enter REMOTE server Public IPv4 [$existing_remote_ip]: " remote_ip_input
+    REMOTE_PUBLIC_IP="${remote_ip_input:-$existing_remote_ip}"
+  else
+    read -rp "Enter REMOTE server Public IPv4: " REMOTE_PUBLIC_IP
+  fi
   if [ -z "$REMOTE_PUBLIC_IP" ]; then
     echo "Remote IP cannot be empty"
     return
@@ -896,9 +962,9 @@ wg_menu_config_tunnel() {
   echo "  Local UDP ListenPort : $LOCAL_WG_PORT"
   echo "  Remote endpoint port : $REMOTE_WG_PORT"
   echo "  AllowedIPs           : peer /32 only"
-  echo
-  echo "If you do not have the remote WireGuard public key yet, leave this empty."
-  read -rp "Enter REMOTE WireGuard public key: " REMOTE_WG_PUBLIC_KEY
+  if [ -n "$REMOTE_WG_PUBLIC_KEY" ]; then
+    echo "  Remote public key    : already saved and will be reused"
+  fi
   echo
 
   wg_create_tunnel 1 || echo "WireGuard tunnel creation failed"
@@ -934,6 +1000,10 @@ wg_check_one_tunnel() {
     fi
   else
     echo "$ifc interface not found"
+    if wg_load_meta "$id" && [ -z "${REMOTE_WG_PUBLIC_KEY:-}" ]; then
+      echo "This tunnel is PENDING because the remote peer public key has not been added yet."
+      echo "Ping will not work until both sides have each other's public keys and the service starts."
+    fi
     if [ -f "$(wg_config_file "$id")" ]; then
       echo "Config exists: $(wg_config_file "$id")"
     fi
