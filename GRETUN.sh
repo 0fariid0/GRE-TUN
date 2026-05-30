@@ -1,10 +1,11 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + WireGuard multi-tunnel manager v5
+# GRE + WireGuard multi-tunnel manager v6
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
+# - Local tunnel/bind IPv4 can be selected manually for servers with multiple IPs
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -26,6 +27,72 @@ ensure_root() {
 
 detect_local_public_ip() {
   ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}'
+}
+
+validate_ipv4() {
+  local ip="${1:-}"
+  local IFS=.
+  local -a octets
+  [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  read -r -a octets <<< "$ip"
+  [ "${#octets[@]}" -eq 4 ] || return 1
+  local o
+  for o in "${octets[@]}"; do
+    [[ "$o" =~ ^[0-9]+$ ]] || return 1
+    [ "$o" -ge 0 ] && [ "$o" -le 255 ] || return 1
+  done
+}
+
+list_local_ipv4s() {
+  ip -o -4 addr show scope global 2>/dev/null | awk '{split($4,a,"/"); print "  - " a[1] " on " $2}' || true
+}
+
+prompt_local_tunnel_ip() {
+  local default_ip="${1:-}"
+  local prompt_label="${2:-LOCAL server IPv4 for this tunnel}"
+  local input detected listed_ips
+
+  detected="$(detect_local_public_ip || true)"
+  [ -n "$default_ip" ] || default_ip="$detected"
+
+  echo "Available local IPv4 addresses on this server:"
+  listed_ips="$(list_local_ipv4s)"
+  if [ -n "$listed_ips" ]; then
+    echo "$listed_ips"
+  else
+    echo "  none detected by iproute2"
+  fi
+  echo "Detected default IPv4: ${detected:-UNKNOWN}"
+  echo
+
+  if [ -n "$default_ip" ]; then
+    read -rp "$prompt_label [$default_ip]: " input
+    input="${input:-$default_ip}"
+  else
+    read -rp "$prompt_label: " input
+  fi
+
+  if ! validate_ipv4 "$input"; then
+    echo "Invalid IPv4 address: $input"
+    return 1
+  fi
+
+  LOCAL_PUBLIC_IP="$input"
+}
+
+prompt_remote_public_ip() {
+  local default_ip="${1:-}"
+  local input
+  if [ -n "$default_ip" ]; then
+    read -rp "Enter REMOTE server Public IPv4 [$default_ip]: " input
+    REMOTE_PUBLIC_IP="${input:-$default_ip}"
+  else
+    read -rp "Enter REMOTE server Public IPv4: " REMOTE_PUBLIC_IP
+  fi
+  if ! validate_ipv4 "$REMOTE_PUBLIC_IP"; then
+    echo "Invalid remote IPv4 address: ${REMOTE_PUBLIC_IP:-empty}"
+    return 1
+  fi
 }
 
 show_header() {
@@ -346,18 +413,27 @@ gre_create_tunnel() {
 gre_menu_config_tunnel() {
   show_header "Configure Normal GRE Tunnel"
   prompt_role || return
+  local selected_role existing_local_ip existing_remote_ip
+  selected_role="$ROLE"
   echo
   prompt_tunnel_id "Enter GRE tunnel number before IP [1-254]: " || return
+
+  existing_local_ip=""
+  existing_remote_ip=""
+  if gre_load_config "$TUNNEL_ID"; then
+    existing_local_ip="${LOCAL_PUBLIC_IP:-}"
+    existing_remote_ip="${REMOTE_PUBLIC_IP:-}"
+  fi
+  ROLE="$selected_role"
+
   echo
   gre_print_ip_plan "$TUNNEL_ID"
   echo
-  LOCAL_PUBLIC_IP="$(detect_local_public_ip || true)"
-  echo "Local server public IP: ${LOCAL_PUBLIC_IP:-UNKNOWN}"
-  read -rp "Enter REMOTE server Public IPv4: " REMOTE_PUBLIC_IP
-  if [ -z "$REMOTE_PUBLIC_IP" ]; then
-    echo "Remote IP cannot be empty"
-    return
-  fi
+  echo "For servers with multiple IP addresses, choose the exact LOCAL IPv4 that should be used by this tunnel."
+  echo "GRE will bind to this address with: ip tunnel ... local <LOCAL_IP>"
+  prompt_local_tunnel_ip "${existing_local_ip:-$(detect_local_public_ip || true)}" "Enter LOCAL server Public IPv4 for GRE bind" || return
+  echo
+  prompt_remote_public_ip "$existing_remote_ip" || return
 
   echo
   gre_create_tunnel 1 || echo "GRE tunnel creation failed"
@@ -378,6 +454,7 @@ gre_check_one_tunnel() {
     remote_public_of_tun=$(ip tunnel show "$ifc" 2>/dev/null | awk -F'remote ' '{print $2}' | awk '{print $1}') || true
     if [ -n "$remote_public_of_tun" ]; then
       echo "Tunnel remote public IP: $remote_public_of_tun"
+      if gre_load_config "$id" && [ -n "${LOCAL_PUBLIC_IP:-}" ]; then echo "Tunnel local public IP : $LOCAL_PUBLIC_IP"; fi
       echo "Pinging remote public IP (1 try)..."
       ping -c 1 -W 1 "$remote_public_of_tun" 2>&1 || true
     fi
@@ -1024,11 +1101,12 @@ wg_choose_auto_endpoint() {
 wg_menu_config_tunnel() {
   show_header "Configure WireGuard Tunnel"
   prompt_role || return
-  local selected_role existing_remote_ip existing_peer_key remote_ip_input
+  local selected_role existing_local_ip existing_remote_ip existing_peer_key remote_ip_input
   selected_role="$ROLE"
   echo
   prompt_tunnel_id "Enter WireGuard tunnel number before IP [1-254]: " || return
 
+  existing_local_ip=""
   existing_remote_ip=""
   existing_peer_key=""
   local previous_endpoint_mode previous_endpoint_ip previous_transport_iface gre_saved_remote
@@ -1037,6 +1115,7 @@ wg_menu_config_tunnel() {
   previous_transport_iface=""
   gre_saved_remote=""
   if wg_load_meta "$TUNNEL_ID"; then
+    existing_local_ip="${LOCAL_PUBLIC_IP:-}"
     existing_remote_ip="${REMOTE_PUBLIC_IP:-}"
     existing_peer_key="${REMOTE_WG_PUBLIC_KEY:-}"
     previous_endpoint_mode="${WG_ENDPOINT_MODE:-}"
@@ -1056,9 +1135,11 @@ wg_menu_config_tunnel() {
   echo
   wg_print_ip_plan "$TUNNEL_ID"
   echo
-
-  LOCAL_PUBLIC_IP="$(detect_local_public_ip || true)"
-  echo "Local server public IP: ${LOCAL_PUBLIC_IP:-UNKNOWN}"
+  echo "For servers with multiple IP addresses, choose the exact LOCAL IPv4 that the other side should use as this server endpoint."
+  echo "WireGuard listens on the generated UDP port; this value is saved and shown so the peer can use the correct IP."
+  prompt_local_tunnel_ip "${existing_local_ip:-$(detect_local_public_ip || true)}" "Enter LOCAL server Public IPv4 for WireGuard endpoint" || return
+  echo "Use this IP as the REMOTE server Public IPv4 on the other server: $LOCAL_PUBLIC_IP"
+  echo
 
   # Fewer questions: ports and AllowedIPs are generated from the tunnel number.
   # Tunnel N uses UDP 51800+N on both sides and allows only the peer /32 by default.
@@ -1073,16 +1154,7 @@ wg_menu_config_tunnel() {
   wg_choose_auto_endpoint "$TUNNEL_ID" "$ROLE"
 
   if [ "${WG_ENDPOINT_MODE:-public}" != "gre" ]; then
-    if [ -n "$existing_remote_ip" ]; then
-      read -rp "Enter REMOTE server Public IPv4 [$existing_remote_ip]: " remote_ip_input
-      REMOTE_PUBLIC_IP="${remote_ip_input:-$existing_remote_ip}"
-    else
-      read -rp "Enter REMOTE server Public IPv4: " REMOTE_PUBLIC_IP
-    fi
-    if [ -z "$REMOTE_PUBLIC_IP" ]; then
-      echo "Remote IP cannot be empty when WireGuard uses public UDP endpoint."
-      return
-    fi
+    prompt_remote_public_ip "$existing_remote_ip" || return
     WG_ENDPOINT_MODE="public"
     WG_ENDPOINT_IP="$REMOTE_PUBLIC_IP"
     WG_TRANSPORT_IFACE=""
@@ -1090,6 +1162,8 @@ wg_menu_config_tunnel() {
     echo "Same-number GRE tunnel is active and reachable."
     echo "WireGuard will automatically use GRE as transport to avoid public UDP/WireGuard blocking."
     echo "No remote public IP is needed for the WireGuard endpoint in this mode."
+    # Keep the public IP in metadata if it was previously known, but do not require it for the endpoint.
+    REMOTE_PUBLIC_IP="${REMOTE_PUBLIC_IP:-$existing_remote_ip}"
   fi
 
   if [ "${WG_ENDPOINT_MODE:-public}" = "gre" ]; then
@@ -1100,17 +1174,18 @@ wg_menu_config_tunnel() {
 
   echo
   echo "Auto WireGuard values for tunnel $TUNNEL_ID:"
-  echo "  Local UDP ListenPort : $LOCAL_WG_PORT"
-  echo "  Remote endpoint port : $REMOTE_WG_PORT"
-  echo "  Endpoint mode        : ${WG_ENDPOINT_MODE:-public}"
-  echo "  Endpoint IP          : ${WG_ENDPOINT_IP:-${REMOTE_PUBLIC_IP:-UNKNOWN}}"
-  echo "  MTU                  : $WG_MTU"
+  echo "  Local public/endpoint IP: $LOCAL_PUBLIC_IP"
+  echo "  Local UDP ListenPort   : $LOCAL_WG_PORT"
+  echo "  Remote endpoint port   : $REMOTE_WG_PORT"
+  echo "  Endpoint mode          : ${WG_ENDPOINT_MODE:-public}"
+  echo "  Endpoint IP            : ${WG_ENDPOINT_IP:-${REMOTE_PUBLIC_IP:-UNKNOWN}}"
+  echo "  MTU                    : $WG_MTU"
   if [ "${WG_ENDPOINT_MODE:-public}" = "gre" ]; then
-    echo "  Transport interface  : ${WG_TRANSPORT_IFACE:-gre$TUNNEL_ID}"
+    echo "  Transport interface    : ${WG_TRANSPORT_IFACE:-gre$TUNNEL_ID}"
   fi
-  echo "  AllowedIPs           : peer /32 only"
+  echo "  AllowedIPs             : peer /32 only"
   if [ -n "$REMOTE_WG_PUBLIC_KEY" ]; then
-    echo "  Remote public key    : already saved"
+    echo "  Remote public key      : already saved"
     echo
     echo "Saved remote peer key found."
     echo "Press Enter to keep it, paste a new peer public key to replace it, or type CLEAR to reset this tunnel to pending."
@@ -1139,6 +1214,7 @@ wg_check_one_tunnel() {
 
   if wg_load_meta "$id"; then
     echo "Saved role           : ${SERVER_ROLE:-unknown}"
+    echo "Local public IP     : ${LOCAL_PUBLIC_IP:-unknown}"
     echo "Local WG IP         : ${LOCAL_WG_IP:-unknown}"
     echo "Remote WG IP        : ${REMOTE_WG_IP:-unknown}"
     echo "Endpoint mode       : ${WG_ENDPOINT_MODE:-public}"
@@ -1198,7 +1274,7 @@ wg_check_one_tunnel() {
           if [ "${WG_ENDPOINT_MODE:-public}" = "gre" ]; then
             echo "Diagnosis: no WireGuard handshake yet. WireGuard is using GRE transport. Check that GRE tunnel $id still pings, the peer public key is correct, and UDP $(wg_default_port "$id") is allowed over gre$id on both servers."
           else
-            echo "Diagnosis: no WireGuard handshake yet. Check the peer public key, remote public IP, UDP port $(wg_default_port "$id"), and firewall/NAT on both servers. If public UDP/WireGuard is blocked but GRE works, re-run create/update after GRE is up; v5 will auto-use GRE as WireGuard transport."
+            echo "Diagnosis: no WireGuard handshake yet. Check the peer public key, remote public IP, UDP port $(wg_default_port "$id"), and firewall/NAT on both servers. If public UDP/WireGuard is blocked but GRE works, re-run create/update after GRE is up; v6 will auto-use GRE as WireGuard transport."
           fi
         else
           now="$(date +%s)"
@@ -1587,7 +1663,7 @@ show_menu() {
   echo "3) remove tunnel"
   echo "4) list saved/active tunnels"
   echo "5) repair/restart WireGuard tunnel"
-  echo "   (v5: if GRE tunnel with same number is up, create/update WireGuard auto-runs over GRE)"
+  echo "   (v6: selectable local IPv4 + WireGuard can auto-run over same-number GRE)"
   echo "0) Exit"
   echo
   read -rp "Choose an option [0-5]: " CHOICE
