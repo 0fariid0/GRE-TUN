@@ -1,11 +1,12 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + WireGuard multi-tunnel manager v6
+# GRE + WireGuard multi-tunnel manager v7
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
 # - Local tunnel/bind IPv4 can be selected manually for servers with multiple IPs
+# - v7 fixes GRE multi-tunnel variable/key bleed and adds GRE repair/firewall isolation
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -191,13 +192,26 @@ gre_service_name() {
   echo "gre-tunnel@$1.service"
 }
 
+gre_default_key() {
+  # Keep the old behavior by default: tunnel N uses GRE key N.
+  # The important v7 fix is that this key is reset per tunnel so a previous
+  # tunnel key cannot leak into the next tunnel created in the same session.
+  echo "$1"
+}
+
+gre_reset_runtime_vars() {
+  # Prevent values sourced/entered for one GRE tunnel from leaking into the next one.
+  unset TUN_IFACE TUN_KEY SERVER_ROLE LOCAL_GRE_IP REMOTE_GRE_IP
+  unset LOCAL_PUBLIC_IP REMOTE_PUBLIC_IP
+}
+
 gre_print_ip_plan() {
   local id="$1"
   echo "Normal GRE tunnel $id plan:"
   echo "  Interface       : gre$id"
   echo "  Config file     : $GRE_CONFIG_DIR/tunnel-$id.conf"
   echo "  Service         : gre-tunnel@$id.service"
-  echo "  GRE key         : $id"
+  echo "  GRE key         : $(gre_default_key "$id")"
   echo "  Iran role IP    : 10.10.$id.1/30"
   echo "  Kharej role IP  : 10.10.$id.2/30"
 }
@@ -335,6 +349,92 @@ gre_list_tunnels() {
   done <<< "$ids"
 }
 
+gre_disable_rp_filter() {
+  local ifc="${1:-}"
+  # Reverse-path filtering often breaks multi-GRE setups on providers that use
+  # policy routing, multiple public IPs, or asymmetric return paths.
+  for rp in /proc/sys/net/ipv4/conf/all/rp_filter /proc/sys/net/ipv4/conf/default/rp_filter "/proc/sys/net/ipv4/conf/$ifc/rp_filter"; do
+    [ -e "$rp" ] && echo 0 > "$rp" 2>/dev/null || true
+  done
+
+  mkdir -p /etc/sysctl.d 2>/dev/null || true
+  cat > /etc/sysctl.d/99-gretun-multitunnel.conf <<EOF_SYSCTL
+net.ipv4.ip_forward=1
+net.ipv4.conf.all.rp_filter=0
+net.ipv4.conf.default.rp_filter=0
+EOF_SYSCTL
+  sysctl -q -p /etc/sysctl.d/99-gretun-multitunnel.conf >/dev/null 2>&1 || true
+}
+
+gre_apply_firewall_rules() {
+  local id="$1"
+  local ifc remote local_ip subnet
+  ifc="$(gre_iface "$id")"
+  remote="${REMOTE_PUBLIC_IP:-}"
+  local_ip="${LOCAL_PUBLIC_IP:-}"
+  subnet="10.10.$id.0/24"
+
+  gre_disable_rp_filter "$ifc"
+
+  if command -v iptables >/dev/null 2>&1; then
+    # Insert at the TOP, not append. This beats broad DROP rules such as
+    # '-A FORWARD -s 10.0.0.0/8 -j DROP' and UFW user DROP rules.
+    iptables -C INPUT -i "$ifc" -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -i "$ifc" -j ACCEPT || true
+    iptables -C OUTPUT -o "$ifc" -j ACCEPT 2>/dev/null || iptables -I OUTPUT 1 -o "$ifc" -j ACCEPT || true
+    iptables -C FORWARD -i "$ifc" -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -i "$ifc" -j ACCEPT || true
+    iptables -C FORWARD -o "$ifc" -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -o "$ifc" -j ACCEPT || true
+
+    iptables -C INPUT -s "$subnet" -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -s "$subnet" -j ACCEPT || true
+    iptables -C OUTPUT -d "$subnet" -j ACCEPT 2>/dev/null || iptables -I OUTPUT 1 -d "$subnet" -j ACCEPT || true
+    iptables -C FORWARD -s "$subnet" -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -s "$subnet" -j ACCEPT || true
+    iptables -C FORWARD -d "$subnet" -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -d "$subnet" -j ACCEPT || true
+
+    if [ -n "$remote" ]; then
+      if [ -n "$local_ip" ]; then
+        iptables -C INPUT -p gre -s "$remote" -d "$local_ip" -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -p gre -s "$remote" -d "$local_ip" -j ACCEPT || true
+        iptables -C OUTPUT -p gre -s "$local_ip" -d "$remote" -j ACCEPT 2>/dev/null || iptables -I OUTPUT 1 -p gre -s "$local_ip" -d "$remote" -j ACCEPT || true
+      fi
+      iptables -C INPUT -p gre -s "$remote" -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -p gre -s "$remote" -j ACCEPT || true
+      iptables -C OUTPUT -p gre -d "$remote" -j ACCEPT 2>/dev/null || iptables -I OUTPUT 1 -p gre -d "$remote" -j ACCEPT || true
+    else
+      iptables -C INPUT -p gre -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -p gre -j ACCEPT || true
+      iptables -C OUTPUT -p gre -j ACCEPT 2>/dev/null || iptables -I OUTPUT 1 -p gre -j ACCEPT || true
+    fi
+  fi
+
+  if command -v ufw >/dev/null 2>&1; then
+    ufw allow in on "$ifc" >/dev/null 2>&1 || true
+    ufw allow out on "$ifc" >/dev/null 2>&1 || true
+    ufw route allow in on "$ifc" >/dev/null 2>&1 || true
+    ufw route allow out on "$ifc" >/dev/null 2>&1 || true
+    ufw allow out to "$subnet" >/dev/null 2>&1 || true
+    ufw allow in from "$subnet" >/dev/null 2>&1 || true
+  fi
+
+  if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    firewall-cmd --permanent --add-interface="$ifc" >/dev/null 2>&1 || true
+    firewall-cmd --reload >/dev/null 2>&1 || true
+  fi
+}
+
+gre_remove_firewall_rules() {
+  local id="$1"
+  local ifc subnet
+  ifc="$(gre_iface "$id")"
+  subnet="10.10.$id.0/24"
+
+  if command -v iptables >/dev/null 2>&1; then
+    while iptables -C INPUT -i "$ifc" -j ACCEPT 2>/dev/null; do iptables -D INPUT -i "$ifc" -j ACCEPT || break; done
+    while iptables -C OUTPUT -o "$ifc" -j ACCEPT 2>/dev/null; do iptables -D OUTPUT -o "$ifc" -j ACCEPT || break; done
+    while iptables -C FORWARD -i "$ifc" -j ACCEPT 2>/dev/null; do iptables -D FORWARD -i "$ifc" -j ACCEPT || break; done
+    while iptables -C FORWARD -o "$ifc" -j ACCEPT 2>/dev/null; do iptables -D FORWARD -o "$ifc" -j ACCEPT || break; done
+    while iptables -C INPUT -s "$subnet" -j ACCEPT 2>/dev/null; do iptables -D INPUT -s "$subnet" -j ACCEPT || break; done
+    while iptables -C OUTPUT -d "$subnet" -j ACCEPT 2>/dev/null; do iptables -D OUTPUT -d "$subnet" -j ACCEPT || break; done
+    while iptables -C FORWARD -s "$subnet" -j ACCEPT 2>/dev/null; do iptables -D FORWARD -s "$subnet" -j ACCEPT || break; done
+    while iptables -C FORWARD -d "$subnet" -j ACCEPT 2>/dev/null; do iptables -D FORWARD -d "$subnet" -j ACCEPT || break; done
+  fi
+}
+
 gre_create_tunnel() {
   local interactive=${1:-0}
 
@@ -344,7 +444,7 @@ gre_create_tunnel() {
   fi
 
   TUN_IFACE="$(gre_iface "$TUNNEL_ID")"
-  TUN_KEY="${TUN_KEY:-$TUNNEL_ID}"
+  TUN_KEY="${TUN_KEY:-$(gre_default_key "$TUNNEL_ID")}"
 
   LOCAL_PUBLIC_IP="${LOCAL_PUBLIC_IP:-$(detect_local_public_ip)}"
   if [ -z "${LOCAL_PUBLIC_IP:-}" ]; then
@@ -387,11 +487,7 @@ gre_create_tunnel() {
   fi
 
   enable_ip_forward
-
-  if command -v iptables >/dev/null 2>&1; then
-    iptables -C INPUT -p gre -s "$REMOTE_PUBLIC_IP" -j ACCEPT 2>/dev/null || iptables -A INPUT -p gre -s "$REMOTE_PUBLIC_IP" -j ACCEPT
-    iptables -C OUTPUT -p gre -d "$REMOTE_PUBLIC_IP" -j ACCEPT 2>/dev/null || iptables -A OUTPUT -p gre -d "$REMOTE_PUBLIC_IP" -j ACCEPT
-  fi
+  gre_apply_firewall_rules "$TUNNEL_ID"
 
   echo "[OK] GRE tunnel created as $TUN_IFACE"
   echo "Local GRE IP : $LOCAL_GRE_IP"
@@ -412,19 +508,23 @@ gre_create_tunnel() {
 
 gre_menu_config_tunnel() {
   show_header "Configure Normal GRE Tunnel"
+  gre_reset_runtime_vars
   prompt_role || return
-  local selected_role existing_local_ip existing_remote_ip
+  local selected_role existing_local_ip existing_remote_ip existing_key
   selected_role="$ROLE"
   echo
   prompt_tunnel_id "Enter GRE tunnel number before IP [1-254]: " || return
 
   existing_local_ip=""
   existing_remote_ip=""
+  existing_key=""
   if gre_load_config "$TUNNEL_ID"; then
     existing_local_ip="${LOCAL_PUBLIC_IP:-}"
     existing_remote_ip="${REMOTE_PUBLIC_IP:-}"
+    existing_key="${TUN_KEY:-}"
   fi
   ROLE="$selected_role"
+  TUN_KEY="${existing_key:-$(gre_default_key "$TUNNEL_ID")}"
 
   echo
   gre_print_ip_plan "$TUNNEL_ID"
@@ -524,6 +624,8 @@ gre_remove_one_tunnel() {
     echo "- $ifc was not found or could not be removed automatically."
   fi
 
+  gre_remove_firewall_rules "$id"
+
   rm -f "$file"
   if [ "$id" = "1" ]; then
     rm -f "$GRE_LEGACY_CONF_FILE"
@@ -560,6 +662,66 @@ gre_remove_menu() {
   else
     echo "Cancelled."
   fi
+}
+
+gre_restart_one_tunnel() {
+  local id="$1"
+  local ifc svc
+  if ! validate_tunnel_id "$id"; then
+    echo "Invalid GRE tunnel number." >&2
+    return 1
+  fi
+  ifc="$(gre_iface "$id")"
+  svc="$(gre_service_name "$id")"
+
+  if ! gre_load_config "$id"; then
+    echo "No saved GRE configuration found for tunnel $id." >&2
+    return 1
+  fi
+
+  echo "Restarting GRE tunnel $id ($ifc) without touching other tunnels..."
+  enable_ip_forward
+  gre_disable_rp_filter "$ifc"
+
+  if command -v systemctl >/dev/null 2>&1 && [ -f "$GRE_SERVICE_TEMPLATE" ]; then
+    systemctl daemon-reload || true
+    if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
+      if ! systemctl restart "$svc"; then
+        echo "Systemd restart failed; trying direct start from saved config..." >&2
+        gre_create_tunnel 0
+      fi
+    else
+      gre_create_tunnel 0
+    fi
+  else
+    gre_create_tunnel 0
+  fi
+
+  gre_apply_firewall_rules "$id"
+  echo "[OK] Repaired/restarted $ifc"
+  gre_check_one_tunnel "$id"
+}
+
+gre_repair_menu() {
+  show_header "Normal GRE Repair / Restart"
+  gre_list_tunnels
+  echo
+  local ids selected_id
+  ids="$(gre_collect_ids || true)"
+  if [ -z "$ids" ]; then
+    echo "No GRE tunnels found."
+    return
+  fi
+  read -rp "Enter GRE tunnel number to repair/restart, for example 1: " selected_id
+  if ! validate_tunnel_id "$selected_id"; then
+    echo "Invalid tunnel number."
+    return
+  fi
+  if ! echo "$ids" | grep -qx "$selected_id"; then
+    echo "GRE tunnel $selected_id was not found in the list."
+    return
+  fi
+  gre_restart_one_tunnel "$selected_id"
 }
 
 gre_install_service() {
@@ -1662,17 +1824,19 @@ show_menu() {
   echo "2) status"
   echo "3) remove tunnel"
   echo "4) list saved/active tunnels"
-  echo "5) repair/restart WireGuard tunnel"
-  echo "   (v6: selectable local IPv4 + WireGuard can auto-run over same-number GRE)"
+  echo "5) repair/restart Normal GRE tunnel"
+  echo "6) repair/restart WireGuard tunnel"
+  echo "   (v7: fixed GRE multi-tunnel key bleed + stronger per-tunnel firewall/rp_filter handling)"
   echo "0) Exit"
   echo
-  read -rp "Choose an option [0-5]: " CHOICE
+  read -rp "Choose an option [0-6]: " CHOICE
   case "$CHOICE" in
     1) menu_config_tunnel ; pause ;;
     2) status_check ; pause ;;
     3) remove_tun ; pause ;;
     4) list_saved_tunnels ; pause ;;
-    5) wg_repair_menu ; pause ;;
+    5) gre_repair_menu ; pause ;;
+    6) wg_repair_menu ; pause ;;
     0) echo "Bye"; exit 0 ;;
     *) echo "Invalid option"; sleep 1 ;;
   esac
