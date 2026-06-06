@@ -1,14 +1,15 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + WireGuard + FOU-GRE multi-tunnel manager v8
+# GRE + WireGuard + FOU-GRE multi-tunnel manager v9
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - FOU-GRE tunnels use separate names/ranges/files: fougreN + 10.30.N.x
 # - FOU-GRE wraps GRE inside UDP, useful when raw GRE protocol 47 is filtered/throttled/lossy
 # - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
 # - Local tunnel/bind IPv4 can be selected manually for servers with multiple IPs
-# - v8 adds UDP port conflict checks and an isolated FOU-GRE fallback mode
+# - v9 detects missing ip-fou support early and falls back to WireGuard UDP rescue mode
+# - v9 also applies UDP port conflict checks to WireGuard, not only FOU-GRE
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -322,6 +323,95 @@ prompt_remote_udp_port() {
     return 1
   fi
   REMOTE_FOUGRE_PORT="$input"
+}
+
+
+wg_saved_uses_local_port() {
+  local id="$1"
+  local port="$2"
+  local file value
+  file="$WG_META_DIR/tunnel-$id.conf"
+  value="$(read_simple_config_value "$file" LOCAL_WG_PORT 2>/dev/null || true)"
+  [ "$value" = "$port" ]
+}
+
+udp_port_available_for_wireguard() {
+  local port="$1"
+  local id="${2:-}"
+  local skip_file=""
+  validate_udp_port "$port" || return 1
+  [ -n "$id" ] && skip_file="$WG_META_DIR/tunnel-$id.conf"
+
+  # During update/repair the current wg interface may already be listening on
+  # its saved port. Allow that same tunnel to reuse its own port, but do not
+  # allow any other socket/config to collide with it.
+  if udp_port_socket_in_use "$port"; then
+    if ! { [ -n "$id" ] && wg_saved_uses_local_port "$id" "$port"; }; then
+      return 1
+    fi
+  fi
+
+  if udp_port_reserved_by_tunnel_configs "$port" "$skip_file"; then
+    return 1
+  fi
+
+  return 0
+}
+
+find_free_udp_port_for_wireguard() {
+  local start="$1"
+  local id="${2:-}"
+  local port
+  validate_udp_port "$start" || start=51801
+  port="$start"
+  while [ "$port" -le 65535 ]; do
+    if udp_port_available_for_wireguard "$port" "$id"; then
+      echo "$port"
+      return 0
+    fi
+    port=$((port + 1))
+  done
+  return 1
+}
+
+prompt_local_udp_port_for_wireguard() {
+  local default_port="$1"
+  local id="$2"
+  local input chosen
+  read -rp "Enter LOCAL WireGuard UDP ListenPort [$default_port, auto-safe]: " input
+  if [ -z "$input" ]; then
+    chosen="$(find_free_udp_port_for_wireguard "$default_port" "$id")" || {
+      echo "Could not find a free UDP port for WireGuard." >&2
+      return 1
+    }
+    if [ "$chosen" != "$default_port" ]; then
+      echo "Default WireGuard UDP port $default_port is busy/reserved; selected free port $chosen instead."
+    fi
+    LOCAL_WG_PORT="$chosen"
+    return 0
+  fi
+
+  if ! validate_udp_port "$input"; then
+    echo "Invalid UDP port: $input"
+    return 1
+  fi
+  if ! udp_port_available_for_wireguard "$input" "$id"; then
+    echo "UDP port $input is already in use or reserved by another tunnel/service. Choose another port."
+    return 1
+  fi
+  LOCAL_WG_PORT="$input"
+}
+
+prompt_remote_udp_port_for_wireguard() {
+  local default_port="$1"
+  local input
+  read -rp "Enter REMOTE server WireGuard UDP ListenPort [$default_port]: " input
+  input="${input:-$default_port}"
+  if ! validate_udp_port "$input"; then
+    echo "Invalid UDP port: $input"
+    return 1
+  fi
+  REMOTE_WG_PORT="$input"
 }
 
 # -----------------------------
@@ -1410,7 +1500,7 @@ wg_choose_auto_endpoint() {
 wg_menu_config_tunnel() {
   show_header "Configure WireGuard Tunnel"
   prompt_role || return
-  local selected_role existing_local_ip existing_remote_ip existing_peer_key remote_ip_input
+  local selected_role existing_local_ip existing_remote_ip existing_peer_key existing_local_port existing_remote_port remote_ip_input
   selected_role="$ROLE"
   echo
   prompt_tunnel_id "Enter WireGuard tunnel number before IP [1-254]: " || return
@@ -1418,6 +1508,8 @@ wg_menu_config_tunnel() {
   existing_local_ip=""
   existing_remote_ip=""
   existing_peer_key=""
+  existing_local_port=""
+  existing_remote_port=""
   local previous_endpoint_mode previous_endpoint_ip previous_transport_iface gre_saved_remote
   previous_endpoint_mode=""
   previous_endpoint_ip=""
@@ -1427,6 +1519,8 @@ wg_menu_config_tunnel() {
     existing_local_ip="${LOCAL_PUBLIC_IP:-}"
     existing_remote_ip="${REMOTE_PUBLIC_IP:-}"
     existing_peer_key="${REMOTE_WG_PUBLIC_KEY:-}"
+    existing_local_port="${LOCAL_WG_PORT:-}"
+    existing_remote_port="${REMOTE_WG_PORT:-}"
     previous_endpoint_mode="${WG_ENDPOINT_MODE:-}"
     previous_endpoint_ip="${WG_ENDPOINT_IP:-}"
     previous_transport_iface="${WG_TRANSPORT_IFACE:-}"
@@ -1450,10 +1544,10 @@ wg_menu_config_tunnel() {
   echo "Use this IP as the REMOTE server Public IPv4 on the other server: $LOCAL_PUBLIC_IP"
   echo
 
-  # Fewer questions: ports and AllowedIPs are generated from the tunnel number.
-  # Tunnel N uses UDP 51800+N on both sides and allows only the peer /32 by default.
-  LOCAL_WG_PORT="$(wg_default_port "$TUNNEL_ID")"
-  REMOTE_WG_PORT="$LOCAL_WG_PORT"
+  # Tunnel N defaults to UDP 51800+N, but v9 checks for conflicts before saving.
+  # If the default port is busy, the local ListenPort is moved to the next free UDP port.
+  prompt_local_udp_port_for_wireguard "${existing_local_port:-$(wg_default_port "$TUNNEL_ID")}" "$TUNNEL_ID" || return
+  prompt_remote_udp_port_for_wireguard "${existing_remote_port:-$LOCAL_WG_PORT}" || return
   EXTRA_ALLOWED_IPS=""
 
   REMOTE_PUBLIC_IP="$existing_remote_ip"
@@ -1974,17 +2068,74 @@ fougre_remote_inner_ip_for_role() {
   fi
 }
 
+fougre_supported() {
+  command -v ip >/dev/null 2>&1 || return 1
+  ip fou help 2>&1 | grep -qi "Usage:" || return 1
+  # Try to load the kernel modules, but do not fail only because modprobe is
+  # unavailable or the modules are built into the kernel.
+  modprobe fou >/dev/null 2>&1 || true
+  modprobe ip_gre >/dev/null 2>&1 || true
+  ip fou show >/dev/null 2>&1 || return 1
+  return 0
+}
+
+fougre_print_unsupported_message() {
+  echo "FOU-GRE is not available on this server."
+  echo "Reason: this kernel/iproute2 does not support 'ip fou' in the current environment."
+  echo "Safe fallback: use WireGuard over UDP with separate wgtunN + 10.20.N.x, so it will not conflict with greN or fougreN."
+}
+
 fougre_ensure_tools() {
   if ! command -v ip >/dev/null 2>&1; then
     echo "iproute2 is required but 'ip' was not found." >&2
     return 1
   fi
-  if ! ip fou help 2>&1 | grep -qi "Usage:"; then
-    echo "This iproute2/kernel does not appear to support 'ip fou'. Update kernel/iproute2 or use WireGuard." >&2
+  if ! fougre_supported; then
+    fougre_print_unsupported_message >&2
     return 1
   fi
-  modprobe fou >/dev/null 2>&1 || true
-  modprobe ip_gre >/dev/null 2>&1 || true
+}
+
+fougre_offer_wireguard_fallback_from_current() {
+  local interactive="${1:-1}"
+  local default_wg_port chosen
+  [ "$interactive" -eq 1 ] || return 1
+
+  echo
+  fougre_print_unsupported_message
+  echo
+  if ! confirm_default_yes "Create a WireGuard UDP fallback tunnel with the same tunnel number now?"; then
+    echo "Cancelled. No tunnel was changed."
+    return 1
+  fi
+
+  default_wg_port="$(wg_default_port "$TUNNEL_ID")"
+  chosen="$(find_free_udp_port_for_wireguard "$default_wg_port" "$TUNNEL_ID")" || {
+    echo "Could not find a free WireGuard UDP port for fallback." >&2
+    return 1
+  }
+  LOCAL_WG_PORT="$chosen"
+  if [ "$chosen" != "$default_wg_port" ]; then
+    echo "Default WireGuard UDP port $default_wg_port is busy/reserved; selected free port $chosen instead."
+  fi
+  prompt_remote_udp_port_for_wireguard "$LOCAL_WG_PORT" || return 1
+
+  WG_ENDPOINT_MODE="public"
+  WG_ENDPOINT_IP="$REMOTE_PUBLIC_IP"
+  WG_TRANSPORT_IFACE=""
+  WG_MTU="1420"
+  EXTRA_ALLOWED_IPS=""
+  REMOTE_WG_PUBLIC_KEY=""
+
+  echo
+  echo "Starting WireGuard fallback using:"
+  echo "  Interface              : $(wg_iface_name "$TUNNEL_ID")"
+  echo "  Inner IP range         : 10.20.$TUNNEL_ID.0/30"
+  echo "  Local UDP ListenPort   : $LOCAL_WG_PORT"
+  echo "  Remote UDP ListenPort  : $REMOTE_WG_PORT"
+  echo "  Endpoint IP            : $REMOTE_PUBLIC_IP"
+  echo
+  wg_create_tunnel 1
 }
 
 fougre_save_config() {
@@ -2212,7 +2363,10 @@ fougre_create_tunnel() {
     return 1
   fi
 
-  fougre_ensure_tools || return 1
+  if ! fougre_ensure_tools; then
+    fougre_offer_wireguard_fallback_from_current "$interactive"
+    return $?
+  fi
 
   FOUGRE_IFACE="$(fougre_iface "$TUNNEL_ID")"
   FOUGRE_KEY="${FOUGRE_KEY:-$(fougre_default_key "$TUNNEL_ID")}"
@@ -2254,11 +2408,21 @@ fougre_create_tunnel() {
   ip fou del port "$LOCAL_FOUGRE_PORT" 2>/dev/null || true
 
   if ! ip fou add port "$LOCAL_FOUGRE_PORT" ipproto 47 local "$LOCAL_PUBLIC_IP" 2>/dev/null; then
-    ip fou add port "$LOCAL_FOUGRE_PORT" ipproto 47
+    if ! ip fou add port "$LOCAL_FOUGRE_PORT" ipproto 47 2>/dev/null; then
+      echo "Could not register FOU receive port $LOCAL_FOUGRE_PORT. Falling back if interactive." >&2
+      fougre_offer_wireguard_fallback_from_current "$interactive"
+      return $?
+    fi
   fi
 
   if ! ip link add name "$FOUGRE_IFACE" type gre local "$LOCAL_PUBLIC_IP" remote "$REMOTE_PUBLIC_IP" key "$FOUGRE_KEY" ttl 255 encap fou encap-sport auto encap-dport "$REMOTE_FOUGRE_PORT" 2>/dev/null; then
-    ip tunnel add "$FOUGRE_IFACE" mode gre local "$LOCAL_PUBLIC_IP" remote "$REMOTE_PUBLIC_IP" key "$FOUGRE_KEY" ttl 255 encap fou encap-sport auto encap-dport "$REMOTE_FOUGRE_PORT"
+    if ! ip tunnel add "$FOUGRE_IFACE" mode gre local "$LOCAL_PUBLIC_IP" remote "$REMOTE_PUBLIC_IP" key "$FOUGRE_KEY" ttl 255 encap fou encap-sport auto encap-dport "$REMOTE_FOUGRE_PORT" 2>/dev/null; then
+      echo "Could not create FOU-GRE interface. Falling back if interactive." >&2
+      ip fou del port "$LOCAL_FOUGRE_PORT" local "$LOCAL_PUBLIC_IP" 2>/dev/null || true
+      ip fou del port "$LOCAL_FOUGRE_PORT" 2>/dev/null || true
+      fougre_offer_wireguard_fallback_from_current "$interactive"
+      return $?
+    fi
   fi
   ip addr add "$LOCAL_FOUGRE_IP" dev "$FOUGRE_IFACE"
   ip link set "$FOUGRE_IFACE" mtu "$FOUGRE_MTU"
@@ -2290,6 +2454,17 @@ fougre_create_tunnel() {
 
 fougre_menu_config_tunnel() {
   show_header "Configure FOU-GRE over UDP Tunnel"
+  if ! fougre_supported; then
+    fougre_print_unsupported_message
+    echo
+    if confirm_default_yes "Use WireGuard UDP fallback instead?"; then
+      wg_menu_config_tunnel
+    else
+      echo "Cancelled. No tunnel was changed."
+    fi
+    return
+  fi
+
   prompt_role || return
   local selected_role existing_local_ip existing_remote_ip existing_local_port existing_remote_port existing_key
   selected_role="$ROLE"
@@ -2365,7 +2540,11 @@ fougre_check_one_tunnel() {
 
   echo
   echo "FOU receive ports:"
-  ip fou show 2>/dev/null | grep -E "(^|[[:space:]])port[[:space:]]+${LOCAL_FOUGRE_PORT:-$(fougre_default_port "$id")}" || echo "  no matching FOU port found"
+  if fougre_supported; then
+    ip fou show 2>/dev/null | grep -E "(^|[[:space:]])port[[:space:]]+${LOCAL_FOUGRE_PORT:-$(fougre_default_port "$id")}" || echo "  no matching FOU port found"
+  else
+    echo "  ip fou unsupported on this server"
+  fi
 
   if ip link show "$ifc" >/dev/null 2>&1; then
     echo "$ifc interface       : exists"
@@ -2651,7 +2830,7 @@ list_saved_tunnels() {
 }
 
 show_menu() {
-  show_header "GRE + WireGuard + FOU-GRE Tunnel Management"
+  show_header "GRE + WireGuard + FOU-GRE/WG-Fallback Tunnel Management"
   echo "1) create/update tunnel"
   echo "2) status"
   echo "3) remove tunnel"
@@ -2659,7 +2838,7 @@ show_menu() {
   echo "5) repair/restart Normal GRE tunnel"
   echo "6) repair/restart WireGuard tunnel"
   echo "7) repair/restart FOU-GRE over UDP tunnel"
-  echo "   (v8: added isolated FOU-GRE/UDP mode + UDP port conflict checks)"
+  echo "   (v9: FOU-GRE + automatic WireGuard UDP fallback + safer UDP port checks)"
   echo "0) Exit"
   echo
   read -rp "Choose an option [0-7]: " CHOICE
