@@ -1,15 +1,16 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + WireGuard + FOU-GRE multi-tunnel manager v9
+# GRE + WireGuard + FOU-GRE multi-tunnel manager v10
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - FOU-GRE tunnels use separate names/ranges/files: fougreN + 10.30.N.x
 # - FOU-GRE wraps GRE inside UDP, useful when raw GRE protocol 47 is filtered/throttled/lossy
 # - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
 # - Local tunnel/bind IPv4 can be selected manually for servers with multiple IPs
-# - v9 detects missing ip-fou support early and falls back to WireGuard UDP rescue mode
-# - v9 also applies UDP port conflict checks to WireGuard, not only FOU-GRE
+# - v10 asks role/tunnel/local/remote IP before FOU capability checks
+# - v10 auto-switches unsupported FOU-GRE servers to clear WireGuard UDP compatible mode
+# - v10 applies UDP port conflict checks to WireGuard and FOU-GRE
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -1544,7 +1545,7 @@ wg_menu_config_tunnel() {
   echo "Use this IP as the REMOTE server Public IPv4 on the other server: $LOCAL_PUBLIC_IP"
   echo
 
-  # Tunnel N defaults to UDP 51800+N, but v9 checks for conflicts before saving.
+  # Tunnel N defaults to UDP 51800+N, but v10 checks for conflicts before saving.
   # If the default port is busy, the local ListenPort is moved to the next free UDP port.
   prompt_local_udp_port_for_wireguard "${existing_local_port:-$(wg_default_port "$TUNNEL_ID")}" "$TUNNEL_ID" || return
   prompt_remote_udp_port_for_wireguard "${existing_remote_port:-$LOCAL_WG_PORT}" || return
@@ -2082,7 +2083,8 @@ fougre_supported() {
 fougre_print_unsupported_message() {
   echo "FOU-GRE is not available on this server."
   echo "Reason: this kernel/iproute2 does not support 'ip fou' in the current environment."
-  echo "Safe fallback: use WireGuard over UDP with separate wgtunN + 10.20.N.x, so it will not conflict with greN or fougreN."
+  echo "Compatible mode: the script will use WireGuard over UDP instead."
+  echo "WireGuard uses separate wgtunN + 10.20.N.x, so it will not conflict with greN or fougreN."
 }
 
 fougre_ensure_tools() {
@@ -2096,46 +2098,66 @@ fougre_ensure_tools() {
   fi
 }
 
-fougre_offer_wireguard_fallback_from_current() {
-  local interactive="${1:-1}"
-  local default_wg_port chosen
-  [ "$interactive" -eq 1 ] || return 1
+fougre_configure_wireguard_compatible_mode() {
+  local existing_peer_key existing_local_port existing_remote_port default_wg_port
+  local entered_local_public_ip entered_remote_public_ip selected_role
+
+  entered_local_public_ip="${LOCAL_PUBLIC_IP:-}"
+  entered_remote_public_ip="${REMOTE_PUBLIC_IP:-}"
+  selected_role="${ROLE:-}"
+
+  existing_peer_key=""
+  existing_local_port=""
+  existing_remote_port=""
+
+  # wg_load_meta sources saved WireGuard variables. Preserve the values the user
+  # just entered in the FOU-GRE menu so old metadata cannot silently replace them.
+  if wg_load_meta "$TUNNEL_ID"; then
+    existing_peer_key="${REMOTE_WG_PUBLIC_KEY:-}"
+    existing_local_port="${LOCAL_WG_PORT:-}"
+    existing_remote_port="${REMOTE_WG_PORT:-}"
+  fi
+
+  LOCAL_PUBLIC_IP="$entered_local_public_ip"
+  REMOTE_PUBLIC_IP="$entered_remote_public_ip"
+  ROLE="$selected_role"
+  REMOTE_WG_PUBLIC_KEY="$existing_peer_key"
+  default_wg_port="${existing_local_port:-$(wg_default_port "$TUNNEL_ID")}"
 
   echo
   fougre_print_unsupported_message
   echo
-  if ! confirm_default_yes "Create a WireGuard UDP fallback tunnel with the same tunnel number now?"; then
-    echo "Cancelled. No tunnel was changed."
-    return 1
-  fi
+  echo "No question needed here: because FOU is unsupported, this tunnel will be created with WireGuard UDP compatible mode."
+  echo "You already entered the remote public IP above: $REMOTE_PUBLIC_IP"
+  echo
 
-  default_wg_port="$(wg_default_port "$TUNNEL_ID")"
-  chosen="$(find_free_udp_port_for_wireguard "$default_wg_port" "$TUNNEL_ID")" || {
-    echo "Could not find a free WireGuard UDP port for fallback." >&2
-    return 1
-  }
-  LOCAL_WG_PORT="$chosen"
-  if [ "$chosen" != "$default_wg_port" ]; then
-    echo "Default WireGuard UDP port $default_wg_port is busy/reserved; selected free port $chosen instead."
-  fi
-  prompt_remote_udp_port_for_wireguard "$LOCAL_WG_PORT" || return 1
+  prompt_local_udp_port_for_wireguard "$default_wg_port" "$TUNNEL_ID" || return 1
+  prompt_remote_udp_port_for_wireguard "${existing_remote_port:-$LOCAL_WG_PORT}" || return 1
 
   WG_ENDPOINT_MODE="public"
   WG_ENDPOINT_IP="$REMOTE_PUBLIC_IP"
   WG_TRANSPORT_IFACE=""
   WG_MTU="1420"
   EXTRA_ALLOWED_IPS=""
-  REMOTE_WG_PUBLIC_KEY=""
 
   echo
-  echo "Starting WireGuard fallback using:"
+  echo "WireGuard compatible values for tunnel $TUNNEL_ID:"
   echo "  Interface              : $(wg_iface_name "$TUNNEL_ID")"
-  echo "  Inner IP range         : 10.20.$TUNNEL_ID.0/30"
+  echo "  Local endpoint IP      : $LOCAL_PUBLIC_IP"
+  echo "  Remote endpoint IP     : $REMOTE_PUBLIC_IP"
   echo "  Local UDP ListenPort   : $LOCAL_WG_PORT"
   echo "  Remote UDP ListenPort  : $REMOTE_WG_PORT"
-  echo "  Endpoint IP            : $REMOTE_PUBLIC_IP"
+  echo "  Inner IP range         : 10.20.$TUNNEL_ID.0/30"
+  echo "  MTU                    : $WG_MTU"
   echo
+
   wg_create_tunnel 1
+}
+
+fougre_offer_wireguard_fallback_from_current() {
+  local interactive="${1:-1}"
+  [ "$interactive" -eq 1 ] || return 1
+  fougre_configure_wireguard_compatible_mode
 }
 
 fougre_save_config() {
@@ -2453,23 +2475,12 @@ fougre_create_tunnel() {
 }
 
 fougre_menu_config_tunnel() {
-  show_header "Configure FOU-GRE over UDP Tunnel"
-  if ! fougre_supported; then
-    fougre_print_unsupported_message
-    echo
-    if confirm_default_yes "Use WireGuard UDP fallback instead?"; then
-      wg_menu_config_tunnel
-    else
-      echo "Cancelled. No tunnel was changed."
-    fi
-    return
-  fi
-
+  show_header "Configure Anti-Loss UDP Tunnel"
   prompt_role || return
   local selected_role existing_local_ip existing_remote_ip existing_local_port existing_remote_port existing_key
   selected_role="$ROLE"
   echo
-  prompt_tunnel_id "Enter FOU-GRE tunnel number before IP [1-254]: " || return
+  prompt_tunnel_id "Enter tunnel number before IP [1-254]: " || return
 
   existing_local_ip=""
   existing_remote_ip=""
@@ -2487,20 +2498,33 @@ fougre_menu_config_tunnel() {
   FOUGRE_KEY="${existing_key:-$(fougre_default_key "$TUNNEL_ID")}"
 
   echo
-  fougre_print_ip_plan "$TUNNEL_ID"
+  echo "Anti-loss UDP tunnel $TUNNEL_ID setup:"
+  echo "  Preferred mode       : FOU-GRE over UDP, if kernel/iproute2 supports it"
+  echo "  Compatible fallback  : WireGuard over UDP, if FOU-GRE is not supported"
+  echo "  Normal GRE untouched : greN + 10.10.N.x"
+  echo "  WireGuard isolated   : wgtunN + 10.20.N.x"
+  echo "  FOU-GRE isolated     : fougreN + 10.30.N.x"
   echo
-  echo "This mode wraps GRE protocol 47 inside UDP. Use it when raw GRE has high loss or is filtered."
-  echo "For servers with multiple IP addresses, choose the exact LOCAL IPv4 that should be used by this tunnel."
-  prompt_local_tunnel_ip "${existing_local_ip:-$(detect_local_public_ip || true)}" "Enter LOCAL server Public IPv4 for FOU-GRE bind" || return
+  echo "First enter the public IPs. This is needed for both FOU-GRE and the compatible fallback."
+  prompt_local_tunnel_ip "${existing_local_ip:-$(detect_local_public_ip || true)}" "Enter LOCAL server Public IPv4 for this tunnel" || return
   echo
   prompt_remote_public_ip "$existing_remote_ip" || return
+
+  if ! fougre_supported; then
+    fougre_configure_wireguard_compatible_mode || echo "WireGuard compatible tunnel creation failed"
+    return
+  fi
+
   echo
+  fougre_print_ip_plan "$TUNNEL_ID"
+  echo
+  echo "This server supports FOU-GRE, so the tunnel will wrap GRE protocol 47 inside UDP."
   prompt_local_udp_port_for_fougre "${existing_local_port:-$(fougre_default_port "$TUNNEL_ID")}" "$TUNNEL_ID" || return
   prompt_remote_udp_port "${existing_remote_port:-$LOCAL_FOUGRE_PORT}" "Enter REMOTE server FOU-GRE UDP receive port" || return
   FOUGRE_MTU="1360"
 
   echo
-  echo "Auto FOU-GRE values for tunnel $TUNNEL_ID:"
+  echo "FOU-GRE values for tunnel $TUNNEL_ID:"
   echo "  Interface              : $(fougre_iface "$TUNNEL_ID")"
   echo "  Local bind public IP   : $LOCAL_PUBLIC_IP"
   echo "  Remote public IP       : $REMOTE_PUBLIC_IP"
@@ -2838,7 +2862,7 @@ show_menu() {
   echo "5) repair/restart Normal GRE tunnel"
   echo "6) repair/restart WireGuard tunnel"
   echo "7) repair/restart FOU-GRE over UDP tunnel"
-  echo "   (v9: FOU-GRE + automatic WireGuard UDP fallback + safer UDP port checks)"
+  echo "   (v10: FOU-GRE + clear automatic WireGuard UDP compatible mode + safer UDP port checks)"
   echo "0) Exit"
   echo
   read -rp "Choose an option [0-7]: " CHOICE
