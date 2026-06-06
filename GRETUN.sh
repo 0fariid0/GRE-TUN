@@ -1,17 +1,16 @@
 #!/bin/bash
 set -euo pipefail
 
-SCRIPT_VERSION="v16.0.0-tcp-bundle-fix"
+SCRIPT_VERSION="v17.0.0-tcp-shortcode"
 
-# GRE + WireGuard + TCP multi-tunnel manager v16
+# GRE + WireGuard + TCP multi-tunnel manager v17
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - TCP tunnels use OpenVPN over TCP with separate names/ranges/files: tcptunN + 10.40.N.x
 # - TCP mode is useful when raw GRE or UDP paths are filtered/throttled/lossy
 # - Local tunnel/bind IPv4 can be selected manually for servers with multiple IPs
-# - v15 replaced deprecated OpenVPN static-key mode with TLS/certificate mode
-# - v16 fixes long client bundle paste by supporting wrapped multi-line blocks and file import
-# - v16 writes the manager version into tunnel metadata, OpenVPN configs, status, and service description
+# - v17 replaces huge TCP TLS bundles with one short-code PSK
+# - v17 writes the manager version into tunnel metadata, OpenVPN configs, status, and service description
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -1780,7 +1779,7 @@ wg_remove_menu() {
 }
 
 # -----------------------------
-# TCP/OpenVPN helpers (v16 TLS mode + robust bundle import)
+# TCP/OpenVPN helpers (v17 short-code PSK mode)
 # -----------------------------
 tcptun_iface() {
   echo "${TCPTUN_IFACE_PREFIX}$1"
@@ -1795,11 +1794,11 @@ tcptun_ovpn_file() {
 }
 
 tcptun_key_file() {
-  # Kept only for cleanup/backward compatibility with v12-v14 static-key mode.
-  echo "$TCPTUN_KEY_DIR/tunnel-$1.static.key"
+  echo "$TCPTUN_KEY_DIR/tunnel-$1.psk.key"
 }
 
 tcptun_pki_dir() {
+  # Legacy v15/v16 cleanup path. v17 no longer uses PKI/bundles.
   echo "$TCPTUN_CONFIG_DIR/pki-$1"
 }
 
@@ -1818,10 +1817,11 @@ tcptun_print_ip_plan() {
   port="$(tcptun_default_port "$id")"
   echo "TCP/OpenVPN tunnel $id plan:"
   echo "  Manager version  : ${SCRIPT_VERSION:-unknown}"
+  echo "  Implementation   : OpenVPN TCP short-code PSK"
   echo "  Interface        : $(tcptun_iface "$id")"
   echo "  Meta file        : $(tcptun_config_file "$id")"
   echo "  OpenVPN config   : $(tcptun_ovpn_file "$id")"
-  echo "  PKI directory    : $(tcptun_pki_dir "$id")"
+  echo "  PSK key file     : $(tcptun_key_file "$id")"
   echo "  Service          : $(tcptun_service_name "$id")"
   echo "  Default TCP port : $port"
   echo "  Iran role IP     : 10.40.$id.1"
@@ -1829,8 +1829,7 @@ tcptun_print_ip_plan() {
   echo
   echo "GRE uses greN + 10.10.N.x and WireGuard uses wgtunN + 10.20.N.x."
   echo "TCP mode uses tcptunN + 10.40.N.x, so it stays isolated from the other types."
-  echo "Default TCP mode: Iran role connects as TCP client; Kharej role listens as TCP server."
-  echo "v16 uses modern OpenVPN TLS/certificate mode, not deprecated static-key/secret mode."
+  echo "v17 uses ONE short code only. No files, no huge certificate bundle, no BF-CBC default."
 }
 
 tcptun_inner_ip_for_role() {
@@ -1985,11 +1984,11 @@ tcptun_ensure_tools() {
   echo "OpenVPN/OpenSSL is not fully installed. Installing automatically..."
   if command -v apt-get >/dev/null 2>&1; then
     apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y openvpn openssl iproute2 iptables ca-certificates tar gzip coreutils
+    DEBIAN_FRONTEND=noninteractive apt-get install -y openvpn openssl iproute2 iptables ca-certificates coreutils
   elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y openvpn openssl iproute iptables ca-certificates tar gzip coreutils
+    dnf install -y openvpn openssl iproute iptables ca-certificates coreutils
   elif command -v yum >/dev/null 2>&1; then
-    yum install -y openvpn openssl iproute iptables ca-certificates tar gzip coreutils
+    yum install -y openvpn openssl iproute iptables ca-certificates coreutils
   else
     echo "No supported package manager found. Install OpenVPN and OpenSSL manually, then run the script again." >&2
     return 1
@@ -2067,11 +2066,11 @@ tcptun_print_service_debug() {
   echo "  journalctl -u $svc -n 120 --no-pager" >&2
   echo "  ip -br addr show $(tcptun_iface "$id")" >&2
   echo "  cat $logf" >&2
-  echo "  cat $conf" >&2
+  echo "  grep -Ev '^(secret|# Short code)' $conf" >&2
   echo >&2
   if [ -f "$conf" ]; then
     echo "Generated OpenVPN config without secrets ($conf):" >&2
-    sed -E 's#^(key|cert|ca|tls-crypt) .*$#\1 <hidden-file-path>#' "$conf" >&2 || true
+    sed -E 's#^(secret) .*$#\1 <hidden-file-path>#' "$conf" >&2 || true
   fi
   if command -v systemctl >/dev/null 2>&1; then
     echo >&2
@@ -2086,286 +2085,123 @@ tcptun_print_service_debug() {
   fi
 }
 
-tcptun_sign_cert() {
-  local pki="$1" name="$2" eku="$3"
-  local key csr crt ext
-  key="$pki/$name.key"
-  csr="$pki/$name.csr"
-  crt="$pki/$name.crt"
-  ext="$pki/$name.ext"
-
-  openssl genrsa -out "$key" 2048 >/dev/null 2>&1
-  openssl req -new -key "$key" -subj "/CN=$name" -out "$csr" >/dev/null 2>&1
-  cat > "$ext" <<EOF_EXT
-basicConstraints=CA:FALSE
-keyUsage=digitalSignature,keyEncipherment
-extendedKeyUsage=$eku
-subjectKeyIdentifier=hash
-authorityKeyIdentifier=keyid,issuer
-EOF_EXT
-  openssl x509 -req -in "$csr" -CA "$pki/ca.crt" -CAkey "$pki/ca.key" -CAcreateserial -out "$crt" -days 3650 -sha256 -extfile "$ext" >/dev/null 2>&1
-  chmod 600 "$key"
-  chmod 644 "$crt"
+tcptun_normalize_code() {
+  printf '%s' "${1:-}" | tr -d '[:space:]'
 }
 
-tcptun_generate_tls_assets() {
-  local id="$1"
-  local pki ta
-  pki="$(tcptun_pki_dir "$id")"
-  ta="$pki/ta.key"
+tcptun_generate_short_code() {
+  local id="$1" raw
+  raw="$(openssl rand -base64 18 2>/dev/null | tr '+/' '-_' | tr -d '=')"
+  if [ -z "$raw" ]; then
+    raw="$(date +%s%N | openssl dgst -sha256 -r | awk '{print substr($1,1,24)}')"
+  fi
+  echo "TCPTUN${id}-${raw}"
+}
 
-  rm -rf "$pki"
-  mkdir -p "$pki"
-  chmod 700 "$TCPTUN_CONFIG_DIR" "$pki" 2>/dev/null || true
+tcptun_code_fingerprint() {
+  local code
+  code="$(tcptun_normalize_code "${1:-}")"
+  printf '%s' "$code" | openssl dgst -sha256 -r | awk '{print substr($1,1,16)}'
+}
 
-  echo "Generating modern TLS/certificate assets for tcptun$id..."
-  openssl genrsa -out "$pki/ca.key" 2048 >/dev/null 2>&1
-  openssl req -x509 -new -nodes -key "$pki/ca.key" -sha256 -days 3650 -subj "/CN=tcptun-$id-ca" -out "$pki/ca.crt" >/dev/null 2>&1
-  chmod 600 "$pki/ca.key"
-  chmod 644 "$pki/ca.crt"
+tcptun_write_psk_from_code() {
+  local id="$1" code="$2" keyfile line seed hex
+  keyfile="$(tcptun_key_file "$id")"
+  code="$(tcptun_normalize_code "$code")"
 
-  tcptun_sign_cert "$pki" "tcptun-$id-server" "serverAuth" || return 1
-  tcptun_sign_cert "$pki" "tcptun-$id-client" "clientAuth" || return 1
-
-  if openvpn --genkey tls-crypt "$ta" >/dev/null 2>&1; then
-    :
-  elif openvpn --genkey secret "$ta" >/dev/null 2>&1; then
-    :
-  elif openvpn --genkey --secret "$ta" >/dev/null 2>&1; then
-    :
-  else
-    echo "Failed to generate OpenVPN tls-crypt key." >&2
+  if [ -z "$code" ]; then
+    echo "TCP short code is empty." >&2
     return 1
   fi
-  chmod 600 "$ta"
-}
-
-tcptun_export_client_bundle_b64() {
-  local id="$1"
-  local pki
-  pki="$(tcptun_pki_dir "$id")"
-  for f in ca.crt tcptun-$id-client.crt tcptun-$id-client.key ta.key; do
-    [ -s "$pki/$f" ] || { echo "Missing client bundle file: $pki/$f" >&2; return 1; }
-  done
-  # Produce a single logical BASE64 string. v16 prints it wrapped later so
-  # terminals do not truncate very long single-line pastes.
-  if tar -C "$pki" -czf - "ca.crt" "tcptun-$id-client.crt" "tcptun-$id-client.key" "ta.key" | base64 -w 0 2>/dev/null; then
-    return 0
+  if [ "${#code}" -lt 12 ]; then
+    echo "TCP short code is too short. Use the generated code or at least 12 characters." >&2
+    return 1
   fi
-  tar -C "$pki" -czf - "ca.crt" "tcptun-$id-client.crt" "tcptun-$id-client.key" "ta.key" | base64 | tr -d '\n'
-}
-
-tcptun_client_bundle_file() {
-  echo "/root/tcptun-client-bundle-$1.b64"
-}
-
-tcptun_normalize_bundle_b64() {
-  # Accept:
-  #   - raw one-line BASE64
-  #   - wrapped BASE64 lines
-  #   - the BEGIN/END block printed by v16
-  #   - files copied with comments/blank lines
-  # Do NOT use a single huge terminal line; Linux terminals may truncate it.
-  sed -E     -e '/^[[:space:]]*$/d'     -e '/^-+BEGIN[[:space:]].*TCPTUN.*BUNDLE.*-+$/d'     -e '/^-+END[[:space:]].*TCPTUN.*BUNDLE.*-+$/d'     -e '/^END_TCPTUN_BUNDLE$/d'     -e '/^#/d'     -e 's/[[:space:]]//g'
-}
-
-tcptun_wrap_b64() {
-  if command -v fold >/dev/null 2>&1; then
-    fold -w 76
-  else
-    awk '{ while (length($0) > 76) { print substr($0,1,76); $0=substr($0,77) } if (length($0)) print }'
+  if printf '%s' "$code" | grep -Eq '[^A-Za-z0-9._:@+=/-]'; then
+    echo "TCP short code has unsupported characters. Use letters/numbers/dash/underscore only." >&2
+    return 1
   fi
-}
 
-tcptun_save_client_bundle_file() {
-  local id="$1" bundle="$2" out
-  out="$(tcptun_client_bundle_file "$id")"
+  mkdir -p "$TCPTUN_KEY_DIR"
+  chmod 700 "$TCPTUN_CONFIG_DIR" "$TCPTUN_KEY_DIR" 2>/dev/null || true
   umask 077
   {
-    echo "# Generated by gretun-manager ${SCRIPT_VERSION:-unknown}"
+    echo "#"
+    echo "# 2048 bit OpenVPN static key"
+    echo "# Generated by gretun-manager ${SCRIPT_VERSION:-unknown} from a one-line tcptun short code"
     echo "# Tunnel ID: $id"
-    echo "# Copy this file to the Iran/client server, then choose file import."
-    echo "-----BEGIN TCPTUN CLIENT BUNDLE $id-----"
-    printf '%s' "$bundle" | tcptun_wrap_b64
-    echo
-    echo "-----END TCPTUN CLIENT BUNDLE $id-----"
-  } > "$out"
-  chmod 600 "$out" 2>/dev/null || true
-  echo "$out"
+    echo "# Fingerprint: $(tcptun_code_fingerprint "$code")"
+    echo "#"
+    echo "-----BEGIN OpenVPN Static key V1-----"
+    for line in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+      seed="gretun-manager|tcptun-v17|id=$id|line=$line|code=$code"
+      hex="$(printf '%s' "$seed" | openssl dgst -sha256 -r | awk '{print substr($1,1,32)}')"
+      printf '%s\n' "$hex"
+    done
+    echo "-----END OpenVPN Static key V1-----"
+  } > "$keyfile"
+  chmod 600 "$keyfile"
+  TCPTUN_KEY_FINGERPRINT="$(tcptun_code_fingerprint "$code")"
+  echo "Wrote OpenVPN PSK key from short code: $keyfile"
+  echo "Short-code fingerprint: $TCPTUN_KEY_FINGERPRINT"
 }
 
-tcptun_read_client_bundle_interactive() {
-  local id="$1"
-  local choice path input bundle default_path
-  default_path="$(tcptun_client_bundle_file "$id")"
+tcptun_prepare_short_code_interactive() {
+  local id="$1" input code keyfile existing_fp
+  keyfile="$(tcptun_key_file "$id")"
+  existing_fp="${TCPTUN_KEY_FINGERPRINT:-}"
 
-  echo "How do you want to provide the Kharej/server CLIENT BUNDLE?" >&2
-  echo "1) Read from a bundle file on this server (recommended)" >&2
-  echo "2) Paste wrapped bundle lines until END_TCPTUN_BUNDLE" >&2
-  echo >&2
-  read -rp "Choose [1-2, default 1]: " choice
-  choice="${choice:-1}"
+  echo
+  echo "TCP/OpenVPN ${SCRIPT_VERSION:-unknown} uses ONE short code."
+  echo "No file copy. No huge BASE64 bundle. Both servers must use the exact SAME one-line code."
+  echo "Best order: run Kharej/server first, press Enter to generate, then paste that code on Iran/client."
+  echo
 
-  case "$choice" in
-    1)
-      read -rp "Bundle file path [$default_path]: " path
-      path="${path:-$default_path}"
-      if [ ! -s "$path" ]; then
-        echo "Bundle file not found or empty: $path" >&2
-        echo "Tip from Kharej/server side:" >&2
-        echo "  scp $(tcptun_client_bundle_file "$id") root@THIS_IRAN_SERVER_IP:$default_path" >&2
+  if [ -s "$keyfile" ]; then
+    echo "Existing short-code key found for tcptun$id. Fingerprint: ${existing_fp:-unknown}"
+    read -rp "Press Enter to keep it, paste a new short code, or type NEW to generate a new code: " input
+    if [ -z "$input" ]; then
+      echo "Keeping existing short-code key."
+      return 0
+    fi
+    if [ "${input^^}" = "NEW" ]; then
+      code="$(tcptun_generate_short_code "$id")"
+    else
+      code="$(tcptun_normalize_code "$input")"
+    fi
+  else
+    if [ "${TCP_MODE:-}" = "server" ]; then
+      read -rp "TCP Short Code [press Enter to generate new]: " input
+      if [ -z "$input" ]; then
+        code="$(tcptun_generate_short_code "$id")"
+      else
+        code="$(tcptun_normalize_code "$input")"
+      fi
+    else
+      echo "Iran/client side needs the one-line code printed by Kharej/server."
+      read -rp "Paste TCP Short Code from Kharej/server: " input
+      code="$(tcptun_normalize_code "$input")"
+      if [ -z "$code" ]; then
+        echo "No code entered. Run this tunnel on Kharej/server first and paste its code here." >&2
         return 1
       fi
-      bundle="$(tcptun_normalize_bundle_b64 < "$path" | tr -d '\n')"
-      ;;
-    2)
-      echo
-      echo "Paste the wrapped CLIENT BUNDLE block now." >&2
-      echo "After the last BASE64 line, type this exact line and press Enter: END_TCPTUN_BUNDLE" >&2
-      echo
-      bundle=""
-      while IFS= read -r input; do
-        [ "$input" = "END_TCPTUN_BUNDLE" ] && break
-        # Ignore v16 block markers and comments; keep the BASE64 data.
-        case "$input" in
-          "-----BEGIN "*|"-----END "*|\#*) continue ;;
-        esac
-        bundle+="$input"
-      done
-      bundle="$(printf '%s' "$bundle" | tcptun_normalize_bundle_b64 | tr -d '\n')"
-      ;;
-    *)
-      echo "Invalid selection." >&2
-      return 1
-      ;;
-  esac
-
-  if [ -z "$bundle" ]; then
-    echo "Client bundle is empty after cleanup." >&2
-    return 1
+    fi
   fi
-  printf '%s' "$bundle"
+
+  tcptun_write_psk_from_code "$id" "$code" || return 1
+
+  if [ "${TCP_MODE:-}" = "server" ] && { [ -z "${input:-}" ] || [ "${input^^}" = "NEW" ]; }; then
+    echo
+    echo "COPY THIS ONE-LINE TCP SHORT CODE TO THE OTHER SERVER:"
+    echo "$code"
+    echo
+    echo "On Iran/client, paste exactly this one line when it asks for TCP Short Code."
+  fi
 }
-tcptun_import_client_bundle_b64() {
+
+tcptun_key_ready() {
   local id="$1"
-  local b64="$2"
-  local pki tmp clean_len
-  pki="$(tcptun_pki_dir "$id")"
-  tmp="$(mktemp -d /tmp/tcptun-bundle.XXXXXX)"
-
-  b64="$(printf '%s
-' "$b64" | tcptun_normalize_bundle_b64 | tr -d '\n')"
-  clean_len="${#b64}"
-  if [ "$clean_len" -lt 100 ]; then
-    rm -rf "$tmp"
-    echo "Invalid or too-short CLIENT BUNDLE after cleanup. Length: $clean_len characters." >&2
-    echo "Do not paste the huge bundle as one terminal line. Use the v16 file import or wrapped paste mode." >&2
-    return 1
-  fi
-
-  if ! printf '%s' "$b64" | base64 -d > "$tmp/bundle.tgz" 2>"$tmp/base64.err"; then
-    rm -rf "$tmp"
-    echo "Invalid BASE64 bundle after cleanup. Length: $clean_len characters." >&2
-    echo "Most common cause: the bundle was pasted as one huge line and got truncated by the terminal." >&2
-    echo "Use file import: copy /root/tcptun-client-bundle-$id.b64 from Kharej to Iran and choose option 1." >&2
-    return 1
-  fi
-  if ! tar -xzf "$tmp/bundle.tgz" -C "$tmp" >/dev/null 2>&1; then
-    rm -rf "$tmp"
-    echo "Decoded bundle is not a valid tcptun client bundle." >&2
-    echo "Make sure you copied the bundle generated by v16 on the Kharej/server side." >&2
-    return 1
-  fi
-  for f in ca.crt tcptun-$id-client.crt tcptun-$id-client.key ta.key; do
-    if [ ! -s "$tmp/$f" ]; then
-      rm -rf "$tmp"
-      echo "Client bundle is missing: $f" >&2
-      echo "Make sure the bundle was generated for the SAME tunnel number: $id." >&2
-      return 1
-    fi
-  done
-
-  mkdir -p "$pki"
-  chmod 700 "$TCPTUN_CONFIG_DIR" "$pki" 2>/dev/null || true
-  cp -f "$tmp/ca.crt" "$pki/ca.crt"
-  cp -f "$tmp/tcptun-$id-client.crt" "$pki/tcptun-$id-client.crt"
-  cp -f "$tmp/tcptun-$id-client.key" "$pki/tcptun-$id-client.key"
-  cp -f "$tmp/ta.key" "$pki/ta.key"
-  chmod 644 "$pki/ca.crt" "$pki/tcptun-$id-client.crt"
-  chmod 600 "$pki/tcptun-$id-client.key" "$pki/ta.key"
-  rm -rf "$tmp"
-}
-
-tcptun_server_assets_ready() {
-  local id="$1" pki
-  pki="$(tcptun_pki_dir "$id")"
-  [ -s "$pki/ca.crt" ] && [ -s "$pki/tcptun-$id-server.crt" ] && [ -s "$pki/tcptun-$id-server.key" ] && [ -s "$pki/ta.key" ]
-}
-
-tcptun_client_assets_ready() {
-  local id="$1" pki
-  pki="$(tcptun_pki_dir "$id")"
-  [ -s "$pki/ca.crt" ] && [ -s "$pki/tcptun-$id-client.crt" ] && [ -s "$pki/tcptun-$id-client.key" ] && [ -s "$pki/ta.key" ]
-}
-
-tcptun_prepare_tls_interactive() {
-  local id="$1"
-  local input bundle bundle_file
-  echo
-  echo "TCP/OpenVPN ${SCRIPT_VERSION:-unknown} uses TLS/cert mode. No deprecated static-key/secret mode, no BF-CBC."
-  echo "v16 bundle fix: client bundle is saved/wrapped so terminal paste truncation will not break it."
-  echo "Manager version: ${SCRIPT_VERSION:-unknown}"
-  echo
-
-  if [ "${TCP_MODE:-}" = "server" ]; then
-    if tcptun_server_assets_ready "$id"; then
-      echo "Existing server TLS assets found for tcptun$id."
-      read -rp "Press Enter to keep them, or type NEW to regenerate server/client bundle: " input
-      if [ "${input^^}" = "NEW" ]; then
-        tcptun_generate_tls_assets "$id" || return 1
-      else
-        echo "Keeping existing server TLS assets."
-      fi
-    else
-      tcptun_generate_tls_assets "$id" || return 1
-    fi
-
-    bundle="$(tcptun_export_client_bundle_b64 "$id")" || return 1
-    bundle_file="$(tcptun_save_client_bundle_file "$id" "$bundle")" || return 1
-    echo
-    echo "CLIENT BUNDLE for Iran/client is ready."
-    echo "Recommended copy method:"
-    echo "  scp $bundle_file root@IRAN_SERVER_IP:$(tcptun_client_bundle_file "$id")"
-    echo
-    echo "Then on the Iran/client side choose:"
-    echo "  1) Read from a bundle file on this server"
-    echo
-    echo "If you cannot use scp, copy this WRAPPED block exactly. Do not turn it into one huge line:"
-    echo "-----BEGIN TCPTUN CLIENT BUNDLE $id-----"
-    printf '%s' "$bundle" | tcptun_wrap_b64
-    echo
-    echo "-----END TCPTUN CLIENT BUNDLE $id-----"
-    echo
-    echo "Important: this bundle is for tunnel number $id only. If you regenerate it, update Iran too."
-  else
-    if tcptun_client_assets_ready "$id"; then
-      echo "Existing client TLS bundle found for tcptun$id."
-      read -rp "Press Enter to keep it, or type NEW to import a new client bundle: " input
-      if [ "${input^^}" = "NEW" ]; then
-        bundle="$(tcptun_read_client_bundle_interactive "$id")" || return 1
-        tcptun_import_client_bundle_b64 "$id" "$bundle" || return 1
-        echo "Imported new client bundle for tcptun$id."
-      else
-        echo "Keeping existing client bundle."
-      fi
-    else
-      echo "Client bundle is required on the Iran/client side."
-      echo "Run this same tunnel number on the Kharej/server side first."
-      bundle="$(tcptun_read_client_bundle_interactive "$id")" || return 1
-      tcptun_import_client_bundle_b64 "$id" "$bundle" || return 1
-      echo "Imported client bundle for tcptun$id."
-    fi
-  fi
+  [ -s "$(tcptun_key_file "$id")" ]
 }
 
 tcptun_save_meta() {
@@ -2374,20 +2210,20 @@ tcptun_save_meta() {
     return 1
   fi
 
-  mkdir -p "$TCPTUN_CONFIG_DIR" "$TCPTUN_KEY_DIR"
-  chmod 700 "$TCPTUN_CONFIG_DIR" "$TCPTUN_KEY_DIR" 2>/dev/null || true
+  mkdir -p "$TCPTUN_CONFIG_DIR"
+  chmod 700 "$TCPTUN_CONFIG_DIR" 2>/dev/null || true
   local file
   file="$(tcptun_config_file "$TUNNEL_ID")"
 
   {
     write_var MANAGER_VERSION "${SCRIPT_VERSION:-unknown}"
     write_var TUNNEL_TYPE "tcptun"
+    write_var TCPTUN_IMPLEMENTATION "openvpn-tcp-shortcode-psk"
     write_var TUNNEL_ID "$TUNNEL_ID"
     write_var TCPTUN_IFACE "$TCPTUN_IFACE"
     write_var ROLE "$ROLE"
     write_var SERVER_ROLE "${SERVER_ROLE:-}"
     write_var TCP_MODE "$TCP_MODE"
-    write_var TCP_IMPL "openvpn-tls"
     write_var LOCAL_PUBLIC_IP "$LOCAL_PUBLIC_IP"
     write_var REMOTE_PUBLIC_IP "$REMOTE_PUBLIC_IP"
     write_var LOCAL_TCP_IP "$LOCAL_TCP_IP"
@@ -2395,8 +2231,10 @@ tcptun_save_meta() {
     write_var LOCAL_TCP_PORT "${LOCAL_TCP_PORT:-}"
     write_var REMOTE_TCP_PORT "${REMOTE_TCP_PORT:-}"
     write_var TCPTUN_MTU "${TCPTUN_MTU:-1400}"
+    write_var TCPTUN_CIPHER "${TCPTUN_CIPHER:-AES-256-CBC}"
+    write_var TCPTUN_KEY_FINGERPRINT "${TCPTUN_KEY_FINGERPRINT:-}"
     write_var TCPTUN_CONFIG_FILE "$(tcptun_ovpn_file "$TUNNEL_ID")"
-    write_var TCPTUN_PKI_DIR "$(tcptun_pki_dir "$TUNNEL_ID")"
+    write_var TCPTUN_KEY_FILE "$(tcptun_key_file "$TUNNEL_ID")"
   } > "$file"
   chmod 600 "$file"
   echo "Saved TCP tunnel $TUNNEL_ID metadata to $file"
@@ -2414,8 +2252,10 @@ tcptun_load_meta() {
     source "$file"
     TUNNEL_ID="$id"
     TCPTUN_IFACE="${TCPTUN_IFACE:-$(tcptun_iface "$id")}"
-    MANAGER_VERSION="${MANAGER_VERSION:-legacy/unknown}"
-    TCP_IMPL="${TCP_IMPL:-legacy-static-key}"
+    TCPTUN_MTU="${TCPTUN_MTU:-1400}"
+    TCPTUN_CIPHER="${TCPTUN_CIPHER:-AES-256-CBC}"
+    MANAGER_VERSION="${MANAGER_VERSION:-unknown}"
+    TCPTUN_IMPLEMENTATION="${TCPTUN_IMPLEMENTATION:-openvpn-tcp-shortcode-psk}"
     return 0
   fi
   return 1
@@ -2431,6 +2271,14 @@ tcptun_collect_ids() {
         id="${id%.conf}"
         validate_tunnel_id "$id" && echo "$id"
       done
+      local cf base id2
+      for cf in "$TCPTUN_CONFIG_DIR"/tunnel-*.ovpn; do
+        [ -e "$cf" ] || continue
+        base="${cf##*/}"
+        id2="${base#tunnel-}"
+        id2="${id2%.ovpn}"
+        validate_tunnel_id "$id2" && echo "$id2"
+      done
     fi
     ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1 | grep -E "^${TCPTUN_IFACE_PREFIX}[0-9]+$" | sed "s/^${TCPTUN_IFACE_PREFIX}//" || true
   } | sort -n -u
@@ -2438,7 +2286,7 @@ tcptun_collect_ids() {
 
 tcptun_list_tunnels() {
   echo "TCP/OpenVPN tunnels:"
-  local ids id ifc meta service_state mode local_ip remote_ip port status version impl
+  local ids id ifc meta service_state status local_ip remote_ip mode port version impl fp
   ids="$(tcptun_collect_ids || true)"
   if [ -z "$ids" ]; then
     echo "  none"
@@ -2450,24 +2298,22 @@ tcptun_list_tunnels() {
     ifc="$(tcptun_iface "$id")"
     meta="$(tcptun_config_file "$id")"
     service_state="not-installed"
-    mode="unknown"
     local_ip="unknown"
     remote_ip="unknown"
-    port="unknown"
+    mode="unknown"
+    port="$(tcptun_default_port "$id")"
     version="unknown"
     impl="unknown"
+    fp="unknown"
 
     if tcptun_load_meta "$id"; then
-      mode="${TCP_MODE:-unknown}"
       local_ip="${LOCAL_TCP_IP:-unknown}"
       remote_ip="${REMOTE_TCP_IP:-unknown}"
+      mode="${TCP_MODE:-unknown}"
+      port="${LOCAL_TCP_PORT:-${REMOTE_TCP_PORT:-$port}}"
       version="${MANAGER_VERSION:-unknown}"
-      impl="${TCP_IMPL:-unknown}"
-      if [ "${TCP_MODE:-}" = "server" ]; then
-        port="${LOCAL_TCP_PORT:-unknown}/tcp-listen"
-      else
-        port="${REMOTE_TCP_PORT:-unknown}/tcp-remote"
-      fi
+      impl="${TCPTUN_IMPLEMENTATION:-unknown}"
+      fp="${TCPTUN_KEY_FINGERPRINT:-unknown}"
     fi
 
     if command -v systemctl >/dev/null 2>&1; then
@@ -2484,48 +2330,54 @@ tcptun_list_tunnels() {
     else
       status="inactive"
     fi
-    echo "  - tunnel $id | version: $version | impl: $impl | iface $ifc | $status | mode: $mode | local IP: $local_ip | remote IP: $remote_ip | port: $port | meta: $meta | service: $service_state"
+    echo "  - tunnel $id | version: $version | impl: $impl | iface $ifc | $status | mode: $mode | local IP: $local_ip | remote IP: $remote_ip | port: $port | key-fp: $fp | service: $service_state"
   done <<< "$ids"
+}
+
+tcptun_choose_cipher() {
+  if openvpn --show-ciphers 2>/dev/null | grep -q '^AES-256-CBC'; then
+    echo "AES-256-CBC"
+  elif openvpn --show-ciphers 2>/dev/null | grep -q '^AES-128-CBC'; then
+    echo "AES-128-CBC"
+  else
+    echo "AES-256-CBC"
+  fi
 }
 
 tcptun_write_openvpn_config() {
   local id="$1"
-  local conf pki mtu
+  local conf keyfile mtu cipher
   conf="$(tcptun_ovpn_file "$id")"
-  pki="$(tcptun_pki_dir "$id")"
+  keyfile="$(tcptun_key_file "$id")"
   mtu="${TCPTUN_MTU:-1400}"
+  cipher="${TCPTUN_CIPHER:-$(tcptun_choose_cipher)}"
+  TCPTUN_CIPHER="$cipher"
 
-  if [ "${TCP_MODE:-}" = "server" ]; then
-    tcptun_server_assets_ready "$id" || { echo "Server TLS assets are missing for tcptun$id." >&2; return 1; }
-  else
-    tcptun_client_assets_ready "$id" || { echo "Client TLS bundle is missing for tcptun$id." >&2; return 1; }
-  fi
+  tcptun_key_ready "$id" || { echo "TCP short-code key is missing for tcptun$id." >&2; return 1; }
 
   mkdir -p "$TCPTUN_CONFIG_DIR"
   chmod 700 "$TCPTUN_CONFIG_DIR" 2>/dev/null || true
 
   cat > "$conf" <<EOF_CONF
 # Generated by gretun-manager ${SCRIPT_VERSION:-unknown}
-# Tunnel type: TCP/OpenVPN TLS
+# Tunnel type: TCP/OpenVPN short-code PSK
 # Tunnel ID: $id
 # Interface: $TCPTUN_IFACE
 # Local inner IP: $LOCAL_TCP_IP
 # Remote inner IP: $REMOTE_TCP_IP
-# NOTE: v16 intentionally does NOT use deprecated 'secret' static-key mode.
-# NOTE: Legacy Blowfish cipher is intentionally not used.
+# Implementation: openvpn-tcp-shortcode-psk
+# Short code fingerprint: ${TCPTUN_KEY_FINGERPRINT:-unknown}
+# NOTE: v17 intentionally uses a one-line short code-derived PSK.
+# NOTE: BF-CBC is never used; cipher is set explicitly below.
 dev $TCPTUN_IFACE
 dev-type tun
 proto tcp-${TCP_MODE}
 ifconfig $LOCAL_TCP_IP $REMOTE_TCP_IP
-ca $pki/ca.crt
-cert $pki/tcptun-$id-${TCP_MODE}.crt
-key $pki/tcptun-$id-${TCP_MODE}.key
-tls-crypt $pki/ta.key
-tls-version-min 1.2
+secret $keyfile
 auth SHA256
-cipher AES-256-CBC
-data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305:AES-256-CBC
-data-ciphers-fallback AES-256-CBC
+cipher $cipher
+data-ciphers $cipher
+data-ciphers-fallback $cipher
 persist-key
 persist-tun
 keepalive 10 60
@@ -2537,37 +2389,27 @@ log-append $(tcptun_log_file "$id")
 EOF_CONF
 
   if [ "$TCP_MODE" = "server" ]; then
-    # Server cert files are named tcptun-N-server.* and client verifies server EKU.
     cat >> "$conf" <<EOF_SERVER
 port $LOCAL_TCP_PORT
-tls-server
-dh none
-ecdh-curve prime256v1
 EOF_SERVER
   else
-    # Client cert files are named tcptun-N-client.*. Verify the remote peer is the server cert.
     cat >> "$conf" <<EOF_CLIENT
 remote $REMOTE_PUBLIC_IP $REMOTE_TCP_PORT
 nobind
 connect-retry 3 5
 connect-retry-max infinite
 resolv-retry infinite
-tls-client
-remote-cert-tls server
-verify-x509-name tcptun-$id-server name
 EOF_CLIENT
   fi
 
-  # Rewrite cert/key paths for the actual role names. The base block uses ${TCP_MODE},
-  # but OpenVPN mode is client/server and our cert names match that exactly.
   chmod 600 "$conf"
 
-  if grep -Eqi '^[[:space:]]*cipher[[:space:]]+BF-CBC|^[[:space:]]*data-ciphers.*BF-CBC' "$conf" || grep -Eq '^[[:space:]]*secret[[:space:]]+' "$conf"; then
-    echo "Internal safety check failed: generated config contains BF-CBC or deprecated secret mode." >&2
+  if grep -Eqi '^[[:space:]]*cipher[[:space:]]+BF-CBC|^[[:space:]]*data-ciphers.*BF-CBC' "$conf"; then
+    echo "Internal safety check failed: generated config contains BF-CBC." >&2
     return 1
   fi
 
-  echo "OpenVPN TCP/TLS config written: $conf"
+  echo "OpenVPN TCP short-code config written: $conf"
 }
 
 tcptun_apply_firewall_rules() {
@@ -2650,7 +2492,7 @@ tcptun_remove_firewall_rules() {
 
 tcptun_install_service() {
   local id="${1:-${TUNNEL_ID:-}}"
-  local svc
+  local svc openvpn_bin
   if ! validate_tunnel_id "$id"; then
     echo "Cannot enable TCP tunnel service: invalid tunnel number" >&2
     return 1
@@ -2665,25 +2507,24 @@ tcptun_install_service() {
   fi
 
   svc="$(tcptun_service_name "$id")"
+  openvpn_bin="$(command -v openvpn || true)"
+  [ -n "$openvpn_bin" ] || openvpn_bin="/usr/sbin/openvpn"
+
   cat > "$TCPTUN_SERVICE_TEMPLATE" <<EOF_SERVICE
 [Unit]
-Description=TCP/OpenVPN Tunnel %i Service (${SCRIPT_VERSION:-unknown})
+Description=TCP/OpenVPN Tunnel %i Service (${SCRIPT_VERSION:-unknown}, short-code PSK)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/sbin/openvpn --config $TCPTUN_CONFIG_DIR/tunnel-%i.ovpn
+ExecStart=$openvpn_bin --config $TCPTUN_CONFIG_DIR/tunnel-%i.ovpn
 Restart=always
 RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 EOF_SERVICE
-
-  if [ ! -x /usr/sbin/openvpn ] && command -v openvpn >/dev/null 2>&1; then
-    sed -i "s#ExecStart=/usr/sbin/openvpn#ExecStart=$(command -v openvpn)#" "$TCPTUN_SERVICE_TEMPLATE"
-  fi
 
   systemctl daemon-reload
   tcptun_clean_runtime "$id"
@@ -2723,31 +2564,29 @@ tcptun_create_tunnel() {
   fi
 
   TCPTUN_MTU="${TCPTUN_MTU:-1400}"
+  TCPTUN_CIPHER="${TCPTUN_CIPHER:-$(tcptun_choose_cipher)}"
 
-  # Stop old v12-v14 services/logs before generating the new TLS config. This avoids
-  # stale BF-CBC/static-key configs being restarted by systemd while we are updating.
+  # Stop old v12-v16 services/logs before generating the new short-code config.
   tcptun_clean_runtime "$TUNNEL_ID"
 
   if [ "$interactive" -eq 1 ]; then
-    tcptun_prepare_tls_interactive "$TUNNEL_ID" || return 1
+    tcptun_prepare_short_code_interactive "$TUNNEL_ID" || return 1
   else
-    if [ "$TCP_MODE" = "server" ]; then
-      tcptun_server_assets_ready "$TUNNEL_ID" || { echo "Server TLS assets are missing. Re-run create/update interactively." >&2; return 1; }
-    else
-      tcptun_client_assets_ready "$TUNNEL_ID" || { echo "Client TLS bundle is missing. Re-run create/update interactively." >&2; return 1; }
-    fi
+    tcptun_key_ready "$TUNNEL_ID" || { echo "TCP short-code key is missing. Re-run create/update interactively." >&2; return 1; }
   fi
 
   echo "[*] Manager version: ${SCRIPT_VERSION:-unknown}"
   echo "[*] Local server public IP: $LOCAL_PUBLIC_IP"
   echo "[*] Remote server public IP: $REMOTE_PUBLIC_IP"
-  echo "[*] Tunnel type: TCP/OpenVPN TLS"
+  echo "[*] Tunnel type: TCP/OpenVPN short-code PSK"
   echo "[*] Tunnel number: $TUNNEL_ID"
   echo "[*] Interface: $TCPTUN_IFACE"
   echo "[*] Server role: $SERVER_ROLE"
   echo "[*] TCP mode: $TCP_MODE"
   echo "[*] Local TCP inner IP: $LOCAL_TCP_IP"
   echo "[*] Remote TCP inner IP: $REMOTE_TCP_IP"
+  echo "[*] Cipher: $TCPTUN_CIPHER"
+  echo "[*] Short-code fingerprint: ${TCPTUN_KEY_FINGERPRINT:-unknown}"
   if [ "$TCP_MODE" = "server" ]; then
     echo "[*] Local TCP listen: 0.0.0.0:$LOCAL_TCP_PORT"
     echo "[*] Public endpoint for client: $LOCAL_PUBLIC_IP:$LOCAL_TCP_PORT"
@@ -2756,18 +2595,17 @@ tcptun_create_tunnel() {
   fi
 
   tcptun_write_openvpn_config "$TUNNEL_ID" || return 1
-  tcptun_save_meta
+  tcptun_save_meta || return 1
   enable_ip_forward
   tcptun_apply_firewall_rules "$TUNNEL_ID"
 
   if command -v systemctl >/dev/null 2>&1; then
-    tcptun_install_service "$TUNNEL_ID" || {
+    if ! tcptun_install_service "$TUNNEL_ID"; then
       echo "TCP/OpenVPN service failed to start." >&2
       tcptun_print_service_debug "$TUNNEL_ID"
       return 1
-    }
+    fi
   else
-    tcptun_clean_runtime "$TUNNEL_ID"
     openvpn --config "$(tcptun_ovpn_file "$TUNNEL_ID")" --daemon "tcptun$TUNNEL_ID"
   fi
 
@@ -2776,10 +2614,10 @@ tcptun_create_tunnel() {
     return 1
   fi
 
-  echo "[OK] TCP/OpenVPN TLS tunnel created as $TCPTUN_IFACE"
-  echo "Version      : ${SCRIPT_VERSION:-unknown}"
+  echo "[OK] TCP/OpenVPN short-code tunnel created as $TCPTUN_IFACE"
   echo "Local TCP IP : $LOCAL_TCP_IP"
   echo "Remote TCP IP: $REMOTE_TCP_IP"
+  echo "Version      : ${SCRIPT_VERSION:-unknown}"
   echo
   echo "After both sides are started, test:"
   echo "  ping $REMOTE_TCP_IP"
@@ -2788,7 +2626,7 @@ tcptun_create_tunnel() {
 tcptun_menu_config_tunnel() {
   show_header "Configure TCP/OpenVPN Tunnel"
   prompt_role || return
-  local selected_role existing_local_ip existing_remote_ip existing_local_port existing_remote_port
+  local selected_role existing_local_ip existing_remote_ip existing_local_port existing_remote_port existing_fp
   selected_role="$ROLE"
   echo
   prompt_tunnel_id "Enter TCP tunnel number before IP [1-254]: " || return
@@ -2797,13 +2635,16 @@ tcptun_menu_config_tunnel() {
   existing_remote_ip=""
   existing_local_port=""
   existing_remote_port=""
+  existing_fp=""
   if tcptun_load_meta "$TUNNEL_ID"; then
     existing_local_ip="${LOCAL_PUBLIC_IP:-}"
     existing_remote_ip="${REMOTE_PUBLIC_IP:-}"
     existing_local_port="${LOCAL_TCP_PORT:-}"
     existing_remote_port="${REMOTE_TCP_PORT:-}"
+    existing_fp="${TCPTUN_KEY_FINGERPRINT:-}"
   fi
   ROLE="$selected_role"
+  TCPTUN_KEY_FINGERPRINT="$existing_fp"
 
   echo
   tcptun_print_ip_plan "$TUNNEL_ID"
@@ -2812,33 +2653,35 @@ tcptun_menu_config_tunnel() {
   echo
   prompt_remote_public_ip "$existing_remote_ip" || return
 
-  if [ "$ROLE" = "1" ]; then
-    TCP_MODE="client"
-    REMOTE_TCP_PORT="${existing_remote_port:-$(tcptun_default_port "$TUNNEL_ID")}" 
-    prompt_remote_tcp_port_for_tcptun "$REMOTE_TCP_PORT" || return
-    LOCAL_TCP_PORT=""
+  local default_port chosen_local_port
+  default_port="$(tcptun_default_port "$TUNNEL_ID")"
+  if [ "$ROLE" = "2" ]; then
+    echo
+    prompt_local_tcp_port_for_tcptun "${existing_local_port:-$default_port}" "$TUNNEL_ID" || return
+    REMOTE_TCP_PORT="${existing_remote_port:-$LOCAL_TCP_PORT}"
   else
-    TCP_MODE="server"
-    LOCAL_TCP_PORT="${existing_local_port:-$(tcptun_default_port "$TUNNEL_ID")}" 
-    prompt_local_tcp_port_for_tcptun "$LOCAL_TCP_PORT" "$TUNNEL_ID" || return
-    REMOTE_TCP_PORT=""
+    LOCAL_TCP_PORT="${existing_local_port:-$default_port}"
+    echo
+    prompt_remote_tcp_port_for_tcptun "${existing_remote_port:-$default_port}" || return
   fi
 
   echo
   echo "Auto TCP/OpenVPN values for tunnel $TUNNEL_ID:"
   echo "  Manager version  : ${SCRIPT_VERSION:-unknown}"
-  echo "  Implementation   : OpenVPN TLS/cert over TCP"
+  echo "  Implementation   : OpenVPN TCP short-code PSK"
   echo "  Interface        : $(tcptun_iface "$TUNNEL_ID")"
-  echo "  TCP mode         : $TCP_MODE"
-  echo "  Local inner IP   : $(tcptun_inner_ip_for_role "$TUNNEL_ID" "$ROLE")"
-  echo "  Remote inner IP  : $(tcptun_remote_inner_ip_for_role "$TUNNEL_ID" "$ROLE")"
-  if [ "$TCP_MODE" = "server" ]; then
-    echo "  Local TCP listen : 0.0.0.0:$LOCAL_TCP_PORT"
-    echo "  Public endpoint  : $LOCAL_PUBLIC_IP:$LOCAL_TCP_PORT"
-    echo "  Other side must connect to this public IP/port."
+  if [ "$ROLE" = "1" ]; then
+    echo "  Role/mode        : IRAN / client"
+    echo "  Local inner IP   : 10.40.$TUNNEL_ID.1"
+    echo "  Remote inner IP  : 10.40.$TUNNEL_ID.2"
+    echo "  Remote endpoint  : $REMOTE_PUBLIC_IP:$REMOTE_TCP_PORT"
   else
-    echo "  Remote TCP target: $REMOTE_PUBLIC_IP:$REMOTE_TCP_PORT"
+    echo "  Role/mode        : KHAREJ / server"
+    echo "  Local inner IP   : 10.40.$TUNNEL_ID.2"
+    echo "  Remote inner IP  : 10.40.$TUNNEL_ID.1"
+    echo "  Listen endpoint  : 0.0.0.0:$LOCAL_TCP_PORT"
   fi
+  echo "  Short code       : one line only; same on both servers"
   echo
 
   tcptun_create_tunnel 1 || echo "TCP/OpenVPN tunnel creation failed"
@@ -2846,38 +2689,35 @@ tcptun_menu_config_tunnel() {
 
 tcptun_check_one_tunnel() {
   local id="$1"
-  local ifc svc
+  local ifc svc last_log
   ifc="$(tcptun_iface "$id")"
   svc="$(tcptun_service_name "$id")"
 
   echo
   echo "TCP/OpenVPN tunnel $id ($ifc) status"
-  echo "--------------------------------------"
-
+  echo "----------------------------------------"
   if tcptun_load_meta "$id"; then
-    echo "Manager version : ${MANAGER_VERSION:-unknown}"
-    echo "Implementation  : ${TCP_IMPL:-unknown}"
-    echo "Saved role      : ${SERVER_ROLE:-unknown}"
-    echo "TCP mode        : ${TCP_MODE:-unknown}"
-    echo "Local public IP : ${LOCAL_PUBLIC_IP:-unknown}"
-    echo "Remote public IP: ${REMOTE_PUBLIC_IP:-unknown}"
-    echo "Local TCP IP    : ${LOCAL_TCP_IP:-unknown}"
-    echo "Remote TCP IP   : ${REMOTE_TCP_IP:-unknown}"
-    if [ "${TCP_MODE:-}" = "server" ]; then
-      echo "Local listen    : ${LOCAL_TCP_PORT:-unknown}/tcp"
-    else
-      echo "Remote endpoint : ${REMOTE_PUBLIC_IP:-unknown}:${REMOTE_TCP_PORT:-unknown}/tcp"
-    fi
+    echo "Manager version   : ${MANAGER_VERSION:-unknown}"
+    echo "Implementation    : ${TCPTUN_IMPLEMENTATION:-unknown}"
+    echo "Role/mode         : ${SERVER_ROLE:-unknown} / ${TCP_MODE:-unknown}"
+    echo "Local public IP   : ${LOCAL_PUBLIC_IP:-unknown}"
+    echo "Remote public IP  : ${REMOTE_PUBLIC_IP:-unknown}"
+    echo "Local TCP IP      : ${LOCAL_TCP_IP:-unknown}"
+    echo "Remote TCP IP     : ${REMOTE_TCP_IP:-unknown}"
+    echo "Local TCP port    : ${LOCAL_TCP_PORT:-not-used}"
+    echo "Remote TCP port   : ${REMOTE_TCP_PORT:-not-used}"
+    echo "Cipher            : ${TCPTUN_CIPHER:-unknown}"
+    echo "Short-code fp     : ${TCPTUN_KEY_FINGERPRINT:-unknown}"
   else
     echo "No metadata found for tunnel $id."
   fi
 
   if command -v systemctl >/dev/null 2>&1; then
-    echo "Systemd service : $(systemctl is-active "$svc" 2>/dev/null || true) / $(systemctl is-enabled "$svc" 2>/dev/null || true)"
+    echo "Systemd service   : $(systemctl is-active "$svc" 2>/dev/null || true) / $(systemctl is-enabled "$svc" 2>/dev/null || true)"
   fi
 
   if ip link show "$ifc" >/dev/null 2>&1; then
-    echo "$ifc interface  : exists"
+    echo "$ifc interface    : exists"
     ip -br addr show "$ifc" 2>/dev/null || true
     if tcptun_load_meta "$id" && [ -n "${REMOTE_TCP_IP:-}" ]; then
       echo
@@ -2888,14 +2728,14 @@ tcptun_check_one_tunnel() {
       else
         cat /tmp/tcptun_ping_$$.log
         echo "[WARN] TCP/OpenVPN inner ping failed"
-        echo "Diagnosis: check that Kharej is server, Iran is client, both use the same client bundle, and the server-side TCP port is open."
+        echo "Diagnosis: check that Kharej is server, Iran is client, both use the same short code, and TCP port is open."
       fi
       rm -f /tmp/tcptun_ping_$$.log
     fi
   else
-    echo "$ifc interface  : not found"
+    echo "$ifc interface    : not found"
     if [ -f "$(tcptun_ovpn_file "$id")" ]; then
-      echo "Config exists   : $(tcptun_ovpn_file "$id")"
+      echo "Config exists     : $(tcptun_ovpn_file "$id")"
     fi
     if command -v systemctl >/dev/null 2>&1; then
       echo
@@ -2905,7 +2745,7 @@ tcptun_check_one_tunnel() {
     if [ -s "$(tcptun_log_file "$id")" ]; then
       echo
       echo "Last OpenVPN log lines:"
-      tail -n 50 "$(tcptun_log_file "$id")" 2>/dev/null || true
+      tail -n 80 "$(tcptun_log_file "$id")" || true
     fi
   fi
 }
@@ -2938,11 +2778,14 @@ tcptun_status_check() {
 
 tcptun_restart_one_tunnel() {
   local id="$1"
-  local svc ifc
+  local ifc svc
   if ! validate_tunnel_id "$id"; then
     echo "Invalid TCP tunnel number." >&2
     return 1
   fi
+  ifc="$(tcptun_iface "$id")"
+  svc="$(tcptun_service_name "$id")"
+
   if ! tcptun_load_meta "$id"; then
     echo "No saved TCP/OpenVPN metadata found for tunnel $id." >&2
     return 1
@@ -2951,18 +2794,20 @@ tcptun_restart_one_tunnel() {
     echo "OpenVPN config file is missing. Re-run create/update for tunnel $id." >&2
     return 1
   fi
+  if [ ! -s "$(tcptun_key_file "$id")" ]; then
+    echo "Short-code key file is missing. Re-run create/update for tunnel $id." >&2
+    return 1
+  fi
 
-  svc="$(tcptun_service_name "$id")"
-  ifc="$(tcptun_iface "$id")"
   tcptun_ensure_tools || return 1
   tcptun_ensure_tun_device || return 1
   enable_ip_forward
   tcptun_apply_firewall_rules "$id"
 
   echo "Restarting TCP/OpenVPN tunnel $id ($ifc) with version ${MANAGER_VERSION:-unknown}..."
+  tcptun_clean_runtime "$id"
   if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload || true
-    tcptun_clean_runtime "$id"
     systemctl enable "$svc" >/dev/null 2>&1 || true
     if ! systemctl restart "$svc"; then
       echo "TCP/OpenVPN service failed to restart." >&2
@@ -2970,7 +2815,6 @@ tcptun_restart_one_tunnel() {
       return 1
     fi
   else
-    tcptun_clean_runtime "$id"
     openvpn --config "$(tcptun_ovpn_file "$id")" --daemon "tcptun$id"
   fi
 
@@ -2978,6 +2822,7 @@ tcptun_restart_one_tunnel() {
     tcptun_print_service_debug "$id"
     return 1
   fi
+
   echo "[OK] Restarted $ifc"
   tcptun_check_one_tunnel "$id"
 }
@@ -3011,20 +2856,23 @@ tcptun_remove_one_tunnel() {
   meta="$(tcptun_config_file "$id")"
   conf="$(tcptun_ovpn_file "$id")"
   key="$(tcptun_key_file "$id")"
-  pki="$(tcptun_pki_dir "$id")"
   svc="$(tcptun_service_name "$id")"
+  pki="$(tcptun_pki_dir "$id")"
 
   echo "Removing TCP/OpenVPN tunnel $id ($ifc)..."
   if command -v systemctl >/dev/null 2>&1; then
     systemctl disable --now "$svc" 2>/dev/null || true
-    systemctl reset-failed "$svc" >/dev/null 2>&1 || true
+    systemctl reset-failed "$svc" 2>/dev/null || true
   fi
   pkill -f "openvpn --config $conf" 2>/dev/null || true
   pkill -f "openvpn.*tunnel-$id\.ovpn" 2>/dev/null || true
+  ip link set "$ifc" down 2>/dev/null || true
   ip link delete "$ifc" 2>/dev/null || true
   tcptun_remove_firewall_rules "$id"
   rm -f "$meta" "$conf" "$key" "$(tcptun_log_file "$id")" "$(tcptun_status_file "$id")"
-  rm -rf "$pki"
+  rm -f "$TCPTUN_KEY_DIR/tunnel-$id.static.key" 2>/dev/null || true
+  rm -rf "$pki" 2>/dev/null || true
+  rm -f "/root/tcptun-client-bundle-$id.b64" 2>/dev/null || true
   if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload || true
   fi
@@ -3050,7 +2898,7 @@ tcptun_remove_menu() {
     echo "TCP/OpenVPN tunnel $selected_id was not found in the list."
     return
   fi
-  if confirm_yes "Are you sure you want to remove TCP/OpenVPN tunnel $selected_id completely, including TLS keys/bundles?"; then
+  if confirm_yes "Are you sure you want to remove TCP/OpenVPN tunnel $selected_id completely, including its short-code key?"; then
     tcptun_remove_one_tunnel "$selected_id"
   else
     echo "Cancelled."
@@ -3058,9 +2906,6 @@ tcptun_remove_menu() {
 }
 
 
-# -----------------------------
-# Shared helpers/menus
-# -----------------------------
 enable_ip_forward() {
   echo 1 > /proc/sys/net/ipv4/ip_forward || true
   if [ -f /etc/sysctl.conf ]; then
@@ -3123,7 +2968,7 @@ show_menu() {
   echo "5) repair/restart Normal GRE tunnel"
   echo "6) repair/restart WireGuard tunnel"
   echo "7) repair/restart TCP/OpenVPN tunnel"
-  echo "   (${SCRIPT_VERSION:-unknown}: TCP/OpenVPN TLS mode, no deprecated static key)"
+  echo "   (${SCRIPT_VERSION:-unknown}: TCP/OpenVPN short-code mode, one-line code)"
   echo "0) Exit"
   echo
   read -rp "Choose an option [0-7]: " CHOICE
