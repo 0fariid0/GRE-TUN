@@ -1,16 +1,13 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + WireGuard + FOU-GRE multi-tunnel manager v10
+# GRE + WireGuard + TCP multi-tunnel manager v12
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
-# - FOU-GRE tunnels use separate names/ranges/files: fougreN + 10.30.N.x
-# - FOU-GRE wraps GRE inside UDP, useful when raw GRE protocol 47 is filtered/throttled/lossy
-# - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
+# - TCP tunnels use OpenVPN over TCP with separate names/ranges/files: tcptunN + 10.40.N.x
+# - TCP mode is useful when raw GRE or UDP paths are filtered/throttled/lossy
 # - Local tunnel/bind IPv4 can be selected manually for servers with multiple IPs
-# - v10 asks role/tunnel/local/remote IP before FOU capability checks
-# - v10 auto-switches unsupported FOU-GRE servers to clear WireGuard UDP compatible mode
-# - v10 applies UDP port conflict checks to WireGuard and FOU-GRE
+# - v12 adds TCP/OpenVPN mode with TCP port conflict checks and isolated service/config names
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -23,9 +20,10 @@ WG_KEY_DIR="$WG_META_DIR/keys"
 WG_CONFIG_DIR="/etc/wireguard"
 WG_IFACE_PREFIX="wgtun"
 
-FOUGRE_CONFIG_DIR="/etc/fougre-tunnels"
-FOUGRE_SERVICE_TEMPLATE="/etc/systemd/system/fougre-tunnel@.service"
-FOUGRE_IFACE_PREFIX="fougre"
+TCPTUN_CONFIG_DIR="/etc/tcptun-tunnels"
+TCPTUN_KEY_DIR="$TCPTUN_CONFIG_DIR/keys"
+TCPTUN_SERVICE_TEMPLATE="/etc/systemd/system/tcptun@.service"
+TCPTUN_IFACE_PREFIX="tcptun"
 
 ensure_root() {
   if [ "$(id -u)" -ne 0 ]; then
@@ -150,17 +148,16 @@ ask_tunnel_type() {
   echo "Select tunnel type:"
   echo "1) Normal GRE tunnel"
   echo "2) WireGuard tunnel"
-  echo "3) Anti-loss UDP tunnel (FOU-GRE if supported; otherwise clear WireGuard fallback)"
+  echo "3) TCP tunnel (OpenVPN over TCP)"
   echo
   read -rp "Choose [1-3]: " TUNNEL_TYPE_CHOICE
   case "$TUNNEL_TYPE_CHOICE" in
     1) SELECTED_TUNNEL_TYPE="gre" ;;
     2) SELECTED_TUNNEL_TYPE="wireguard" ;;
-    3) SELECTED_TUNNEL_TYPE="fougre" ;;
+    3) SELECTED_TUNNEL_TYPE="tcptun" ;;
     *) echo "Invalid tunnel type"; return 1 ;;
   esac
 }
-
 confirm_yes() {
   local prompt="$1"
   local answer
@@ -185,234 +182,6 @@ write_var() {
   local name="$1"
   local value="${2:-}"
   printf '%s=%q\n' "$name" "$value"
-}
-
-validate_udp_port() {
-  local port="${1:-}"
-  [[ "$port" =~ ^[0-9]+$ ]] || return 1
-  [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
-}
-
-read_simple_config_value() {
-  local file="$1"
-  local key="$2"
-  [ -f "$file" ] || return 1
-  awk -F= -v k="$key" '$1 == k {print $2; exit}' "$file" | tr -d "'\""
-}
-
-udp_port_socket_in_use() {
-  local port="$1"
-  if command -v ss >/dev/null 2>&1; then
-    ss -H -lun 2>/dev/null | awk '{print $5}' | grep -Eq "(^|:|\])$port$" && return 0
-  fi
-  if command -v netstat >/dev/null 2>&1; then
-    netstat -lun 2>/dev/null | awk 'NR>2{print $4}' | grep -Eq "(^|:|\])$port$" && return 0
-  fi
-  return 1
-}
-
-udp_fou_port_registered() {
-  local port="$1"
-  command -v ip >/dev/null 2>&1 || return 1
-  ip fou show 2>/dev/null | grep -Eq "(^|[[:space:]])port[[:space:]]+$port([[:space:]]|$)"
-}
-
-udp_port_reserved_by_tunnel_configs() {
-  local port="$1"
-  local skip_file="${2:-}"
-  local f key value
-  for f in "$WG_META_DIR"/tunnel-*.conf "$FOUGRE_CONFIG_DIR"/tunnel-*.conf; do
-    [ -f "$f" ] || continue
-    [ -n "$skip_file" ] && [ "$f" = "$skip_file" ] && continue
-    for key in LOCAL_WG_PORT REMOTE_WG_PORT LOCAL_FOUGRE_PORT REMOTE_FOUGRE_PORT; do
-      value="$(read_simple_config_value "$f" "$key" 2>/dev/null || true)"
-      [ "$value" = "$port" ] && return 0
-    done
-  done
-  return 1
-}
-
-fougre_saved_uses_local_port() {
-  local id="$1"
-  local port="$2"
-  local file value
-  file="$FOUGRE_CONFIG_DIR/tunnel-$id.conf"
-  value="$(read_simple_config_value "$file" LOCAL_FOUGRE_PORT 2>/dev/null || true)"
-  [ "$value" = "$port" ]
-}
-
-udp_port_available_for_fougre() {
-  local port="$1"
-  local id="${2:-}"
-  local skip_file=""
-  validate_udp_port "$port" || return 1
-  [ -n "$id" ] && skip_file="$FOUGRE_CONFIG_DIR/tunnel-$id.conf"
-
-  if udp_port_socket_in_use "$port"; then
-    # ss/netstat may also show kernel FOU receive ports. Allow the current
-    # same-number FOU-GRE tunnel to reuse its own port during update/repair.
-    if ! { [ -n "$id" ] && fougre_saved_uses_local_port "$id" "$port" && udp_fou_port_registered "$port"; }; then
-      return 1
-    fi
-  fi
-
-  if udp_fou_port_registered "$port"; then
-    if ! { [ -n "$id" ] && fougre_saved_uses_local_port "$id" "$port"; }; then
-      return 1
-    fi
-  fi
-
-  if udp_port_reserved_by_tunnel_configs "$port" "$skip_file"; then
-    return 1
-  fi
-
-  return 0
-}
-
-find_free_udp_port_for_fougre() {
-  local start="$1"
-  local id="${2:-}"
-  local port
-  validate_udp_port "$start" || start=53001
-  port="$start"
-  while [ "$port" -le 65535 ]; do
-    if udp_port_available_for_fougre "$port" "$id"; then
-      echo "$port"
-      return 0
-    fi
-    port=$((port + 1))
-  done
-  return 1
-}
-
-prompt_local_udp_port_for_fougre() {
-  local default_port="$1"
-  local id="$2"
-  local input chosen
-  read -rp "Enter LOCAL FOU-GRE UDP receive port [$default_port, auto-safe]: " input
-  if [ -z "$input" ]; then
-    chosen="$(find_free_udp_port_for_fougre "$default_port" "$id")" || {
-      echo "Could not find a free UDP port for FOU-GRE." >&2
-      return 1
-    }
-    if [ "$chosen" != "$default_port" ]; then
-      echo "Default UDP port $default_port is busy/reserved; selected free port $chosen instead."
-    fi
-    LOCAL_FOUGRE_PORT="$chosen"
-    return 0
-  fi
-
-  if ! validate_udp_port "$input"; then
-    echo "Invalid UDP port: $input"
-    return 1
-  fi
-  if ! udp_port_available_for_fougre "$input" "$id"; then
-    echo "UDP port $input is already in use or reserved by another tunnel/service. Choose another port."
-    return 1
-  fi
-  LOCAL_FOUGRE_PORT="$input"
-}
-
-prompt_remote_udp_port() {
-  local default_port="$1"
-  local label="${2:-REMOTE UDP port}"
-  local input
-  read -rp "$label [$default_port]: " input
-  input="${input:-$default_port}"
-  if ! validate_udp_port "$input"; then
-    echo "Invalid UDP port: $input"
-    return 1
-  fi
-  REMOTE_FOUGRE_PORT="$input"
-}
-
-
-wg_saved_uses_local_port() {
-  local id="$1"
-  local port="$2"
-  local file value
-  file="$WG_META_DIR/tunnel-$id.conf"
-  value="$(read_simple_config_value "$file" LOCAL_WG_PORT 2>/dev/null || true)"
-  [ "$value" = "$port" ]
-}
-
-udp_port_available_for_wireguard() {
-  local port="$1"
-  local id="${2:-}"
-  local skip_file=""
-  validate_udp_port "$port" || return 1
-  [ -n "$id" ] && skip_file="$WG_META_DIR/tunnel-$id.conf"
-
-  # During update/repair the current wg interface may already be listening on
-  # its saved port. Allow that same tunnel to reuse its own port, but do not
-  # allow any other socket/config to collide with it.
-  if udp_port_socket_in_use "$port"; then
-    if ! { [ -n "$id" ] && wg_saved_uses_local_port "$id" "$port"; }; then
-      return 1
-    fi
-  fi
-
-  if udp_port_reserved_by_tunnel_configs "$port" "$skip_file"; then
-    return 1
-  fi
-
-  return 0
-}
-
-find_free_udp_port_for_wireguard() {
-  local start="$1"
-  local id="${2:-}"
-  local port
-  validate_udp_port "$start" || start=51801
-  port="$start"
-  while [ "$port" -le 65535 ]; do
-    if udp_port_available_for_wireguard "$port" "$id"; then
-      echo "$port"
-      return 0
-    fi
-    port=$((port + 1))
-  done
-  return 1
-}
-
-prompt_local_udp_port_for_wireguard() {
-  local default_port="$1"
-  local id="$2"
-  local input chosen
-  read -rp "Enter LOCAL WireGuard UDP ListenPort [$default_port, auto-safe]: " input
-  if [ -z "$input" ]; then
-    chosen="$(find_free_udp_port_for_wireguard "$default_port" "$id")" || {
-      echo "Could not find a free UDP port for WireGuard." >&2
-      return 1
-    }
-    if [ "$chosen" != "$default_port" ]; then
-      echo "Default WireGuard UDP port $default_port is busy/reserved; selected free port $chosen instead."
-    fi
-    LOCAL_WG_PORT="$chosen"
-    return 0
-  fi
-
-  if ! validate_udp_port "$input"; then
-    echo "Invalid UDP port: $input"
-    return 1
-  fi
-  if ! udp_port_available_for_wireguard "$input" "$id"; then
-    echo "UDP port $input is already in use or reserved by another tunnel/service. Choose another port."
-    return 1
-  fi
-  LOCAL_WG_PORT="$input"
-}
-
-prompt_remote_udp_port_for_wireguard() {
-  local default_port="$1"
-  local input
-  read -rp "Enter REMOTE server WireGuard UDP ListenPort [$default_port]: " input
-  input="${input:-$default_port}"
-  if ! validate_udp_port "$input"; then
-    echo "Invalid UDP port: $input"
-    return 1
-  fi
-  REMOTE_WG_PORT="$input"
 }
 
 # -----------------------------
@@ -1501,7 +1270,7 @@ wg_choose_auto_endpoint() {
 wg_menu_config_tunnel() {
   show_header "Configure WireGuard Tunnel"
   prompt_role || return
-  local selected_role existing_local_ip existing_remote_ip existing_peer_key existing_local_port existing_remote_port remote_ip_input
+  local selected_role existing_local_ip existing_remote_ip existing_peer_key remote_ip_input
   selected_role="$ROLE"
   echo
   prompt_tunnel_id "Enter WireGuard tunnel number before IP [1-254]: " || return
@@ -1509,8 +1278,6 @@ wg_menu_config_tunnel() {
   existing_local_ip=""
   existing_remote_ip=""
   existing_peer_key=""
-  existing_local_port=""
-  existing_remote_port=""
   local previous_endpoint_mode previous_endpoint_ip previous_transport_iface gre_saved_remote
   previous_endpoint_mode=""
   previous_endpoint_ip=""
@@ -1520,8 +1287,6 @@ wg_menu_config_tunnel() {
     existing_local_ip="${LOCAL_PUBLIC_IP:-}"
     existing_remote_ip="${REMOTE_PUBLIC_IP:-}"
     existing_peer_key="${REMOTE_WG_PUBLIC_KEY:-}"
-    existing_local_port="${LOCAL_WG_PORT:-}"
-    existing_remote_port="${REMOTE_WG_PORT:-}"
     previous_endpoint_mode="${WG_ENDPOINT_MODE:-}"
     previous_endpoint_ip="${WG_ENDPOINT_IP:-}"
     previous_transport_iface="${WG_TRANSPORT_IFACE:-}"
@@ -1545,10 +1310,10 @@ wg_menu_config_tunnel() {
   echo "Use this IP as the REMOTE server Public IPv4 on the other server: $LOCAL_PUBLIC_IP"
   echo
 
-  # Tunnel N defaults to UDP 51800+N, but v10 checks for conflicts before saving.
-  # If the default port is busy, the local ListenPort is moved to the next free UDP port.
-  prompt_local_udp_port_for_wireguard "${existing_local_port:-$(wg_default_port "$TUNNEL_ID")}" "$TUNNEL_ID" || return
-  prompt_remote_udp_port_for_wireguard "${existing_remote_port:-$LOCAL_WG_PORT}" || return
+  # Fewer questions: ports and AllowedIPs are generated from the tunnel number.
+  # Tunnel N uses UDP 51800+N on both sides and allows only the peer /32 by default.
+  LOCAL_WG_PORT="$(wg_default_port "$TUNNEL_ID")"
+  REMOTE_WG_PORT="$LOCAL_WG_PORT"
   EXTRA_ALLOWED_IPS=""
 
   REMOTE_PUBLIC_IP="$existing_remote_ip"
@@ -2009,255 +1774,375 @@ wg_remove_menu() {
   fi
 }
 
-
 # -----------------------------
-# FOU-GRE over UDP helpers
+# TCP/OpenVPN helpers
 # -----------------------------
-fougre_iface() {
-  echo "${FOUGRE_IFACE_PREFIX}$1"
+tcptun_iface() {
+  echo "${TCPTUN_IFACE_PREFIX}$1"
 }
 
-fougre_config_file() {
-  echo "$FOUGRE_CONFIG_DIR/tunnel-$1.conf"
+tcptun_config_file() {
+  echo "$TCPTUN_CONFIG_DIR/tunnel-$1.conf"
 }
 
-fougre_service_name() {
-  echo "fougre-tunnel@$1.service"
+tcptun_ovpn_file() {
+  echo "$TCPTUN_CONFIG_DIR/tunnel-$1.ovpn"
 }
 
-fougre_default_key() {
-  echo "$1"
+tcptun_key_file() {
+  echo "$TCPTUN_KEY_DIR/tunnel-$1.static.key"
 }
 
-fougre_default_port() {
+tcptun_service_name() {
+  echo "tcptun@$1.service"
+}
+
+tcptun_default_port() {
   local id="$1"
-  echo $((53000 + id))
+  echo $((44300 + id))
 }
 
-fougre_print_ip_plan() {
+tcptun_print_ip_plan() {
   local id="$1"
-  echo "FOU-GRE over UDP tunnel $id plan:"
-  echo "  Interface        : $(fougre_iface "$id")"
-  echo "  Config file      : $FOUGRE_CONFIG_DIR/tunnel-$id.conf"
-  echo "  Service          : $(fougre_service_name "$id")"
-  echo "  GRE key          : $(fougre_default_key "$id")"
-  echo "  Default UDP port : $(fougre_default_port "$id")"
-  echo "  Iran role IP     : 10.30.$id.1/30"
-  echo "  Kharej role IP   : 10.30.$id.2/30"
+  local port
+  port="$(tcptun_default_port "$id")"
+  echo "TCP/OpenVPN tunnel $id plan:"
+  echo "  Interface        : $(tcptun_iface "$id")"
+  echo "  Meta file        : $(tcptun_config_file "$id")"
+  echo "  OpenVPN config   : $(tcptun_ovpn_file "$id")"
+  echo "  Service          : $(tcptun_service_name "$id")"
+  echo "  Default TCP port : $port"
+  echo "  Iran role IP     : 10.40.$id.1"
+  echo "  Kharej role IP   : 10.40.$id.2"
   echo
-  echo "Normal GRE uses greN + 10.10.N.x, WireGuard uses wgtunN + 10.20.N.x."
-  echo "FOU-GRE uses fougreN + 10.30.N.x, so it stays isolated from the other types."
+  echo "GRE uses greN + 10.10.N.x and WireGuard uses wgtunN + 10.20.N.x."
+  echo "TCP mode uses tcptunN + 10.40.N.x, so it stays isolated from the other types."
+  echo "Default TCP mode: Iran role connects as TCP client; Kharej role listens as TCP server."
 }
 
-fougre_inner_ip_for_role() {
+tcptun_inner_ip_for_role() {
   local id="$1"
   local role="$2"
   if [ "$role" = "1" ]; then
-    echo "10.30.$id.1"
+    echo "10.40.$id.1"
   else
-    echo "10.30.$id.2"
+    echo "10.40.$id.2"
   fi
 }
 
-fougre_remote_inner_ip_for_role() {
+tcptun_remote_inner_ip_for_role() {
   local id="$1"
   local role="$2"
   if [ "$role" = "1" ]; then
-    echo "10.30.$id.2"
+    echo "10.40.$id.2"
   else
-    echo "10.30.$id.1"
+    echo "10.40.$id.1"
   fi
 }
 
-fougre_supported() {
-  command -v ip >/dev/null 2>&1 || return 1
-  ip fou help 2>&1 | grep -qi "Usage:" || return 1
-  # Try to load the kernel modules, but do not fail only because modprobe is
-  # unavailable or the modules are built into the kernel.
-  modprobe fou >/dev/null 2>&1 || true
-  modprobe ip_gre >/dev/null 2>&1 || true
-  ip fou show >/dev/null 2>&1 || return 1
+validate_tcp_port() {
+  local port="${1:-}"
+  [[ "$port" =~ ^[0-9]+$ ]] || return 1
+  [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
+}
+
+read_simple_config_value_tcp() {
+  local file="$1"
+  local key="$2"
+  [ -f "$file" ] || return 1
+  awk -F= -v k="$key" '$1 == k {print $2; exit}' "$file" | tr -d "'\""
+}
+
+tcp_port_socket_in_use() {
+  local port="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ss -H -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:|\])$port$" && return 0
+  fi
+  if command -v netstat >/dev/null 2>&1; then
+    netstat -ltn 2>/dev/null | awk 'NR>2{print $4}' | grep -Eq "(^|:|\])$port$" && return 0
+  fi
+  return 1
+}
+
+tcp_port_reserved_by_tcptun_configs() {
+  local port="$1"
+  local skip_file="${2:-}"
+  local f key value
+  for f in "$TCPTUN_CONFIG_DIR"/tunnel-*.conf; do
+    [ -f "$f" ] || continue
+    [ -n "$skip_file" ] && [ "$f" = "$skip_file" ] && continue
+    for key in LOCAL_TCP_PORT REMOTE_TCP_PORT; do
+      value="$(read_simple_config_value_tcp "$f" "$key" 2>/dev/null || true)"
+      [ "$value" = "$port" ] && return 0
+    done
+  done
+  return 1
+}
+
+tcptun_saved_uses_local_port() {
+  local id="$1"
+  local port="$2"
+  local file value
+  file="$(tcptun_config_file "$id")"
+  value="$(read_simple_config_value_tcp "$file" LOCAL_TCP_PORT 2>/dev/null || true)"
+  [ "$value" = "$port" ]
+}
+
+tcp_port_available_for_tcptun() {
+  local port="$1"
+  local id="${2:-}"
+  local skip_file=""
+  validate_tcp_port "$port" || return 1
+  [ -n "$id" ] && skip_file="$(tcptun_config_file "$id")"
+
+  if tcp_port_socket_in_use "$port"; then
+    if ! { [ -n "$id" ] && tcptun_saved_uses_local_port "$id" "$port"; }; then
+      return 1
+    fi
+  fi
+
+  if tcp_port_reserved_by_tcptun_configs "$port" "$skip_file"; then
+    return 1
+  fi
+
   return 0
 }
 
-fougre_print_unsupported_message() {
-  echo "FOU-GRE is not available on this server."
-  echo "Reason: this kernel/iproute2 does not support 'ip fou' in the current environment."
-  echo "Compatible mode: the script will use WireGuard over UDP instead."
-  echo "WireGuard uses separate wgtunN + 10.20.N.x, so it will not conflict with greN or fougreN."
+find_free_tcp_port_for_tcptun() {
+  local start="$1"
+  local id="${2:-}"
+  local port
+  validate_tcp_port "$start" || start=44301
+  port="$start"
+  while [ "$port" -le 65535 ]; do
+    if tcp_port_available_for_tcptun "$port" "$id"; then
+      echo "$port"
+      return 0
+    fi
+    port=$((port + 1))
+  done
+  return 1
 }
 
-fougre_ensure_tools() {
-  if ! command -v ip >/dev/null 2>&1; then
-    echo "iproute2 is required but 'ip' was not found." >&2
+prompt_local_tcp_port_for_tcptun() {
+  local default_port="$1"
+  local id="$2"
+  local input chosen
+  read -rp "Enter LOCAL TCP listen port for tcptun$id [$default_port, auto-safe]: " input
+  if [ -z "$input" ]; then
+    chosen="$(find_free_tcp_port_for_tcptun "$default_port" "$id")" || {
+      echo "Could not find a free TCP port for tcptun$id." >&2
+      return 1
+    }
+    if [ "$chosen" != "$default_port" ]; then
+      echo "Default TCP port $default_port is busy/reserved; selected free port $chosen instead."
+    fi
+    LOCAL_TCP_PORT="$chosen"
+    return 0
+  fi
+
+  if ! validate_tcp_port "$input"; then
+    echo "Invalid TCP port: $input"
     return 1
   fi
-  if ! fougre_supported; then
-    fougre_print_unsupported_message >&2
+  if ! tcp_port_available_for_tcptun "$input" "$id"; then
+    echo "TCP port $input is already in use or reserved by another service/tunnel. Choose another port."
     return 1
   fi
+  LOCAL_TCP_PORT="$input"
 }
 
-fougre_configure_wireguard_compatible_mode() {
-  local fixed_tunnel_id existing_peer_key existing_local_port existing_remote_port default_wg_port
-  local entered_local_public_ip entered_remote_public_ip selected_role answer
+prompt_remote_tcp_port_for_tcptun() {
+  local default_port="$1"
+  local input
+  read -rp "Enter REMOTE server TCP listen port for tcptun [$default_port]: " input
+  input="${input:-$default_port}"
+  if ! validate_tcp_port "$input"; then
+    echo "Invalid TCP port: $input"
+    return 1
+  fi
+  REMOTE_TCP_PORT="$input"
+}
 
-  fixed_tunnel_id="${TUNNEL_ID:-}"
-  if ! validate_tunnel_id "$fixed_tunnel_id"; then
-    echo "Internal error: fallback received an invalid tunnel number: ${fixed_tunnel_id:-empty}" >&2
+tcptun_ensure_tools() {
+  if command -v openvpn >/dev/null 2>&1; then
+    return 0
+  fi
+
+  echo "OpenVPN is not installed. Installing automatically..."
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y openvpn iproute2 iptables ca-certificates
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y openvpn iproute iptables ca-certificates
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y openvpn iproute iptables ca-certificates
+  else
+    echo "No supported package manager found. Install OpenVPN manually and run the script again." >&2
     return 1
   fi
 
-  entered_local_public_ip="${LOCAL_PUBLIC_IP:-}"
-  entered_remote_public_ip="${REMOTE_PUBLIC_IP:-}"
-  selected_role="${ROLE:-}"
+  command -v openvpn >/dev/null 2>&1
+}
 
-  existing_peer_key=""
-  existing_local_port=""
-  existing_remote_port=""
+tcptun_generate_key() {
+  local id="$1"
+  local key_file
+  key_file="$(tcptun_key_file "$id")"
+  mkdir -p "$TCPTUN_KEY_DIR"
+  chmod 700 "$TCPTUN_CONFIG_DIR" "$TCPTUN_KEY_DIR" 2>/dev/null || true
+  umask 077
+  if openvpn --genkey secret "$key_file" >/dev/null 2>&1; then
+    :
+  elif openvpn --genkey --secret "$key_file" >/dev/null 2>&1; then
+    :
+  else
+    echo "Failed to generate OpenVPN static key." >&2
+    return 1
+  fi
+  chmod 600 "$key_file"
+}
 
-  # wg_load_meta sources saved WireGuard variables. Preserve the values the user
-  # just entered in the FOU-GRE menu so old metadata cannot silently replace them.
-  if wg_load_meta "$fixed_tunnel_id"; then
-    existing_peer_key="${REMOTE_WG_PUBLIC_KEY:-}"
-    existing_local_port="${LOCAL_WG_PORT:-}"
-    existing_remote_port="${REMOTE_WG_PORT:-}"
+tcptun_key_to_b64() {
+  local key_file="$1"
+  if base64 -w 0 "$key_file" 2>/dev/null; then
+    return 0
+  fi
+  base64 "$key_file" | tr -d '\n'
+}
+
+tcptun_import_key_b64() {
+  local id="$1"
+  local b64="$2"
+  local key_file tmp
+  key_file="$(tcptun_key_file "$id")"
+  tmp="$key_file.tmp.$$"
+  mkdir -p "$TCPTUN_KEY_DIR"
+  chmod 700 "$TCPTUN_CONFIG_DIR" "$TCPTUN_KEY_DIR" 2>/dev/null || true
+  if ! printf '%s' "$b64" | tr -d '[:space:]' | base64 -d > "$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    echo "Invalid base64 key. Paste the one-line key printed by this script on the other server." >&2
+    return 1
+  fi
+  if ! grep -q "BEGIN OpenVPN Static key" "$tmp" || ! grep -q "END OpenVPN Static key" "$tmp"; then
+    rm -f "$tmp"
+    echo "Decoded key does not look like an OpenVPN static key." >&2
+    return 1
+  fi
+  mv -f "$tmp" "$key_file"
+  chmod 600 "$key_file"
+}
+
+tcptun_prepare_key_interactive() {
+  local id="$1"
+  local key_file input key_b64
+  key_file="$(tcptun_key_file "$id")"
+
+  echo
+  echo "OpenVPN TCP needs the SAME shared key file on both servers."
+  echo "This script prints that key as one single BASE64 line so you can copy/paste it safely."
+  echo
+
+  if [ -s "$key_file" ]; then
+    echo "Existing shared key found for tcptun$id."
+    read -rp "Press Enter to keep it, paste new BASE64 key, or type NEW to regenerate: " input
+    if [ "${input^^}" = "NEW" ]; then
+      tcptun_generate_key "$id" || return 1
+      echo "Generated a new shared key for tcptun$id. You MUST update the other server with this same key."
+    elif [ -n "$input" ]; then
+      tcptun_import_key_b64 "$id" "$input" || return 1
+      echo "Imported shared key for tcptun$id."
+    else
+      echo "Keeping existing shared key."
+    fi
+  else
+    echo "Paste shared key BASE64 from the other server, or press Enter to generate a new key here."
+    read -rp "Shared OpenVPN key BASE64 [generate new]: " input
+    if [ -n "$input" ]; then
+      tcptun_import_key_b64 "$id" "$input" || return 1
+      echo "Imported shared key for tcptun$id."
+    else
+      tcptun_generate_key "$id" || return 1
+      echo "Generated a new shared key for tcptun$id."
+    fi
   fi
 
-  # HARD LOCK: never let sourced WireGuard metadata or old shell variables change
-  # the tunnel number selected in the Anti-Loss/FOU-GRE menu.
-  TUNNEL_ID="$fixed_tunnel_id"
-  LOCAL_PUBLIC_IP="$entered_local_public_ip"
-  REMOTE_PUBLIC_IP="$entered_remote_public_ip"
-  ROLE="$selected_role"
-  REMOTE_WG_PUBLIC_KEY="$existing_peer_key"
-  default_wg_port="${existing_local_port:-$(wg_default_port "$fixed_tunnel_id")}"
-
+  key_b64="$(tcptun_key_to_b64 "$key_file")"
   echo
-  fougre_print_unsupported_message
+  echo "Copy this ONE-LINE shared key to the other server if it asks for BASE64 key:"
+  echo "$key_b64"
   echo
-  echo "You selected Anti-Loss/FOU-GRE menu option for tunnel number: $fixed_tunnel_id"
-  echo "But this server cannot create a real FOU-GRE tunnel because 'ip fou' is unsupported."
-  echo
-  echo "Fallback explanation:"
-  echo "  - It will create WireGuard, because WireGuard works on normal UDP on most kernels."
-  echo "  - The tunnel number will stay the SAME: $fixed_tunnel_id"
-  echo "  - Interface will be: $(wg_iface_name "$fixed_tunnel_id")"
-  echo "  - Inner IP range will be: 10.20.$fixed_tunnel_id.0/30"
-  echo "  - This may look like tunnel type 2 in status, because technically it is WireGuard."
-  echo "  - It is NOT changing your requested tunnel number to 2."
-  echo
-  echo "Remote public IP already entered: $REMOTE_PUBLIC_IP"
-  read -rp "Continue with WireGuard fallback using SAME tunnel number $fixed_tunnel_id? [Y/n]: " answer
-  case "$answer" in
-    [Nn]*) echo "Cancelled. Nothing was installed for tunnel $fixed_tunnel_id."; return 1 ;;
-  esac
-  echo
-
-  TUNNEL_ID="$fixed_tunnel_id"
-  prompt_local_udp_port_for_wireguard "$default_wg_port" "$fixed_tunnel_id" || return 1
-  prompt_remote_udp_port_for_wireguard "${existing_remote_port:-$LOCAL_WG_PORT}" || return 1
-
-  TUNNEL_ID="$fixed_tunnel_id"
-  WG_ENDPOINT_MODE="public"
-  WG_ENDPOINT_IP="$REMOTE_PUBLIC_IP"
-  WG_TRANSPORT_IFACE=""
-  WG_MTU="1420"
-  EXTRA_ALLOWED_IPS=""
-
-  echo
-  echo "WireGuard fallback values for SAME tunnel number $fixed_tunnel_id:"
-  echo "  Requested menu option   : 3 / Anti-Loss UDP"
-  echo "  Actual installed type   : WireGuard fallback"
-  echo "  Tunnel number           : $fixed_tunnel_id"
-  echo "  Interface               : $(wg_iface_name "$fixed_tunnel_id")"
-  echo "  Local endpoint IP       : $LOCAL_PUBLIC_IP"
-  echo "  Remote endpoint IP      : $REMOTE_PUBLIC_IP"
-  echo "  Local UDP ListenPort    : $LOCAL_WG_PORT"
-  echo "  Remote UDP ListenPort   : $REMOTE_WG_PORT"
-  echo "  Inner IP range          : 10.20.$fixed_tunnel_id.0/30"
-  echo "  MTU                     : $WG_MTU"
-  echo
-
-  TUNNEL_ID="$fixed_tunnel_id"
-  wg_create_tunnel 1
+  echo "Important: both servers must use this exact same key, otherwise the TCP tunnel will not connect."
 }
 
-fougre_offer_wireguard_fallback_from_current() {
-  local interactive="${1:-1}"
-  [ "$interactive" -eq 1 ] || return 1
-  fougre_configure_wireguard_compatible_mode
-}
-
-fougre_save_config() {
+tcptun_save_meta() {
   if ! validate_tunnel_id "${TUNNEL_ID:-}"; then
-    echo "Cannot save FOU-GRE config: invalid tunnel number" >&2
+    echo "Cannot save TCP tunnel metadata: invalid tunnel number" >&2
     return 1
   fi
 
-  mkdir -p "$FOUGRE_CONFIG_DIR"
+  mkdir -p "$TCPTUN_CONFIG_DIR" "$TCPTUN_KEY_DIR"
+  chmod 700 "$TCPTUN_CONFIG_DIR" "$TCPTUN_KEY_DIR" 2>/dev/null || true
   local file
-  file="$(fougre_config_file "$TUNNEL_ID")"
+  file="$(tcptun_config_file "$TUNNEL_ID")"
 
   {
-    write_var TUNNEL_TYPE "fougre"
+    write_var TUNNEL_TYPE "tcptun"
     write_var TUNNEL_ID "$TUNNEL_ID"
-    write_var FOUGRE_IFACE "$FOUGRE_IFACE"
-    write_var FOUGRE_KEY "$FOUGRE_KEY"
+    write_var TCPTUN_IFACE "$TCPTUN_IFACE"
     write_var ROLE "$ROLE"
     write_var SERVER_ROLE "${SERVER_ROLE:-}"
+    write_var TCP_MODE "$TCP_MODE"
     write_var LOCAL_PUBLIC_IP "$LOCAL_PUBLIC_IP"
     write_var REMOTE_PUBLIC_IP "$REMOTE_PUBLIC_IP"
-    write_var LOCAL_FOUGRE_IP "$LOCAL_FOUGRE_IP"
-    write_var REMOTE_FOUGRE_IP "$REMOTE_FOUGRE_IP"
-    write_var LOCAL_FOUGRE_PORT "$LOCAL_FOUGRE_PORT"
-    write_var REMOTE_FOUGRE_PORT "$REMOTE_FOUGRE_PORT"
-    write_var FOUGRE_MTU "${FOUGRE_MTU:-1360}"
+    write_var LOCAL_TCP_IP "$LOCAL_TCP_IP"
+    write_var REMOTE_TCP_IP "$REMOTE_TCP_IP"
+    write_var LOCAL_TCP_PORT "${LOCAL_TCP_PORT:-}"
+    write_var REMOTE_TCP_PORT "${REMOTE_TCP_PORT:-}"
+    write_var TCPTUN_MTU "${TCPTUN_MTU:-1400}"
+    write_var TCPTUN_CONFIG_FILE "$(tcptun_ovpn_file "$TUNNEL_ID")"
+    write_var TCPTUN_KEY_FILE "$(tcptun_key_file "$TUNNEL_ID")"
   } > "$file"
   chmod 600 "$file"
-  echo "Saved FOU-GRE tunnel $TUNNEL_ID configuration to $file"
+  echo "Saved TCP tunnel $TUNNEL_ID metadata to $file"
 }
 
-fougre_load_config() {
+tcptun_load_meta() {
   local id="${1:-${TUNNEL_ID:-}}"
   if ! validate_tunnel_id "$id"; then
     return 1
   fi
   local file
-  file="$(fougre_config_file "$id")"
+  file="$(tcptun_config_file "$id")"
   if [ -f "$file" ]; then
     # shellcheck disable=SC1090
     source "$file"
     TUNNEL_ID="$id"
-    FOUGRE_IFACE="${FOUGRE_IFACE:-$(fougre_iface "$id")}"
-    FOUGRE_KEY="${FOUGRE_KEY:-$id}"
-    LOCAL_FOUGRE_PORT="${LOCAL_FOUGRE_PORT:-$(fougre_default_port "$id")}"
-    REMOTE_FOUGRE_PORT="${REMOTE_FOUGRE_PORT:-$LOCAL_FOUGRE_PORT}"
-    FOUGRE_MTU="${FOUGRE_MTU:-1360}"
+    TCPTUN_IFACE="${TCPTUN_IFACE:-$(tcptun_iface "$id")}"
     return 0
   fi
   return 1
 }
 
-fougre_collect_ids() {
+tcptun_collect_ids() {
   {
-    if [ -d "$FOUGRE_CONFIG_DIR" ]; then
+    if [ -d "$TCPTUN_CONFIG_DIR" ]; then
       local f id
-      for f in "$FOUGRE_CONFIG_DIR"/tunnel-*.conf; do
+      for f in "$TCPTUN_CONFIG_DIR"/tunnel-*.conf; do
         [ -e "$f" ] || continue
         id="${f##*/tunnel-}"
         id="${id%.conf}"
         validate_tunnel_id "$id" && echo "$id"
       done
     fi
-    ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1 | grep -E "^${FOUGRE_IFACE_PREFIX}[0-9]+$" | sed "s/^${FOUGRE_IFACE_PREFIX}//" || true
+    ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1 | grep -E "^${TCPTUN_IFACE_PREFIX}[0-9]+$" | sed "s/^${TCPTUN_IFACE_PREFIX}//" || true
   } | sort -n -u
 }
 
-fougre_list_tunnels() {
-  echo "FOU-GRE over UDP tunnels:"
-  local ids id ifc file service_state remote local_port remote_port link_state
-  ids="$(fougre_collect_ids || true)"
+tcptun_list_tunnels() {
+  echo "TCP/OpenVPN tunnels:"
+  local ids id ifc meta service_state mode local_ip remote_ip port status
+  ids="$(tcptun_collect_ids || true)"
   if [ -z "$ids" ]; then
     echo "  none"
     return 0
@@ -2265,66 +2150,112 @@ fougre_list_tunnels() {
 
   while IFS= read -r id; do
     [ -n "$id" ] || continue
-    ifc="$(fougre_iface "$id")"
-    file="$(fougre_config_file "$id")"
+    ifc="$(tcptun_iface "$id")"
+    meta="$(tcptun_config_file "$id")"
     service_state="not-installed"
-    remote="unknown"
-    local_port="$(fougre_default_port "$id")"
-    remote_port="$local_port"
+    mode="unknown"
+    local_ip="unknown"
+    remote_ip="unknown"
+    port="unknown"
 
-    if fougre_load_config "$id"; then
-      remote="${REMOTE_PUBLIC_IP:-unknown}"
-      local_port="${LOCAL_FOUGRE_PORT:-$local_port}"
-      remote_port="${REMOTE_FOUGRE_PORT:-$remote_port}"
+    if tcptun_load_meta "$id"; then
+      mode="${TCP_MODE:-unknown}"
+      local_ip="${LOCAL_TCP_IP:-unknown}"
+      remote_ip="${REMOTE_TCP_IP:-unknown}"
+      if [ "${TCP_MODE:-}" = "server" ]; then
+        port="${LOCAL_TCP_PORT:-unknown}/tcp-listen"
+      else
+        port="${REMOTE_TCP_PORT:-unknown}/tcp-remote"
+      fi
     fi
 
     if command -v systemctl >/dev/null 2>&1; then
-      if [ -f "$FOUGRE_SERVICE_TEMPLATE" ]; then
-        service_state="template-installed"
-      fi
-      if systemctl is-enabled --quiet "$(fougre_service_name "$id")" 2>/dev/null; then
+      if systemctl is-enabled --quiet "$(tcptun_service_name "$id")" 2>/dev/null; then
         service_state="enabled"
       fi
-      if systemctl is-active --quiet "$(fougre_service_name "$id")" 2>/dev/null; then
+      if systemctl is-active --quiet "$(tcptun_service_name "$id")" 2>/dev/null; then
         service_state="active"
       fi
     fi
 
     if ip link show "$ifc" >/dev/null 2>&1; then
-      link_state="active"
+      status="active"
     else
-      link_state="inactive"
+      status="inactive"
     fi
-    echo "  - tunnel $id | iface $ifc | $link_state | UDP local/remote: $local_port/$remote_port | remote public: $remote | config: $file | service: $service_state"
+    echo "  - tunnel $id | iface $ifc | $status | mode: $mode | local IP: $local_ip | remote IP: $remote_ip | port: $port | meta: $meta | service: $service_state"
   done <<< "$ids"
 }
 
-fougre_disable_rp_filter() {
-  local ifc="${1:-}"
+tcptun_write_openvpn_config() {
+  local id="$1"
+  local conf key_file mtu
+  conf="$(tcptun_ovpn_file "$id")"
+  key_file="$(tcptun_key_file "$id")"
+  mtu="${TCPTUN_MTU:-1400}"
+
+  if [ ! -s "$key_file" ]; then
+    echo "OpenVPN shared key is missing: $key_file" >&2
+    return 1
+  fi
+
+  mkdir -p "$TCPTUN_CONFIG_DIR"
+  chmod 700 "$TCPTUN_CONFIG_DIR" 2>/dev/null || true
+
+  cat > "$conf" <<EOF_CONF
+# Generated by gretun-manager v12
+# TCP/OpenVPN tunnel $id
+mode p2p
+dev-type tun
+dev $TCPTUN_IFACE
+proto tcp-${TCP_MODE}
+ifconfig $LOCAL_TCP_IP $REMOTE_TCP_IP
+secret $key_file
+persist-key
+persist-tun
+keepalive 10 60
+tun-mtu $mtu
+mssfix 1360
+verb 3
+EOF_CONF
+
+  if [ "$TCP_MODE" = "server" ]; then
+    {
+      echo "local $LOCAL_PUBLIC_IP"
+      echo "port $LOCAL_TCP_PORT"
+    } >> "$conf"
+  else
+    {
+      echo "remote $REMOTE_PUBLIC_IP $REMOTE_TCP_PORT"
+      echo "nobind"
+      echo "connect-retry 3 5"
+      echo "connect-retry-max infinite"
+      echo "resolv-retry infinite"
+    } >> "$conf"
+  fi
+
+  chmod 600 "$conf"
+  echo "OpenVPN TCP config written: $conf"
+}
+
+tcptun_apply_firewall_rules() {
+  local id="$1"
+  local ifc port mode remote remote_port
+  ifc="$(tcptun_iface "$id")"
+  port=""
+  mode=""
+  remote=""
+  remote_port=""
+  if tcptun_load_meta "$id"; then
+    port="${LOCAL_TCP_PORT:-}"
+    mode="${TCP_MODE:-}"
+    remote="${REMOTE_PUBLIC_IP:-}"
+    remote_port="${REMOTE_TCP_PORT:-}"
+  fi
+
   for rp in /proc/sys/net/ipv4/conf/all/rp_filter /proc/sys/net/ipv4/conf/default/rp_filter "/proc/sys/net/ipv4/conf/$ifc/rp_filter"; do
     [ -e "$rp" ] && echo 0 > "$rp" 2>/dev/null || true
   done
-
-  mkdir -p /etc/sysctl.d 2>/dev/null || true
-  cat > /etc/sysctl.d/99-fougre-multitunnel.conf <<EOF_SYSCTL
-net.ipv4.ip_forward=1
-net.ipv4.conf.all.rp_filter=0
-net.ipv4.conf.default.rp_filter=0
-EOF_SYSCTL
-  sysctl -q -p /etc/sysctl.d/99-fougre-multitunnel.conf >/dev/null 2>&1 || true
-}
-
-fougre_apply_firewall_rules() {
-  local id="$1"
-  local ifc remote local_ip local_port remote_port subnet
-  ifc="$(fougre_iface "$id")"
-  remote="${REMOTE_PUBLIC_IP:-}"
-  local_ip="${LOCAL_PUBLIC_IP:-}"
-  local_port="${LOCAL_FOUGRE_PORT:-$(fougre_default_port "$id")}"
-  remote_port="${REMOTE_FOUGRE_PORT:-$local_port}"
-  subnet="10.30.$id.0/24"
-
-  fougre_disable_rp_filter "$ifc"
 
   if command -v iptables >/dev/null 2>&1; then
     iptables -C INPUT -i "$ifc" -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -i "$ifc" -j ACCEPT || true
@@ -2332,52 +2263,46 @@ fougre_apply_firewall_rules() {
     iptables -C FORWARD -i "$ifc" -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -i "$ifc" -j ACCEPT || true
     iptables -C FORWARD -o "$ifc" -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -o "$ifc" -j ACCEPT || true
 
-    iptables -C INPUT -s "$subnet" -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -s "$subnet" -j ACCEPT || true
-    iptables -C OUTPUT -d "$subnet" -j ACCEPT 2>/dev/null || iptables -I OUTPUT 1 -d "$subnet" -j ACCEPT || true
-    iptables -C FORWARD -s "$subnet" -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -s "$subnet" -j ACCEPT || true
-    iptables -C FORWARD -d "$subnet" -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -d "$subnet" -j ACCEPT || true
-
-    if [ -n "$remote" ]; then
-      if [ -n "$local_ip" ]; then
-        iptables -C INPUT -p udp -s "$remote" -d "$local_ip" --dport "$local_port" -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -p udp -s "$remote" -d "$local_ip" --dport "$local_port" -j ACCEPT || true
-        iptables -C OUTPUT -p udp -s "$local_ip" -d "$remote" --dport "$remote_port" -j ACCEPT 2>/dev/null || iptables -I OUTPUT 1 -p udp -s "$local_ip" -d "$remote" --dport "$remote_port" -j ACCEPT || true
-      fi
-      iptables -C INPUT -p udp -s "$remote" --dport "$local_port" -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -p udp -s "$remote" --dport "$local_port" -j ACCEPT || true
-      iptables -C OUTPUT -p udp -d "$remote" --dport "$remote_port" -j ACCEPT 2>/dev/null || iptables -I OUTPUT 1 -p udp -d "$remote" --dport "$remote_port" -j ACCEPT || true
-    else
-      iptables -C INPUT -p udp --dport "$local_port" -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -p udp --dport "$local_port" -j ACCEPT || true
+    if [ "$mode" = "server" ] && [ -n "$port" ]; then
+      iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -p tcp --dport "$port" -j ACCEPT || true
+    fi
+    if [ "$mode" = "client" ] && [ -n "$remote" ] && [ -n "$remote_port" ]; then
+      iptables -C OUTPUT -p tcp -d "$remote" --dport "$remote_port" -j ACCEPT 2>/dev/null || iptables -I OUTPUT 1 -p tcp -d "$remote" --dport "$remote_port" -j ACCEPT || true
     fi
   fi
 
   if command -v ufw >/dev/null 2>&1; then
-    ufw allow "$local_port/udp" comment "fougre$id" >/dev/null 2>&1 || true
     ufw allow in on "$ifc" >/dev/null 2>&1 || true
     ufw allow out on "$ifc" >/dev/null 2>&1 || true
     ufw route allow in on "$ifc" >/dev/null 2>&1 || true
     ufw route allow out on "$ifc" >/dev/null 2>&1 || true
+    if [ "$mode" = "server" ] && [ -n "$port" ]; then
+      ufw allow "$port/tcp" comment "tcptun$id" >/dev/null 2>&1 || true
+    fi
   fi
 
   if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-    firewall-cmd --permanent --add-port="$local_port/udp" >/dev/null 2>&1 || true
+    if [ "$mode" = "server" ] && [ -n "$port" ]; then
+      firewall-cmd --permanent --add-port="$port/tcp" >/dev/null 2>&1 || true
+    fi
     firewall-cmd --permanent --add-interface="$ifc" >/dev/null 2>&1 || true
     firewall-cmd --reload >/dev/null 2>&1 || true
   fi
 }
 
-fougre_remove_firewall_rules() {
+tcptun_remove_firewall_rules() {
   local id="$1"
-  local ifc subnet local_port remote remote_port local_ip
-  ifc="$(fougre_iface "$id")"
-  subnet="10.30.$id.0/24"
-  local_port="$(fougre_default_port "$id")"
-  remote_port="$local_port"
+  local ifc port mode remote remote_port
+  ifc="$(tcptun_iface "$id")"
+  port=""
+  mode=""
   remote=""
-  local_ip=""
-  if fougre_load_config "$id"; then
-    local_port="${LOCAL_FOUGRE_PORT:-$local_port}"
-    remote_port="${REMOTE_FOUGRE_PORT:-$remote_port}"
+  remote_port=""
+  if tcptun_load_meta "$id"; then
+    port="${LOCAL_TCP_PORT:-}"
+    mode="${TCP_MODE:-}"
     remote="${REMOTE_PUBLIC_IP:-}"
-    local_ip="${LOCAL_PUBLIC_IP:-}"
+    remote_port="${REMOTE_TCP_PORT:-}"
   fi
 
   if command -v iptables >/dev/null 2>&1; then
@@ -2385,28 +2310,57 @@ fougre_remove_firewall_rules() {
     while iptables -C OUTPUT -o "$ifc" -j ACCEPT 2>/dev/null; do iptables -D OUTPUT -o "$ifc" -j ACCEPT || break; done
     while iptables -C FORWARD -i "$ifc" -j ACCEPT 2>/dev/null; do iptables -D FORWARD -i "$ifc" -j ACCEPT || break; done
     while iptables -C FORWARD -o "$ifc" -j ACCEPT 2>/dev/null; do iptables -D FORWARD -o "$ifc" -j ACCEPT || break; done
-    while iptables -C INPUT -s "$subnet" -j ACCEPT 2>/dev/null; do iptables -D INPUT -s "$subnet" -j ACCEPT || break; done
-    while iptables -C OUTPUT -d "$subnet" -j ACCEPT 2>/dev/null; do iptables -D OUTPUT -d "$subnet" -j ACCEPT || break; done
-    while iptables -C FORWARD -s "$subnet" -j ACCEPT 2>/dev/null; do iptables -D FORWARD -s "$subnet" -j ACCEPT || break; done
-    while iptables -C FORWARD -d "$subnet" -j ACCEPT 2>/dev/null; do iptables -D FORWARD -d "$subnet" -j ACCEPT || break; done
-    while iptables -C INPUT -p udp --dport "$local_port" -j ACCEPT 2>/dev/null; do iptables -D INPUT -p udp --dport "$local_port" -j ACCEPT || break; done
-    [ -n "$remote" ] && while iptables -C INPUT -p udp -s "$remote" --dport "$local_port" -j ACCEPT 2>/dev/null; do iptables -D INPUT -p udp -s "$remote" --dport "$local_port" -j ACCEPT || break; done
-    [ -n "$remote" ] && while iptables -C OUTPUT -p udp -d "$remote" --dport "$remote_port" -j ACCEPT 2>/dev/null; do iptables -D OUTPUT -p udp -d "$remote" --dport "$remote_port" -j ACCEPT || break; done
-    [ -n "$remote" ] && [ -n "$local_ip" ] && while iptables -C INPUT -p udp -s "$remote" -d "$local_ip" --dport "$local_port" -j ACCEPT 2>/dev/null; do iptables -D INPUT -p udp -s "$remote" -d "$local_ip" --dport "$local_port" -j ACCEPT || break; done
-    [ -n "$remote" ] && [ -n "$local_ip" ] && while iptables -C OUTPUT -p udp -s "$local_ip" -d "$remote" --dport "$remote_port" -j ACCEPT 2>/dev/null; do iptables -D OUTPUT -p udp -s "$local_ip" -d "$remote" --dport "$remote_port" -j ACCEPT || break; done
-  fi
-
-  if command -v ufw >/dev/null 2>&1; then
-    ufw delete allow "$local_port/udp" >/dev/null 2>&1 || true
-  fi
-
-  if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-    firewall-cmd --permanent --remove-port="$local_port/udp" >/dev/null 2>&1 || true
-    firewall-cmd --reload >/dev/null 2>&1 || true
+    if [ "$mode" = "server" ] && [ -n "$port" ]; then
+      while iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null; do iptables -D INPUT -p tcp --dport "$port" -j ACCEPT || break; done
+    fi
+    if [ "$mode" = "client" ] && [ -n "$remote" ] && [ -n "$remote_port" ]; then
+      while iptables -C OUTPUT -p tcp -d "$remote" --dport "$remote_port" -j ACCEPT 2>/dev/null; do iptables -D OUTPUT -p tcp -d "$remote" --dport "$remote_port" -j ACCEPT || break; done
+    fi
   fi
 }
 
-fougre_create_tunnel() {
+tcptun_install_service() {
+  local id="${1:-${TUNNEL_ID:-}}"
+  local svc
+  if ! validate_tunnel_id "$id"; then
+    echo "Cannot enable TCP tunnel service: invalid tunnel number" >&2
+    return 1
+  fi
+  if ! command -v systemctl >/dev/null 2>&1; then
+    echo "systemctl not available on this system; cannot enable TCP tunnel service." >&2
+    return 1
+  fi
+  if [ ! -f "$(tcptun_ovpn_file "$id")" ]; then
+    echo "OpenVPN config not found: $(tcptun_ovpn_file "$id")" >&2
+    return 1
+  fi
+
+  svc="$(tcptun_service_name "$id")"
+  cat > "$TCPTUN_SERVICE_TEMPLATE" <<EOF_SERVICE
+[Unit]
+Description=TCP/OpenVPN Tunnel %i Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/bin/bash -lc 'exec openvpn --config "$TCPTUN_CONFIG_DIR/tunnel-%i.ovpn"'
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF_SERVICE
+
+  systemctl daemon-reload
+  systemctl stop "$svc" >/dev/null 2>&1 || true
+  ip link delete "$(tcptun_iface "$id")" 2>/dev/null || true
+  systemctl enable "$svc" || return 1
+  systemctl restart "$svc" || return 1
+  echo "TCP/OpenVPN service enabled and started ($svc)"
+}
+
+tcptun_create_tunnel() {
   local interactive=${1:-0}
 
   if ! validate_tunnel_id "${TUNNEL_ID:-}"; then
@@ -2414,413 +2368,323 @@ fougre_create_tunnel() {
     return 1
   fi
 
-  if ! fougre_ensure_tools; then
-    fougre_offer_wireguard_fallback_from_current "$interactive"
-    return $?
-  fi
-
-  FOUGRE_IFACE="$(fougre_iface "$TUNNEL_ID")"
-  FOUGRE_KEY="${FOUGRE_KEY:-$(fougre_default_key "$TUNNEL_ID")}"
-  LOCAL_FOUGRE_PORT="${LOCAL_FOUGRE_PORT:-$(fougre_default_port "$TUNNEL_ID")}"
-  REMOTE_FOUGRE_PORT="${REMOTE_FOUGRE_PORT:-$LOCAL_FOUGRE_PORT}"
-  FOUGRE_MTU="${FOUGRE_MTU:-1360}"
-
+  tcptun_ensure_tools || return 1
+  TCPTUN_IFACE="$(tcptun_iface "$TUNNEL_ID")"
   LOCAL_PUBLIC_IP="${LOCAL_PUBLIC_IP:-$(detect_local_public_ip)}"
   if [ -z "${LOCAL_PUBLIC_IP:-}" ]; then
     echo "Failed to detect local public IPv4" >&2
     return 1
   fi
 
-  if [ "$ROLE" == "1" ]; then
+  if [ "$ROLE" = "1" ]; then
     SERVER_ROLE="IRAN"
-    LOCAL_FOUGRE_IP="10.30.$TUNNEL_ID.1/30"
-    REMOTE_FOUGRE_IP="10.30.$TUNNEL_ID.2"
+    TCP_MODE="client"
+    LOCAL_TCP_IP="10.40.$TUNNEL_ID.1"
+    REMOTE_TCP_IP="10.40.$TUNNEL_ID.2"
   else
     SERVER_ROLE="KHAREJ"
-    LOCAL_FOUGRE_IP="10.30.$TUNNEL_ID.2/30"
-    REMOTE_FOUGRE_IP="10.30.$TUNNEL_ID.1"
+    TCP_MODE="server"
+    LOCAL_TCP_IP="10.40.$TUNNEL_ID.2"
+    REMOTE_TCP_IP="10.40.$TUNNEL_ID.1"
   fi
 
-  echo "[*] Local server public IP: $LOCAL_PUBLIC_IP"
-  echo "[*] Tunnel type: FOU-GRE over UDP"
-  echo "[*] Tunnel number: $TUNNEL_ID"
-  echo "[*] Interface: $FOUGRE_IFACE"
-  echo "[*] GRE key: $FOUGRE_KEY"
-  echo "[*] Server role: $SERVER_ROLE"
-  echo "[*] Remote server public IP: $REMOTE_PUBLIC_IP"
-  echo "[*] Local UDP receive port: $LOCAL_FOUGRE_PORT"
-  echo "[*] Remote UDP endpoint port: $REMOTE_FOUGRE_PORT"
-  echo "[*] MTU: $FOUGRE_MTU"
+  TCPTUN_MTU="${TCPTUN_MTU:-1400}"
 
-  ip link set "$FOUGRE_IFACE" down 2>/dev/null || true
-  ip tunnel del "$FOUGRE_IFACE" 2>/dev/null || true
-  ip link delete "$FOUGRE_IFACE" 2>/dev/null || true
-  ip fou del port "$LOCAL_FOUGRE_PORT" local "$LOCAL_PUBLIC_IP" 2>/dev/null || true
-  ip fou del port "$LOCAL_FOUGRE_PORT" 2>/dev/null || true
-
-  if ! ip fou add port "$LOCAL_FOUGRE_PORT" ipproto 47 local "$LOCAL_PUBLIC_IP" 2>/dev/null; then
-    if ! ip fou add port "$LOCAL_FOUGRE_PORT" ipproto 47 2>/dev/null; then
-      echo "Could not register FOU receive port $LOCAL_FOUGRE_PORT. Falling back if interactive." >&2
-      fougre_offer_wireguard_fallback_from_current "$interactive"
-      return $?
-    fi
-  fi
-
-  if ! ip link add name "$FOUGRE_IFACE" type gre local "$LOCAL_PUBLIC_IP" remote "$REMOTE_PUBLIC_IP" key "$FOUGRE_KEY" ttl 255 encap fou encap-sport auto encap-dport "$REMOTE_FOUGRE_PORT" 2>/dev/null; then
-    if ! ip tunnel add "$FOUGRE_IFACE" mode gre local "$LOCAL_PUBLIC_IP" remote "$REMOTE_PUBLIC_IP" key "$FOUGRE_KEY" ttl 255 encap fou encap-sport auto encap-dport "$REMOTE_FOUGRE_PORT" 2>/dev/null; then
-      echo "Could not create FOU-GRE interface. Falling back if interactive." >&2
-      ip fou del port "$LOCAL_FOUGRE_PORT" local "$LOCAL_PUBLIC_IP" 2>/dev/null || true
-      ip fou del port "$LOCAL_FOUGRE_PORT" 2>/dev/null || true
-      fougre_offer_wireguard_fallback_from_current "$interactive"
-      return $?
-    fi
-  fi
-  ip addr add "$LOCAL_FOUGRE_IP" dev "$FOUGRE_IFACE"
-  ip link set "$FOUGRE_IFACE" mtu "$FOUGRE_MTU"
-  ip link set "$FOUGRE_IFACE" up
-
-  if ! ip link show "$FOUGRE_IFACE" >/dev/null 2>&1; then
-    echo "FOU-GRE interface creation failed" >&2
+  if [ "$interactive" -eq 1 ]; then
+    tcptun_prepare_key_interactive "$TUNNEL_ID" || return 1
+  elif [ ! -s "$(tcptun_key_file "$TUNNEL_ID")" ]; then
+    echo "OpenVPN shared key is missing. Re-run create/update interactively." >&2
     return 1
   fi
 
-  enable_ip_forward
-  fougre_apply_firewall_rules "$TUNNEL_ID"
-
-  echo "[OK] FOU-GRE over UDP tunnel created as $FOUGRE_IFACE"
-  echo "Local FOU-GRE IP : $LOCAL_FOUGRE_IP"
-  echo "Remote FOU-GRE IP: $REMOTE_FOUGRE_IP"
-
-  if [ "$interactive" -eq 1 ]; then
-    fougre_save_config
-    if [ -f "$(fougre_config_file "$TUNNEL_ID")" ] && command -v systemctl >/dev/null 2>&1; then
-      if fougre_install_service "$TUNNEL_ID"; then
-        echo "FOU-GRE persistence enabled for $(fougre_service_name "$TUNNEL_ID")."
-      else
-        echo "Failed to enable FOU-GRE persistence. Tunnel is currently created, but it may not survive reboot." >&2
-      fi
-    fi
+  echo "[*] Local server public IP: $LOCAL_PUBLIC_IP"
+  echo "[*] Remote server public IP: $REMOTE_PUBLIC_IP"
+  echo "[*] Tunnel type: TCP/OpenVPN"
+  echo "[*] Tunnel number: $TUNNEL_ID"
+  echo "[*] Interface: $TCPTUN_IFACE"
+  echo "[*] Server role: $SERVER_ROLE"
+  echo "[*] TCP mode: $TCP_MODE"
+  echo "[*] Local TCP inner IP: $LOCAL_TCP_IP"
+  echo "[*] Remote TCP inner IP: $REMOTE_TCP_IP"
+  if [ "$TCP_MODE" = "server" ]; then
+    echo "[*] Local TCP listen port: $LOCAL_TCP_PORT"
+  else
+    echo "[*] Remote TCP endpoint: $REMOTE_PUBLIC_IP:$REMOTE_TCP_PORT"
   fi
+
+  tcptun_write_openvpn_config "$TUNNEL_ID" || return 1
+  tcptun_save_meta
+  enable_ip_forward
+  tcptun_apply_firewall_rules "$TUNNEL_ID"
+
+  if command -v systemctl >/dev/null 2>&1; then
+    tcptun_install_service "$TUNNEL_ID" || {
+      echo "TCP/OpenVPN service failed to start." >&2
+      echo "Useful debug command: journalctl -xeu $(tcptun_service_name "$TUNNEL_ID") --no-pager" >&2
+      return 1
+    }
+  else
+    openvpn --config "$(tcptun_ovpn_file "$TUNNEL_ID")" --daemon "tcptun$TUNNEL_ID"
+  fi
+
+  echo "[OK] TCP/OpenVPN tunnel created as $TCPTUN_IFACE"
+  echo "Local TCP IP : $LOCAL_TCP_IP"
+  echo "Remote TCP IP: $REMOTE_TCP_IP"
+  echo
+  echo "After both sides are started, test:"
+  echo "  ping $REMOTE_TCP_IP"
 }
 
-fougre_menu_config_tunnel() {
-  show_header "Configure Anti-Loss UDP Tunnel"
+tcptun_menu_config_tunnel() {
+  show_header "Configure TCP/OpenVPN Tunnel"
   prompt_role || return
-  local selected_role existing_local_ip existing_remote_ip existing_local_port existing_remote_port existing_key
+  local selected_role existing_local_ip existing_remote_ip existing_local_port existing_remote_port
   selected_role="$ROLE"
   echo
-  prompt_tunnel_id "Enter tunnel number before IP [1-254]: " || return
+  prompt_tunnel_id "Enter TCP tunnel number before IP [1-254]: " || return
 
   existing_local_ip=""
   existing_remote_ip=""
   existing_local_port=""
   existing_remote_port=""
-  existing_key=""
-  if fougre_load_config "$TUNNEL_ID"; then
+  if tcptun_load_meta "$TUNNEL_ID"; then
     existing_local_ip="${LOCAL_PUBLIC_IP:-}"
     existing_remote_ip="${REMOTE_PUBLIC_IP:-}"
-    existing_local_port="${LOCAL_FOUGRE_PORT:-}"
-    existing_remote_port="${REMOTE_FOUGRE_PORT:-}"
-    existing_key="${FOUGRE_KEY:-}"
+    existing_local_port="${LOCAL_TCP_PORT:-}"
+    existing_remote_port="${REMOTE_TCP_PORT:-}"
   fi
   ROLE="$selected_role"
-  FOUGRE_KEY="${existing_key:-$(fougre_default_key "$TUNNEL_ID")}"
 
   echo
-  echo "Anti-loss UDP tunnel $TUNNEL_ID setup:"
-  echo "  Preferred mode       : FOU-GRE over UDP, if kernel/iproute2 supports it"
-  echo "  Compatible fallback  : WireGuard over UDP, if FOU-GRE is not supported"
-  echo "  Normal GRE untouched : greN + 10.10.N.x"
-  echo "  WireGuard isolated   : wgtunN + 10.20.N.x"
-  echo "  FOU-GRE isolated     : fougreN + 10.30.N.x"
+  tcptun_print_ip_plan "$TUNNEL_ID"
   echo
-  echo "First enter the public IPs. This is needed for both FOU-GRE and the compatible fallback."
-  prompt_local_tunnel_ip "${existing_local_ip:-$(detect_local_public_ip || true)}" "Enter LOCAL server Public IPv4 for this tunnel" || return
+  prompt_local_tunnel_ip "${existing_local_ip:-$(detect_local_public_ip || true)}" "Enter LOCAL server Public IPv4 for TCP tunnel" || return
   echo
   prompt_remote_public_ip "$existing_remote_ip" || return
 
-  if ! fougre_supported; then
-    fougre_configure_wireguard_compatible_mode || echo "WireGuard compatible tunnel creation failed"
-    return
+  if [ "$ROLE" = "1" ]; then
+    TCP_MODE="client"
+    REMOTE_TCP_PORT="${existing_remote_port:-$(tcptun_default_port "$TUNNEL_ID")}"
+    prompt_remote_tcp_port_for_tcptun "$REMOTE_TCP_PORT" || return
+    LOCAL_TCP_PORT=""
+  else
+    TCP_MODE="server"
+    LOCAL_TCP_PORT="${existing_local_port:-$(tcptun_default_port "$TUNNEL_ID")}"
+    prompt_local_tcp_port_for_tcptun "$LOCAL_TCP_PORT" "$TUNNEL_ID" || return
+    REMOTE_TCP_PORT=""
   fi
 
   echo
-  fougre_print_ip_plan "$TUNNEL_ID"
-  echo
-  echo "This server supports FOU-GRE, so the tunnel will wrap GRE protocol 47 inside UDP."
-  prompt_local_udp_port_for_fougre "${existing_local_port:-$(fougre_default_port "$TUNNEL_ID")}" "$TUNNEL_ID" || return
-  prompt_remote_udp_port "${existing_remote_port:-$LOCAL_FOUGRE_PORT}" "Enter REMOTE server FOU-GRE UDP receive port" || return
-  FOUGRE_MTU="1360"
-
-  echo
-  echo "FOU-GRE values for tunnel $TUNNEL_ID:"
-  echo "  Interface              : $(fougre_iface "$TUNNEL_ID")"
-  echo "  Local bind public IP   : $LOCAL_PUBLIC_IP"
-  echo "  Remote public IP       : $REMOTE_PUBLIC_IP"
-  echo "  Local UDP receive port : $LOCAL_FOUGRE_PORT"
-  echo "  Remote UDP port        : $REMOTE_FOUGRE_PORT"
-  echo "  Inner IP range         : 10.30.$TUNNEL_ID.0/30"
-  echo "  MTU                    : $FOUGRE_MTU"
+  echo "Auto TCP/OpenVPN values for tunnel $TUNNEL_ID:"
+  echo "  Interface        : $(tcptun_iface "$TUNNEL_ID")"
+  echo "  TCP mode         : $TCP_MODE"
+  echo "  Local inner IP   : $(tcptun_inner_ip_for_role "$TUNNEL_ID" "$ROLE")"
+  echo "  Remote inner IP  : $(tcptun_remote_inner_ip_for_role "$TUNNEL_ID" "$ROLE")"
+  if [ "$TCP_MODE" = "server" ]; then
+    echo "  Local TCP listen : $LOCAL_PUBLIC_IP:$LOCAL_TCP_PORT"
+    echo "  Other side must connect to this IP/port."
+  else
+    echo "  Remote TCP target: $REMOTE_PUBLIC_IP:$REMOTE_TCP_PORT"
+  fi
   echo
 
-  fougre_create_tunnel 1 || echo "FOU-GRE tunnel creation failed"
+  tcptun_create_tunnel 1 || echo "TCP/OpenVPN tunnel creation failed"
 }
 
-fougre_check_one_tunnel() {
+tcptun_check_one_tunnel() {
   local id="$1"
-  local ifc remote_public_of_tun
-  ifc="$(fougre_iface "$id")"
+  local ifc svc
+  ifc="$(tcptun_iface "$id")"
+  svc="$(tcptun_service_name "$id")"
 
   echo
-  echo "FOU-GRE tunnel $id ($ifc) status"
-  echo "-----------------------------------"
-  if fougre_load_config "$id"; then
-    echo "Saved role           : ${SERVER_ROLE:-unknown}"
-    echo "Local public IP      : ${LOCAL_PUBLIC_IP:-unknown}"
-    echo "Remote public IP     : ${REMOTE_PUBLIC_IP:-unknown}"
-    echo "Local FOU-GRE IP     : ${LOCAL_FOUGRE_IP:-unknown}"
-    echo "Remote FOU-GRE IP    : ${REMOTE_FOUGRE_IP:-unknown}"
-    echo "Local UDP port       : ${LOCAL_FOUGRE_PORT:-$(fougre_default_port "$id")}"
-    echo "Remote UDP port      : ${REMOTE_FOUGRE_PORT:-$(fougre_default_port "$id")}"
-    echo "MTU                  : ${FOUGRE_MTU:-1360}"
+  echo "TCP/OpenVPN tunnel $id ($ifc) status"
+  echo "--------------------------------------"
+
+  if tcptun_load_meta "$id"; then
+    echo "Saved role       : ${SERVER_ROLE:-unknown}"
+    echo "TCP mode         : ${TCP_MODE:-unknown}"
+    echo "Local public IP  : ${LOCAL_PUBLIC_IP:-unknown}"
+    echo "Remote public IP : ${REMOTE_PUBLIC_IP:-unknown}"
+    echo "Local TCP IP     : ${LOCAL_TCP_IP:-unknown}"
+    echo "Remote TCP IP    : ${REMOTE_TCP_IP:-unknown}"
+    if [ "${TCP_MODE:-}" = "server" ]; then
+      echo "Local listen     : ${LOCAL_TCP_PORT:-unknown}/tcp"
+    else
+      echo "Remote endpoint  : ${REMOTE_PUBLIC_IP:-unknown}:${REMOTE_TCP_PORT:-unknown}/tcp"
+    fi
   else
-    echo "No saved metadata found for tunnel $id."
+    echo "No metadata found for tunnel $id."
   fi
 
   if command -v systemctl >/dev/null 2>&1; then
-    echo "Systemd service      : $(systemctl is-active "$(fougre_service_name "$id")" 2>/dev/null || true) / $(systemctl is-enabled "$(fougre_service_name "$id")" 2>/dev/null || true)"
-  fi
-
-  echo
-  echo "FOU receive ports:"
-  if fougre_supported; then
-    ip fou show 2>/dev/null | grep -E "(^|[[:space:]])port[[:space:]]+${LOCAL_FOUGRE_PORT:-$(fougre_default_port "$id")}" || echo "  no matching FOU port found"
-  else
-    echo "  ip fou unsupported on this server"
+    echo "Systemd service  : $(systemctl is-active "$svc" 2>/dev/null || true) / $(systemctl is-enabled "$svc" 2>/dev/null || true)"
   fi
 
   if ip link show "$ifc" >/dev/null 2>&1; then
-    echo "$ifc interface       : exists"
+    echo "$ifc interface   : exists"
     ip -br addr show "$ifc" 2>/dev/null || true
-    remote_public_of_tun=$(ip tunnel show "$ifc" 2>/dev/null | awk -F'remote ' '{print $2}' | awk '{print $1}') || true
-    if [ -n "$remote_public_of_tun" ]; then
-      echo "Tunnel remote public IP: $remote_public_of_tun"
-      echo "Pinging remote public IP (1 try)..."
-      ping -c 1 -W 1 "$remote_public_of_tun" 2>&1 || true
-    fi
-
-    if fougre_load_config "$id" && [ -n "${REMOTE_FOUGRE_IP:-}" ]; then
+    if tcptun_load_meta "$id" && [ -n "${REMOTE_TCP_IP:-}" ]; then
       echo
-      echo "Pinging remote FOU-GRE inner IP $REMOTE_FOUGRE_IP (4 tries)..."
-      if ping -c 4 "$REMOTE_FOUGRE_IP" >/tmp/fougre_ping_$$.log 2>&1; then
-        cat /tmp/fougre_ping_$$.log
-        echo "[OK] FOU-GRE inner tunnel is UP"
+      echo "Pinging remote TCP tunnel inner IP $REMOTE_TCP_IP (4 tries)..."
+      if ping -c 4 "$REMOTE_TCP_IP" >/tmp/tcptun_ping_$$.log 2>&1; then
+        cat /tmp/tcptun_ping_$$.log
+        echo "[OK] TCP/OpenVPN tunnel is UP"
       else
-        cat /tmp/fougre_ping_$$.log
-        echo "[WARN] FOU-GRE inner ping failed"
-        echo "Diagnosis: check both sides use each other's public IPs, matching remote UDP ports, and that UDP ${LOCAL_FOUGRE_PORT:-$(fougre_default_port "$id")} is open inbound on this server. If public ping works but inner ping fails, run repair/restart on both sides."
+        cat /tmp/tcptun_ping_$$.log
+        echo "[WARN] TCP/OpenVPN inner ping failed"
+        echo "Diagnosis: check that exactly one side is TCP server, the other is TCP client, both use the same BASE64 key, and the server-side TCP port is open."
       fi
-      rm -f /tmp/fougre_ping_$$.log
+      rm -f /tmp/tcptun_ping_$$.log
     fi
   else
-    echo "$ifc interface       : not found"
+    echo "$ifc interface   : not found"
+    if [ -f "$(tcptun_ovpn_file "$id")" ]; then
+      echo "Config exists    : $(tcptun_ovpn_file "$id")"
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+      echo
+      echo "Last service log lines:"
+      journalctl -u "$svc" -n 30 --no-pager 2>/dev/null || true
+    fi
   fi
 }
 
-fougre_status_check() {
-  show_header "FOU-GRE over UDP Tunnel Status"
-  fougre_list_tunnels
+tcptun_status_check() {
+  show_header "TCP/OpenVPN Tunnel Status"
+  tcptun_list_tunnels
   echo
-  read -rp "Enter FOU-GRE tunnel number to check, or leave empty to check all listed FOU-GRE tunnels: " selected_id
+  read -rp "Enter TCP tunnel number to check, or leave empty to check all listed TCP tunnels: " selected_id
 
   if [ -n "$selected_id" ]; then
     if ! validate_tunnel_id "$selected_id"; then
       echo "Invalid tunnel number. Use 1 to 254."
       return
     fi
-    fougre_check_one_tunnel "$selected_id"
+    tcptun_check_one_tunnel "$selected_id"
     return
   fi
 
   local ids id
-  ids="$(fougre_collect_ids || true)"
+  ids="$(tcptun_collect_ids || true)"
   if [ -z "$ids" ]; then
-    echo "No FOU-GRE tunnels found."
+    echo "No TCP/OpenVPN tunnels found."
     return
   fi
   while IFS= read -r id; do
-    [ -n "$id" ] && fougre_check_one_tunnel "$id"
+    [ -n "$id" ] && tcptun_check_one_tunnel "$id"
   done <<< "$ids"
 }
 
-fougre_install_service() {
-  local id="${1:-${TUNNEL_ID:-}}"
-  if ! validate_tunnel_id "$id"; then
-    echo "Cannot install FOU-GRE service: invalid tunnel number" >&2
-    return 1
-  fi
-  if ! command -v systemctl >/dev/null 2>&1; then
-    echo "systemctl not available on this system; cannot install FOU-GRE service." >&2
-    return 1
-  fi
-
-  mkdir -p "$(dirname "$INSTALL_BIN")"
-  cp -f "$0" "$INSTALL_BIN"
-  chmod 755 "$INSTALL_BIN"
-
-  cat > "$FOUGRE_SERVICE_TEMPLATE" <<EOF_SERVICE
-[Unit]
-Description=FOU-GRE over UDP Tunnel %i Service
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/bin/bash $INSTALL_BIN --service start-fougre %i
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF_SERVICE
-
-  systemctl daemon-reload
-  systemctl enable "$(fougre_service_name "$id")"
-  echo "FOU-GRE service installed and enabled for boot ($(fougre_service_name "$id"))"
-}
-
-fougre_service_start() {
-  local id="${1:-${TUNNEL_ID:-}}"
-  if ! validate_tunnel_id "$id"; then
-    echo "FOU-GRE service start needs a tunnel number, e.g. --service start-fougre 1" >&2
-    return 1
-  fi
-  if fougre_load_config "$id"; then
-    echo "Starting FOU-GRE tunnel $id from saved config..."
-    fougre_create_tunnel 0
-  else
-    echo "No saved FOU-GRE configuration for tunnel $id at $(fougre_config_file "$id")." >&2
-    return 1
-  fi
-}
-
-fougre_restart_one_tunnel() {
+tcptun_restart_one_tunnel() {
   local id="$1"
-  local ifc svc
+  local svc ifc
   if ! validate_tunnel_id "$id"; then
-    echo "Invalid FOU-GRE tunnel number." >&2
+    echo "Invalid TCP tunnel number." >&2
     return 1
   fi
-  ifc="$(fougre_iface "$id")"
-  svc="$(fougre_service_name "$id")"
-
-  if ! fougre_load_config "$id"; then
-    echo "No saved FOU-GRE configuration found for tunnel $id." >&2
+  if ! tcptun_load_meta "$id"; then
+    echo "No saved TCP/OpenVPN metadata found for tunnel $id." >&2
+    return 1
+  fi
+  if [ ! -f "$(tcptun_ovpn_file "$id")" ]; then
+    echo "OpenVPN config file is missing. Re-run create/update for tunnel $id." >&2
     return 1
   fi
 
-  echo "Restarting FOU-GRE tunnel $id ($ifc) without touching other tunnels..."
+  svc="$(tcptun_service_name "$id")"
+  ifc="$(tcptun_iface "$id")"
+  tcptun_ensure_tools || return 1
   enable_ip_forward
-  fougre_disable_rp_filter "$ifc"
+  tcptun_apply_firewall_rules "$id"
 
-  if command -v systemctl >/dev/null 2>&1 && [ -f "$FOUGRE_SERVICE_TEMPLATE" ]; then
+  echo "Restarting TCP/OpenVPN tunnel $id ($ifc)..."
+  if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload || true
-    if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
-      if ! systemctl restart "$svc"; then
-        echo "Systemd restart failed; trying direct start from saved config..." >&2
-        fougre_create_tunnel 0
-      fi
-    else
-      fougre_create_tunnel 0
+    systemctl stop "$svc" >/dev/null 2>&1 || true
+    ip link delete "$ifc" 2>/dev/null || true
+    systemctl enable "$svc" >/dev/null 2>&1 || true
+    if ! systemctl restart "$svc"; then
+      echo "TCP/OpenVPN service failed to restart." >&2
+      journalctl -u "$svc" -n 30 --no-pager 2>/dev/null || true
+      return 1
     fi
   else
-    fougre_create_tunnel 0
+    pkill -f "openvpn --config $(tcptun_ovpn_file "$id")" 2>/dev/null || true
+    ip link delete "$ifc" 2>/dev/null || true
+    openvpn --config "$(tcptun_ovpn_file "$id")" --daemon "tcptun$id"
   fi
 
-  fougre_apply_firewall_rules "$id"
-  echo "[OK] Repaired/restarted $ifc"
-  fougre_check_one_tunnel "$id"
+  echo "[OK] Restarted $ifc"
+  tcptun_check_one_tunnel "$id"
 }
 
-fougre_repair_menu() {
-  show_header "FOU-GRE Repair / Restart"
-  fougre_list_tunnels
+tcptun_repair_menu() {
+  show_header "TCP/OpenVPN Repair / Restart"
+  tcptun_list_tunnels
   echo
   local ids selected_id
-  ids="$(fougre_collect_ids || true)"
+  ids="$(tcptun_collect_ids || true)"
   if [ -z "$ids" ]; then
-    echo "No FOU-GRE tunnels found."
+    echo "No TCP/OpenVPN tunnels found."
     return
   fi
-  read -rp "Enter FOU-GRE tunnel number to repair/restart, for example 1: " selected_id
+  read -rp "Enter TCP tunnel number to repair/restart, for example 1: " selected_id
   if ! validate_tunnel_id "$selected_id"; then
     echo "Invalid tunnel number."
     return
   fi
   if ! echo "$ids" | grep -qx "$selected_id"; then
-    echo "FOU-GRE tunnel $selected_id was not found in the list."
+    echo "TCP/OpenVPN tunnel $selected_id was not found in the list."
     return
   fi
-  fougre_restart_one_tunnel "$selected_id"
+  tcptun_restart_one_tunnel "$selected_id"
 }
 
-fougre_remove_one_tunnel() {
+tcptun_remove_one_tunnel() {
   local id="$1"
-  local ifc file local_port local_ip
-  ifc="$(fougre_iface "$id")"
-  file="$(fougre_config_file "$id")"
-  local_port="$(fougre_default_port "$id")"
-  local_ip=""
-  if fougre_load_config "$id"; then
-    local_port="${LOCAL_FOUGRE_PORT:-$local_port}"
-    local_ip="${LOCAL_PUBLIC_IP:-}"
-  fi
+  local ifc meta conf key svc
+  ifc="$(tcptun_iface "$id")"
+  meta="$(tcptun_config_file "$id")"
+  conf="$(tcptun_ovpn_file "$id")"
+  key="$(tcptun_key_file "$id")"
+  svc="$(tcptun_service_name "$id")"
 
-  echo "Removing FOU-GRE tunnel $id ($ifc)..."
-
+  echo "Removing TCP/OpenVPN tunnel $id ($ifc)..."
   if command -v systemctl >/dev/null 2>&1; then
-    systemctl disable --now "$(fougre_service_name "$id")" 2>/dev/null || true
+    systemctl disable --now "$svc" 2>/dev/null || true
   fi
-
-  ip link set dev "$ifc" down 2>/dev/null || true
-  ip tunnel del "$ifc" 2>/dev/null || true
+  pkill -f "openvpn --config $conf" 2>/dev/null || true
   ip link delete "$ifc" 2>/dev/null || true
-  if [ -n "$local_ip" ]; then
-    ip fou del port "$local_port" local "$local_ip" 2>/dev/null || true
-  fi
-  ip fou del port "$local_port" 2>/dev/null || true
-  fougre_remove_firewall_rules "$id"
-
-  rm -f "$file"
-  echo "- Config removed: $file"
-  echo "- FOU UDP receive port removed: $local_port"
-
+  tcptun_remove_firewall_rules "$id"
+  rm -f "$meta" "$conf" "$key"
   if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload || true
   fi
-  echo "[OK] FOU-GRE tunnel $id removed."
+  echo "[OK] TCP/OpenVPN tunnel $id removed."
 }
 
-fougre_remove_menu() {
-  show_header "Remove FOU-GRE over UDP Tunnel"
-  fougre_list_tunnels
+tcptun_remove_menu() {
+  show_header "Remove TCP/OpenVPN Tunnel"
+  tcptun_list_tunnels
   echo
   local ids selected_id
-  ids="$(fougre_collect_ids || true)"
+  ids="$(tcptun_collect_ids || true)"
   if [ -z "$ids" ]; then
-    echo "No FOU-GRE tunnels found."
+    echo "No TCP/OpenVPN tunnels found."
     return
   fi
-  read -rp "Enter FOU-GRE tunnel number to remove, for example 1: " selected_id
+  read -rp "Enter TCP tunnel number to remove, for example 1: " selected_id
   if ! validate_tunnel_id "$selected_id"; then
     echo "Invalid tunnel number."
     return
   fi
   if ! echo "$ids" | grep -qx "$selected_id"; then
-    echo "FOU-GRE tunnel $selected_id was not found in the list."
+    echo "TCP/OpenVPN tunnel $selected_id was not found in the list."
     return
   fi
-  if confirm_yes "Are you sure you want to remove FOU-GRE tunnel $selected_id completely?"; then
-    fougre_remove_one_tunnel "$selected_id"
+  if confirm_yes "Are you sure you want to remove TCP/OpenVPN tunnel $selected_id completely, including its shared key?"; then
+    tcptun_remove_one_tunnel "$selected_id"
   else
     echo "Cancelled."
   fi
@@ -2847,7 +2711,7 @@ menu_config_tunnel() {
   case "$SELECTED_TUNNEL_TYPE" in
     gre) gre_menu_config_tunnel ;;
     wireguard) wg_menu_config_tunnel ;;
-    fougre) fougre_menu_config_tunnel ;;
+    tcptun) tcptun_menu_config_tunnel ;;
   esac
 }
 
@@ -2857,7 +2721,7 @@ status_check() {
   case "$SELECTED_TUNNEL_TYPE" in
     gre) gre_status_check ;;
     wireguard) wg_status_check ;;
-    fougre) fougre_status_check ;;
+    tcptun) tcptun_status_check ;;
   esac
 }
 
@@ -2869,7 +2733,7 @@ remove_tun() {
   case "$SELECTED_TUNNEL_TYPE" in
     gre) gre_remove_menu ;;
     wireguard) wg_remove_menu ;;
-    fougre) fougre_remove_menu ;;
+    tcptun) tcptun_remove_menu ;;
   esac
 }
 
@@ -2879,19 +2743,19 @@ list_saved_tunnels() {
   echo
   wg_list_tunnels
   echo
-  fougre_list_tunnels
+  tcptun_list_tunnels
 }
 
 show_menu() {
-  show_header "GRE + WireGuard + Anti-Loss UDP Tunnel Management"
+  show_header "GRE + WireGuard + TCP Tunnel Management"
   echo "1) create/update tunnel"
   echo "2) status"
   echo "3) remove tunnel"
   echo "4) list saved/active tunnels"
   echo "5) repair/restart Normal GRE tunnel"
   echo "6) repair/restart WireGuard tunnel"
-  echo "7) repair/restart FOU-GRE over UDP tunnel"
-  echo "   (v11: explicit fallback, fixed tunnel-number lock, safer UDP port checks)"
+  echo "7) repair/restart TCP/OpenVPN tunnel"
+  echo "   (v12: added TCP/OpenVPN mode with safe TCP port checks)"
   echo "0) Exit"
   echo
   read -rp "Choose an option [0-7]: " CHOICE
@@ -2902,7 +2766,7 @@ show_menu() {
     4) list_saved_tunnels ; pause ;;
     5) gre_repair_menu ; pause ;;
     6) wg_repair_menu ; pause ;;
-    7) fougre_repair_menu ; pause ;;
+    7) tcptun_repair_menu ; pause ;;
     0) echo "Bye"; exit 0 ;;
     *) echo "Invalid option"; sleep 1 ;;
   esac
@@ -2916,11 +2780,6 @@ if [[ "${1:-}" == "--service" ]]; then
       gre_service_start "${3:-}"
       exit $?
       ;;
-    start-fougre)
-      ensure_root
-      fougre_service_start "${3:-}"
-      exit $?
-      ;;
     start)
       # Backward compatibility with older gre-tunnel@ service template.
       ensure_root
@@ -2928,7 +2787,7 @@ if [[ "${1:-}" == "--service" ]]; then
       exit $?
       ;;
     *)
-      echo "Unknown service command. Use --service start-gre <id> or --service start-fougre <id>." >&2
+      echo "Unknown service command. Use --service start-gre <id>." >&2
       exit 1
       ;;
   esac
