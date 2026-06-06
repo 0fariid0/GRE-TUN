@@ -1,16 +1,17 @@
 #!/bin/bash
 set -euo pipefail
 
-SCRIPT_VERSION="v17.0.0-tcp-shortcode"
+SCRIPT_VERSION="v19.0.0-tcp-latency"
 
-# GRE + WireGuard + TCP multi-tunnel manager v17
+# GRE + WireGuard + TCP multi-tunnel manager v19
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - TCP tunnels use OpenVPN over TCP with separate names/ranges/files: tcptunN + 10.40.N.x
 # - TCP mode is useful when raw GRE or UDP paths are filtered/throttled/lossy
 # - Local tunnel/bind IPv4 can be selected manually for servers with multiple IPs
-# - v17 replaces huge TCP TLS bundles with one short-code PSK
-# - v17 writes the manager version into tunnel metadata, OpenVPN configs, status, and service description
+# - v18 TCP mode uses only one short code prompt on Iran/client: paste code and press Enter
+# - v19 adds TCP latency tuning: TCP_NODELAY, small OpenVPN TCP queue, txqueuelen, lower MTU/MSS
+# - v19 writes the manager version into tunnel metadata, OpenVPN configs, status, and service description
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -152,7 +153,7 @@ ask_tunnel_type() {
   echo "Select tunnel type:"
   echo "1) Normal GRE tunnel"
   echo "2) WireGuard tunnel"
-  echo "3) TCP tunnel (OpenVPN over TCP)"
+  echo "3) TCP tunnel (OpenVPN over TCP - simple one-line code)"
   echo
   read -rp "Choose [1-3]: " TUNNEL_TYPE_CHOICE
   case "$TUNNEL_TYPE_CHOICE" in
@@ -1779,7 +1780,7 @@ wg_remove_menu() {
 }
 
 # -----------------------------
-# TCP/OpenVPN helpers (v17 short-code PSK mode)
+# TCP/OpenVPN helpers (v18 simple one-line code PSK mode)
 # -----------------------------
 tcptun_iface() {
   echo "${TCPTUN_IFACE_PREFIX}$1"
@@ -1798,7 +1799,7 @@ tcptun_key_file() {
 }
 
 tcptun_pki_dir() {
-  # Legacy v15/v16 cleanup path. v17 no longer uses PKI/bundles.
+  # Legacy v15/v16 cleanup path. v18 no longer uses PKI or long packages.
   echo "$TCPTUN_CONFIG_DIR/pki-$1"
 }
 
@@ -1817,7 +1818,7 @@ tcptun_print_ip_plan() {
   port="$(tcptun_default_port "$id")"
   echo "TCP/OpenVPN tunnel $id plan:"
   echo "  Manager version  : ${SCRIPT_VERSION:-unknown}"
-  echo "  Implementation   : OpenVPN TCP short-code PSK"
+  echo "  Implementation   : OpenVPN TCP simple-code PSK"
   echo "  Interface        : $(tcptun_iface "$id")"
   echo "  Meta file        : $(tcptun_config_file "$id")"
   echo "  OpenVPN config   : $(tcptun_ovpn_file "$id")"
@@ -1829,7 +1830,7 @@ tcptun_print_ip_plan() {
   echo
   echo "GRE uses greN + 10.10.N.x and WireGuard uses wgtunN + 10.20.N.x."
   echo "TCP mode uses tcptunN + 10.40.N.x, so it stays isolated from the other types."
-  echo "v17 uses ONE short code only. No files, no huge certificate bundle, no BF-CBC default."
+  echo "v18 uses ONE short code only. On Iran, paste the code and press Enter. No files, no package text, no BF-CBC default."
 }
 
 tcptun_inner_ip_for_role() {
@@ -2134,7 +2135,7 @@ tcptun_write_psk_from_code() {
     echo "#"
     echo "-----BEGIN OpenVPN Static key V1-----"
     for line in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
-      seed="gretun-manager|tcptun-v17|id=$id|line=$line|code=$code"
+      seed="gretun-manager|tcptun-v18|id=$id|line=$line|code=$code"
       hex="$(printf '%s' "$seed" | openssl dgst -sha256 -r | awk '{print substr($1,1,32)}')"
       printf '%s\n' "$hex"
     done
@@ -2143,62 +2144,46 @@ tcptun_write_psk_from_code() {
   chmod 600 "$keyfile"
   TCPTUN_KEY_FINGERPRINT="$(tcptun_code_fingerprint "$code")"
   echo "Wrote OpenVPN PSK key from short code: $keyfile"
-  echo "Short-code fingerprint: $TCPTUN_KEY_FINGERPRINT"
+  echo "Simple-code fingerprint: $TCPTUN_KEY_FINGERPRINT"
 }
 
 tcptun_prepare_short_code_interactive() {
-  local id="$1" input code keyfile existing_fp
-  keyfile="$(tcptun_key_file "$id")"
-  existing_fp="${TCPTUN_KEY_FINGERPRINT:-}"
+  local id="$1" input code
 
   echo
-  echo "TCP/OpenVPN ${SCRIPT_VERSION:-unknown} uses ONE short code."
-  echo "No file copy. No huge BASE64 bundle. Both servers must use the exact SAME one-line code."
-  echo "Best order: run Kharej/server first, press Enter to generate, then paste that code on Iran/client."
+  echo "TCP/OpenVPN ${SCRIPT_VERSION:-unknown} uses ONE SHORT CODE ONLY."
+  echo "Both servers must use the exact SAME one-line code."
+  echo "Kharej/server: press Enter to generate a code."
+  echo "Iran/client  : paste that exact code and press Enter."
+  echo "No file. No long text. No END line."
   echo
 
-  if [ -s "$keyfile" ]; then
-    echo "Existing short-code key found for tcptun$id. Fingerprint: ${existing_fp:-unknown}"
-    read -rp "Press Enter to keep it, paste a new short code, or type NEW to generate a new code: " input
+  if [ "${TCP_MODE:-}" = "server" ]; then
+    read -rp "TCP Short Code [Enter = generate new]: " input
     if [ -z "$input" ]; then
-      echo "Keeping existing short-code key."
-      return 0
-    fi
-    if [ "${input^^}" = "NEW" ]; then
       code="$(tcptun_generate_short_code "$id")"
     else
       code="$(tcptun_normalize_code "$input")"
     fi
   else
-    if [ "${TCP_MODE:-}" = "server" ]; then
-      read -rp "TCP Short Code [press Enter to generate new]: " input
-      if [ -z "$input" ]; then
-        code="$(tcptun_generate_short_code "$id")"
-      else
-        code="$(tcptun_normalize_code "$input")"
-      fi
-    else
-      echo "Iran/client side needs the one-line code printed by Kharej/server."
-      read -rp "Paste TCP Short Code from Kharej/server: " input
-      code="$(tcptun_normalize_code "$input")"
-      if [ -z "$code" ]; then
-        echo "No code entered. Run this tunnel on Kharej/server first and paste its code here." >&2
-        return 1
-      fi
+    read -rp "Paste TCP Short Code: " input
+    code="$(tcptun_normalize_code "$input")"
+    if [ -z "$code" ]; then
+      echo "No code entered. Run Kharej/server first, copy its TCP Short Code, then paste it here." >&2
+      return 1
     fi
   fi
 
   tcptun_write_psk_from_code "$id" "$code" || return 1
 
-  if [ "${TCP_MODE:-}" = "server" ] && { [ -z "${input:-}" ] || [ "${input^^}" = "NEW" ]; }; then
+  if [ "${TCP_MODE:-}" = "server" ]; then
     echo
-    echo "COPY THIS ONE-LINE TCP SHORT CODE TO THE OTHER SERVER:"
+    echo "COPY THIS TCP SHORT CODE TO IRAN:"
     echo "$code"
     echo
-    echo "On Iran/client, paste exactly this one line when it asks for TCP Short Code."
+    echo "On Iran/client, paste exactly this one line when it asks: Paste TCP Short Code:"
   fi
 }
-
 tcptun_key_ready() {
   local id="$1"
   [ -s "$(tcptun_key_file "$id")" ]
@@ -2218,7 +2203,7 @@ tcptun_save_meta() {
   {
     write_var MANAGER_VERSION "${SCRIPT_VERSION:-unknown}"
     write_var TUNNEL_TYPE "tcptun"
-    write_var TCPTUN_IMPLEMENTATION "openvpn-tcp-shortcode-psk"
+    write_var TCPTUN_IMPLEMENTATION "openvpn-tcp-simple-code-psk"
     write_var TUNNEL_ID "$TUNNEL_ID"
     write_var TCPTUN_IFACE "$TCPTUN_IFACE"
     write_var ROLE "$ROLE"
@@ -2230,7 +2215,10 @@ tcptun_save_meta() {
     write_var REMOTE_TCP_IP "$REMOTE_TCP_IP"
     write_var LOCAL_TCP_PORT "${LOCAL_TCP_PORT:-}"
     write_var REMOTE_TCP_PORT "${REMOTE_TCP_PORT:-}"
-    write_var TCPTUN_MTU "${TCPTUN_MTU:-1400}"
+    write_var TCPTUN_MTU "${TCPTUN_MTU:-1300}"
+    write_var TCPTUN_MSSFIX "${TCPTUN_MSSFIX:-1200}"
+    write_var TCPTUN_TCP_QUEUE_LIMIT "${TCPTUN_TCP_QUEUE_LIMIT:-8}"
+    write_var TCPTUN_TXQUEUELEN "${TCPTUN_TXQUEUELEN:-32}"
     write_var TCPTUN_CIPHER "${TCPTUN_CIPHER:-AES-256-CBC}"
     write_var TCPTUN_KEY_FINGERPRINT "${TCPTUN_KEY_FINGERPRINT:-}"
     write_var TCPTUN_CONFIG_FILE "$(tcptun_ovpn_file "$TUNNEL_ID")"
@@ -2255,7 +2243,7 @@ tcptun_load_meta() {
     TCPTUN_MTU="${TCPTUN_MTU:-1400}"
     TCPTUN_CIPHER="${TCPTUN_CIPHER:-AES-256-CBC}"
     MANAGER_VERSION="${MANAGER_VERSION:-unknown}"
-    TCPTUN_IMPLEMENTATION="${TCPTUN_IMPLEMENTATION:-openvpn-tcp-shortcode-psk}"
+    TCPTUN_IMPLEMENTATION="${TCPTUN_IMPLEMENTATION:-openvpn-tcp-simple-code-psk}"
     return 0
   fi
   return 1
@@ -2346,28 +2334,35 @@ tcptun_choose_cipher() {
 
 tcptun_write_openvpn_config() {
   local id="$1"
-  local conf keyfile mtu cipher
+  local conf keyfile mtu cipher mssfix tcp_queue txqlen
   conf="$(tcptun_ovpn_file "$id")"
   keyfile="$(tcptun_key_file "$id")"
-  mtu="${TCPTUN_MTU:-1400}"
+  mtu="${TCPTUN_MTU:-1300}"
+  mssfix="${TCPTUN_MSSFIX:-1200}"
+  tcp_queue="${TCPTUN_TCP_QUEUE_LIMIT:-8}"
+  txqlen="${TCPTUN_TXQUEUELEN:-32}"
   cipher="${TCPTUN_CIPHER:-$(tcptun_choose_cipher)}"
+  TCPTUN_MTU="$mtu"
+  TCPTUN_MSSFIX="$mssfix"
+  TCPTUN_TCP_QUEUE_LIMIT="$tcp_queue"
+  TCPTUN_TXQUEUELEN="$txqlen"
   TCPTUN_CIPHER="$cipher"
 
-  tcptun_key_ready "$id" || { echo "TCP short-code key is missing for tcptun$id." >&2; return 1; }
+  tcptun_key_ready "$id" || { echo "TCP simple-code key is missing for tcptun$id." >&2; return 1; }
 
   mkdir -p "$TCPTUN_CONFIG_DIR"
   chmod 700 "$TCPTUN_CONFIG_DIR" 2>/dev/null || true
 
   cat > "$conf" <<EOF_CONF
 # Generated by gretun-manager ${SCRIPT_VERSION:-unknown}
-# Tunnel type: TCP/OpenVPN short-code PSK
+# Tunnel type: TCP/OpenVPN simple-code PSK
 # Tunnel ID: $id
 # Interface: $TCPTUN_IFACE
 # Local inner IP: $LOCAL_TCP_IP
 # Remote inner IP: $REMOTE_TCP_IP
-# Implementation: openvpn-tcp-shortcode-psk
-# Short code fingerprint: ${TCPTUN_KEY_FINGERPRINT:-unknown}
-# NOTE: v17 intentionally uses a one-line short code-derived PSK.
+# Implementation: openvpn-tcp-simple-code-psk
+# Simple code fingerprint: ${TCPTUN_KEY_FINGERPRINT:-unknown}
+# NOTE: v19 uses a one-line simple code-derived PSK with TCP latency tuning.
 # NOTE: BF-CBC is never used; cipher is set explicitly below.
 dev $TCPTUN_IFACE
 dev-type tun
@@ -2381,8 +2376,17 @@ data-ciphers-fallback $cipher
 persist-key
 persist-tun
 keepalive 10 60
+# TCP latency tuning added in ${SCRIPT_VERSION:-unknown}
+# TCP_NODELAY sends small tunnel packets immediately instead of waiting to coalesce them.
+socket-flags TCP_NODELAY
+# Keep OpenVPN/TUN queues short so latency does not grow into multi-second backlog.
+tcp-queue-limit $tcp_queue
+txqueuelen $txqlen
+# Use OS default socket buffers, and lower tunnel MSS/MTU to reduce fragmentation/queueing.
+sndbuf 0
+rcvbuf 0
 tun-mtu $mtu
-mssfix 1360
+mssfix $mssfix
 verb 3
 status $(tcptun_status_file "$id") 10
 log-append $(tcptun_log_file "$id")
@@ -2512,7 +2516,7 @@ tcptun_install_service() {
 
   cat > "$TCPTUN_SERVICE_TEMPLATE" <<EOF_SERVICE
 [Unit]
-Description=TCP/OpenVPN Tunnel %i Service (${SCRIPT_VERSION:-unknown}, short-code PSK)
+Description=TCP/OpenVPN Tunnel %i Service (${SCRIPT_VERSION:-unknown}, simple-code PSK, latency tuned)
 After=network-online.target
 Wants=network-online.target
 
@@ -2563,7 +2567,10 @@ tcptun_create_tunnel() {
     REMOTE_TCP_IP="10.40.$TUNNEL_ID.1"
   fi
 
-  TCPTUN_MTU="${TCPTUN_MTU:-1400}"
+  TCPTUN_MTU="${TCPTUN_MTU:-1300}"
+  TCPTUN_MSSFIX="${TCPTUN_MSSFIX:-1200}"
+  TCPTUN_TCP_QUEUE_LIMIT="${TCPTUN_TCP_QUEUE_LIMIT:-8}"
+  TCPTUN_TXQUEUELEN="${TCPTUN_TXQUEUELEN:-32}"
   TCPTUN_CIPHER="${TCPTUN_CIPHER:-$(tcptun_choose_cipher)}"
 
   # Stop old v12-v16 services/logs before generating the new short-code config.
@@ -2572,13 +2579,13 @@ tcptun_create_tunnel() {
   if [ "$interactive" -eq 1 ]; then
     tcptun_prepare_short_code_interactive "$TUNNEL_ID" || return 1
   else
-    tcptun_key_ready "$TUNNEL_ID" || { echo "TCP short-code key is missing. Re-run create/update interactively." >&2; return 1; }
+    tcptun_key_ready "$TUNNEL_ID" || { echo "TCP simple-code key is missing. Re-run create/update interactively." >&2; return 1; }
   fi
 
   echo "[*] Manager version: ${SCRIPT_VERSION:-unknown}"
   echo "[*] Local server public IP: $LOCAL_PUBLIC_IP"
   echo "[*] Remote server public IP: $REMOTE_PUBLIC_IP"
-  echo "[*] Tunnel type: TCP/OpenVPN short-code PSK"
+  echo "[*] Tunnel type: TCP/OpenVPN simple-code PSK"
   echo "[*] Tunnel number: $TUNNEL_ID"
   echo "[*] Interface: $TCPTUN_IFACE"
   echo "[*] Server role: $SERVER_ROLE"
@@ -2586,7 +2593,8 @@ tcptun_create_tunnel() {
   echo "[*] Local TCP inner IP: $LOCAL_TCP_IP"
   echo "[*] Remote TCP inner IP: $REMOTE_TCP_IP"
   echo "[*] Cipher: $TCPTUN_CIPHER"
-  echo "[*] Short-code fingerprint: ${TCPTUN_KEY_FINGERPRINT:-unknown}"
+  echo "[*] Latency tuning: TCP_NODELAY, tcp-queue-limit=${TCPTUN_TCP_QUEUE_LIMIT:-8}, txqueuelen=${TCPTUN_TXQUEUELEN:-32}, tun-mtu=${TCPTUN_MTU:-1300}, mssfix=${TCPTUN_MSSFIX:-1200}"
+  echo "[*] Simple-code fingerprint: ${TCPTUN_KEY_FINGERPRINT:-unknown}"
   if [ "$TCP_MODE" = "server" ]; then
     echo "[*] Local TCP listen: 0.0.0.0:$LOCAL_TCP_PORT"
     echo "[*] Public endpoint for client: $LOCAL_PUBLIC_IP:$LOCAL_TCP_PORT"
@@ -2614,7 +2622,7 @@ tcptun_create_tunnel() {
     return 1
   fi
 
-  echo "[OK] TCP/OpenVPN short-code tunnel created as $TCPTUN_IFACE"
+  echo "[OK] TCP/OpenVPN simple-code tunnel created as $TCPTUN_IFACE"
   echo "Local TCP IP : $LOCAL_TCP_IP"
   echo "Remote TCP IP: $REMOTE_TCP_IP"
   echo "Version      : ${SCRIPT_VERSION:-unknown}"
@@ -2668,7 +2676,7 @@ tcptun_menu_config_tunnel() {
   echo
   echo "Auto TCP/OpenVPN values for tunnel $TUNNEL_ID:"
   echo "  Manager version  : ${SCRIPT_VERSION:-unknown}"
-  echo "  Implementation   : OpenVPN TCP short-code PSK"
+  echo "  Implementation   : OpenVPN TCP simple-code PSK"
   echo "  Interface        : $(tcptun_iface "$TUNNEL_ID")"
   if [ "$ROLE" = "1" ]; then
     echo "  Role/mode        : IRAN / client"
@@ -2681,7 +2689,7 @@ tcptun_menu_config_tunnel() {
     echo "  Remote inner IP  : 10.40.$TUNNEL_ID.1"
     echo "  Listen endpoint  : 0.0.0.0:$LOCAL_TCP_PORT"
   fi
-  echo "  Short code       : one line only; same on both servers"
+  echo "  Simple code      : one line only; same on both servers"
   echo
 
   tcptun_create_tunnel 1 || echo "TCP/OpenVPN tunnel creation failed"
@@ -2707,7 +2715,8 @@ tcptun_check_one_tunnel() {
     echo "Local TCP port    : ${LOCAL_TCP_PORT:-not-used}"
     echo "Remote TCP port   : ${REMOTE_TCP_PORT:-not-used}"
     echo "Cipher            : ${TCPTUN_CIPHER:-unknown}"
-    echo "Short-code fp     : ${TCPTUN_KEY_FINGERPRINT:-unknown}"
+    echo "Latency tuning    : tcp-queue-limit=${TCPTUN_TCP_QUEUE_LIMIT:-8}, txqueuelen=${TCPTUN_TXQUEUELEN:-32}, tun-mtu=${TCPTUN_MTU:-1300}, mssfix=${TCPTUN_MSSFIX:-1200}"
+    echo "Simple-code fp    : ${TCPTUN_KEY_FINGERPRINT:-unknown}"
   else
     echo "No metadata found for tunnel $id."
   fi
@@ -2872,7 +2881,7 @@ tcptun_remove_one_tunnel() {
   rm -f "$meta" "$conf" "$key" "$(tcptun_log_file "$id")" "$(tcptun_status_file "$id")"
   rm -f "$TCPTUN_KEY_DIR/tunnel-$id.static.key" 2>/dev/null || true
   rm -rf "$pki" 2>/dev/null || true
-  rm -f "/root/tcptun-client-bundle-$id.b64" 2>/dev/null || true
+  rm -f "/root/tcptun-client-bundle-$id.b64" 2>/dev/null || true  # old v16 file cleanup
   if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload || true
   fi
@@ -2898,7 +2907,7 @@ tcptun_remove_menu() {
     echo "TCP/OpenVPN tunnel $selected_id was not found in the list."
     return
   fi
-  if confirm_yes "Are you sure you want to remove TCP/OpenVPN tunnel $selected_id completely, including its short-code key?"; then
+  if confirm_yes "Are you sure you want to remove TCP/OpenVPN tunnel $selected_id completely, including its simple-code key?"; then
     tcptun_remove_one_tunnel "$selected_id"
   else
     echo "Cancelled."
@@ -2968,7 +2977,7 @@ show_menu() {
   echo "5) repair/restart Normal GRE tunnel"
   echo "6) repair/restart WireGuard tunnel"
   echo "7) repair/restart TCP/OpenVPN tunnel"
-  echo "   (${SCRIPT_VERSION:-unknown}: TCP/OpenVPN short-code mode, one-line code)"
+  echo "   (${SCRIPT_VERSION:-unknown}: TCP/OpenVPN simple-code + latency tuning)"
   echo "0) Exit"
   echo
   read -rp "Choose an option [0-7]: " CHOICE
