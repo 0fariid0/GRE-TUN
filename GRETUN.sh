@@ -150,7 +150,7 @@ ask_tunnel_type() {
   echo "Select tunnel type:"
   echo "1) Normal GRE tunnel"
   echo "2) WireGuard tunnel"
-  echo "3) FOU-GRE over UDP tunnel"
+  echo "3) Anti-loss UDP tunnel (FOU-GRE if supported; otherwise clear WireGuard fallback)"
   echo
   read -rp "Choose [1-3]: " TUNNEL_TYPE_CHOICE
   case "$TUNNEL_TYPE_CHOICE" in
@@ -2099,8 +2099,14 @@ fougre_ensure_tools() {
 }
 
 fougre_configure_wireguard_compatible_mode() {
-  local existing_peer_key existing_local_port existing_remote_port default_wg_port
-  local entered_local_public_ip entered_remote_public_ip selected_role
+  local fixed_tunnel_id existing_peer_key existing_local_port existing_remote_port default_wg_port
+  local entered_local_public_ip entered_remote_public_ip selected_role answer
+
+  fixed_tunnel_id="${TUNNEL_ID:-}"
+  if ! validate_tunnel_id "$fixed_tunnel_id"; then
+    echo "Internal error: fallback received an invalid tunnel number: ${fixed_tunnel_id:-empty}" >&2
+    return 1
+  fi
 
   entered_local_public_ip="${LOCAL_PUBLIC_IP:-}"
   entered_remote_public_ip="${REMOTE_PUBLIC_IP:-}"
@@ -2112,28 +2118,47 @@ fougre_configure_wireguard_compatible_mode() {
 
   # wg_load_meta sources saved WireGuard variables. Preserve the values the user
   # just entered in the FOU-GRE menu so old metadata cannot silently replace them.
-  if wg_load_meta "$TUNNEL_ID"; then
+  if wg_load_meta "$fixed_tunnel_id"; then
     existing_peer_key="${REMOTE_WG_PUBLIC_KEY:-}"
     existing_local_port="${LOCAL_WG_PORT:-}"
     existing_remote_port="${REMOTE_WG_PORT:-}"
   fi
 
+  # HARD LOCK: never let sourced WireGuard metadata or old shell variables change
+  # the tunnel number selected in the Anti-Loss/FOU-GRE menu.
+  TUNNEL_ID="$fixed_tunnel_id"
   LOCAL_PUBLIC_IP="$entered_local_public_ip"
   REMOTE_PUBLIC_IP="$entered_remote_public_ip"
   ROLE="$selected_role"
   REMOTE_WG_PUBLIC_KEY="$existing_peer_key"
-  default_wg_port="${existing_local_port:-$(wg_default_port "$TUNNEL_ID")}"
+  default_wg_port="${existing_local_port:-$(wg_default_port "$fixed_tunnel_id")}"
 
   echo
   fougre_print_unsupported_message
   echo
-  echo "No question needed here: because FOU is unsupported, this tunnel will be created with WireGuard UDP compatible mode."
-  echo "You already entered the remote public IP above: $REMOTE_PUBLIC_IP"
+  echo "You selected Anti-Loss/FOU-GRE menu option for tunnel number: $fixed_tunnel_id"
+  echo "But this server cannot create a real FOU-GRE tunnel because 'ip fou' is unsupported."
+  echo
+  echo "Fallback explanation:"
+  echo "  - It will create WireGuard, because WireGuard works on normal UDP on most kernels."
+  echo "  - The tunnel number will stay the SAME: $fixed_tunnel_id"
+  echo "  - Interface will be: $(wg_iface_name "$fixed_tunnel_id")"
+  echo "  - Inner IP range will be: 10.20.$fixed_tunnel_id.0/30"
+  echo "  - This may look like tunnel type 2 in status, because technically it is WireGuard."
+  echo "  - It is NOT changing your requested tunnel number to 2."
+  echo
+  echo "Remote public IP already entered: $REMOTE_PUBLIC_IP"
+  read -rp "Continue with WireGuard fallback using SAME tunnel number $fixed_tunnel_id? [Y/n]: " answer
+  case "$answer" in
+    [Nn]*) echo "Cancelled. Nothing was installed for tunnel $fixed_tunnel_id."; return 1 ;;
+  esac
   echo
 
-  prompt_local_udp_port_for_wireguard "$default_wg_port" "$TUNNEL_ID" || return 1
+  TUNNEL_ID="$fixed_tunnel_id"
+  prompt_local_udp_port_for_wireguard "$default_wg_port" "$fixed_tunnel_id" || return 1
   prompt_remote_udp_port_for_wireguard "${existing_remote_port:-$LOCAL_WG_PORT}" || return 1
 
+  TUNNEL_ID="$fixed_tunnel_id"
   WG_ENDPOINT_MODE="public"
   WG_ENDPOINT_IP="$REMOTE_PUBLIC_IP"
   WG_TRANSPORT_IFACE=""
@@ -2141,16 +2166,20 @@ fougre_configure_wireguard_compatible_mode() {
   EXTRA_ALLOWED_IPS=""
 
   echo
-  echo "WireGuard compatible values for tunnel $TUNNEL_ID:"
-  echo "  Interface              : $(wg_iface_name "$TUNNEL_ID")"
-  echo "  Local endpoint IP      : $LOCAL_PUBLIC_IP"
-  echo "  Remote endpoint IP     : $REMOTE_PUBLIC_IP"
-  echo "  Local UDP ListenPort   : $LOCAL_WG_PORT"
-  echo "  Remote UDP ListenPort  : $REMOTE_WG_PORT"
-  echo "  Inner IP range         : 10.20.$TUNNEL_ID.0/30"
-  echo "  MTU                    : $WG_MTU"
+  echo "WireGuard fallback values for SAME tunnel number $fixed_tunnel_id:"
+  echo "  Requested menu option   : 3 / Anti-Loss UDP"
+  echo "  Actual installed type   : WireGuard fallback"
+  echo "  Tunnel number           : $fixed_tunnel_id"
+  echo "  Interface               : $(wg_iface_name "$fixed_tunnel_id")"
+  echo "  Local endpoint IP       : $LOCAL_PUBLIC_IP"
+  echo "  Remote endpoint IP      : $REMOTE_PUBLIC_IP"
+  echo "  Local UDP ListenPort    : $LOCAL_WG_PORT"
+  echo "  Remote UDP ListenPort   : $REMOTE_WG_PORT"
+  echo "  Inner IP range          : 10.20.$fixed_tunnel_id.0/30"
+  echo "  MTU                     : $WG_MTU"
   echo
 
+  TUNNEL_ID="$fixed_tunnel_id"
   wg_create_tunnel 1
 }
 
@@ -2854,7 +2883,7 @@ list_saved_tunnels() {
 }
 
 show_menu() {
-  show_header "GRE + WireGuard + FOU-GRE/WG-Fallback Tunnel Management"
+  show_header "GRE + WireGuard + Anti-Loss UDP Tunnel Management"
   echo "1) create/update tunnel"
   echo "2) status"
   echo "3) remove tunnel"
@@ -2862,7 +2891,7 @@ show_menu() {
   echo "5) repair/restart Normal GRE tunnel"
   echo "6) repair/restart WireGuard tunnel"
   echo "7) repair/restart FOU-GRE over UDP tunnel"
-  echo "   (v10: FOU-GRE + clear automatic WireGuard UDP compatible mode + safer UDP port checks)"
+  echo "   (v11: explicit fallback, fixed tunnel-number lock, safer UDP port checks)"
   echo "0) Exit"
   echo
   read -rp "Choose an option [0-7]: " CHOICE
