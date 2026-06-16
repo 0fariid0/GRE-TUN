@@ -1,12 +1,12 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + WireGuard + Vira7 multi-tunnel manager v7.2-original-based
+# GRE + WireGuard + Vira7 multi-tunnel manager v7.3-original-based
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
 # - Local tunnel/bind IPv4 can be selected manually for servers with multiple IPs
-# - v7.2-original-based adds Vira7 UDP-TUN, reset-all, ping test, auto unique UDP ports, and iptables/ufw port/IP rules
+# - v7.3-original-based adds unified delete/ping menus, pro colors, Vira7, reset-all, auto unique UDP ports, and firewall rules
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -29,6 +29,27 @@ VIRA7_DEFAULT_PORT_BASE=5571
 VIRA7_DEFAULT_KEEPALIVE=5
 VIRA7_DEFAULT_BUFFER_SIZE=2097152
 VIRA7_DEFAULT_QUEUE_LEN=1000
+
+# Color/theme helpers
+if [ -t 1 ]; then
+  C_RESET='\033[0m'
+  C_BOLD='\033[1m'
+  C_DIM='\033[2m'
+  C_RED='\033[31m'
+  C_GREEN='\033[32m'
+  C_YELLOW='\033[33m'
+  C_BLUE='\033[34m'
+  C_MAGENTA='\033[35m'
+  C_CYAN='\033[36m'
+  C_WHITE='\033[37m'
+else
+  C_RESET=''; C_BOLD=''; C_DIM=''; C_RED=''; C_GREEN=''; C_YELLOW=''; C_BLUE=''; C_MAGENTA=''; C_CYAN=''; C_WHITE=''
+fi
+
+ok_msg() { echo -e "${C_GREEN}[OK]${C_RESET} $*"; }
+warn_msg() { echo -e "${C_YELLOW}[WARN]${C_RESET} $*"; }
+err_msg() { echo -e "${C_RED}[ERR]${C_RESET} $*"; }
+info_msg() { echo -e "${C_CYAN}[INFO]${C_RESET} $*"; }
 
 ensure_root() {
   if [ "$(id -u)" -ne 0 ]; then
@@ -117,10 +138,12 @@ show_header() {
   local ip_addr
   ip_addr="$(detect_local_public_ip || true)"
   clear 2>/dev/null || true
-  echo "=============================================="
-  echo " $title"
-  echo " Local server public IP: ${ip_addr:-UNKNOWN}"
-  echo "=============================================="
+  echo -e "${C_CYAN}${C_BOLD}╔══════════════════════════════════════════════════════╗${C_RESET}"
+  printf "${C_CYAN}${C_BOLD}║${C_RESET} %-52s ${C_CYAN}${C_BOLD}║${C_RESET}
+" "$title"
+  printf "${C_CYAN}${C_BOLD}║${C_RESET} Local public IP: %-35s ${C_CYAN}${C_BOLD}║${C_RESET}
+" "${ip_addr:-UNKNOWN}"
+  echo -e "${C_CYAN}${C_BOLD}╚══════════════════════════════════════════════════════╝${C_RESET}"
   echo
 }
 
@@ -2475,6 +2498,104 @@ enable_ip_forward() {
   fi
 }
 
+
+# -----------------------------
+# Unified tunnel inventory / professional menus
+# -----------------------------
+declare -a INV_TYPE INV_ID INV_IFACE INV_TARGET INV_STATE INV_DESC
+
+build_tunnel_inventory() {
+  INV_TYPE=(); INV_ID=(); INV_IFACE=(); INV_TARGET=(); INV_STATE=(); INV_DESC=()
+  local ids id ifc target state desc
+
+  ids="$(gre_collect_ids || true)"
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    ifc="$(gre_iface "$id")"
+    target=""
+    desc="Normal GRE"
+    if gre_load_config "$id"; then
+      target="${REMOTE_GRE_IP:-}"
+      if [ -z "$target" ] && [ -n "${ROLE:-}" ]; then
+        target="$(gre_remote_inner_ip_for_role "$id" "$ROLE")"
+      fi
+    fi
+    if ip link show "$ifc" >/dev/null 2>&1; then state="active"; else state="inactive"; fi
+    INV_TYPE+=("gre"); INV_ID+=("$id"); INV_IFACE+=("$ifc"); INV_TARGET+=("$target"); INV_STATE+=("$state"); INV_DESC+=("$desc")
+  done <<< "$ids"
+
+  ids="$(wg_collect_ids || true)"
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    ifc="$(wg_iface_name "$id")"
+    target=""
+    desc="WireGuard"
+    if wg_load_meta "$id"; then
+      target="${REMOTE_WG_IP:-}"
+      if [ -z "${REMOTE_WG_PUBLIC_KEY:-}" ]; then desc="WireGuard/PENDING"; fi
+    fi
+    if ip link show "$ifc" >/dev/null 2>&1; then state="active"; else state="inactive"; fi
+    INV_TYPE+=("wireguard"); INV_ID+=("$id"); INV_IFACE+=("$ifc"); INV_TARGET+=("$target"); INV_STATE+=("$state"); INV_DESC+=("$desc")
+  done <<< "$ids"
+
+  ids="$(vira7_collect_ids || true)"
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    ifc="$(vira7_iface_name "$id")"
+    target=""
+    desc="Vira7 UDP-TUN"
+    if vira7_load_config "$id"; then
+      target="${REMOTE_VIRA7_IP:-${remote_priv:-}}"
+    fi
+    if ip link show "$ifc" >/dev/null 2>&1; then state="active"; else state="inactive"; fi
+    INV_TYPE+=("vira7"); INV_ID+=("$id"); INV_IFACE+=("$ifc"); INV_TARGET+=("$target"); INV_STATE+=("$state"); INV_DESC+=("$desc")
+  done <<< "$ids"
+}
+
+print_tunnel_inventory() {
+  local count="${#INV_TYPE[@]}"
+  if [ "$count" -eq 0 ]; then
+    warn_msg "No saved or active tunnels found."
+    return 1
+  fi
+
+  echo -e "${C_BOLD}${C_WHITE}Existing tunnels:${C_RESET}"
+  printf "${C_DIM}%4s  %-12s  %-8s  %-12s  %-15s  %-10s${C_RESET}\n" "No" "Type" "ID" "Interface" "Remote-IP" "State"
+  printf "${C_DIM}%s${C_RESET}\n" "-------------------------------------------------------------------------------"
+  local i idx type id ifc target state color
+  for i in "${!INV_TYPE[@]}"; do
+    idx=$((i + 1))
+    type="${INV_TYPE[$i]}"; id="${INV_ID[$i]}"; ifc="${INV_IFACE[$i]}"; target="${INV_TARGET[$i]:-N/A}"; state="${INV_STATE[$i]}"
+    if [ "$state" = "active" ]; then color="$C_GREEN"; else color="$C_YELLOW"; fi
+    printf "%4s  %-12s  %-8s  %-12s  %-15s  ${color}%-10s${C_RESET}\n" "$idx" "$type" "$id" "$ifc" "$target" "$state"
+  done
+  echo
+}
+
+remove_inventory_item() {
+  local index="$1"
+  local i=$((index - 1))
+  local type="${INV_TYPE[$i]}"
+  local id="${INV_ID[$i]}"
+  case "$type" in
+    gre) gre_remove_one_tunnel "$id" ;;
+    wireguard) wg_remove_one_tunnel "$id" ;;
+    vira7) vira7_remove_one_tunnel "$id" ;;
+  esac
+}
+
+ping_inventory_item() {
+  local index="$1"
+  local i=$((index - 1))
+  local type="${INV_TYPE[$i]}"
+  local id="${INV_ID[$i]}"
+  case "$type" in
+    gre) test_gre_tunnel_ping "$id" ;;
+    wireguard) test_wg_tunnel_ping "$id" ;;
+    vira7) test_vira7_tunnel_ping "$id" ;;
+  esac
+}
+
 menu_config_tunnel() {
   show_header "Create / Update Tunnel"
   ask_tunnel_type || return
@@ -2496,15 +2617,48 @@ status_check() {
 
 remove_tun() {
   show_header "Remove Tunnel"
-  echo "First choose which tunnel type you want to remove."
+  build_tunnel_inventory
+  print_tunnel_inventory || return
+
+  echo -e "${C_RED}${C_BOLD}88) remove ALL tunnels${C_RESET}"
+  echo "Select a tunnel number from the list, or 88 to remove everything."
   echo
-  ask_tunnel_type || return
-  case "$SELECTED_TUNNEL_TYPE" in
-    gre) gre_remove_menu ;;
-    wireguard) wg_remove_menu ;;
-    vira7) vira7_remove_menu ;;
-  esac
+  read -rp "Choose tunnel to remove [number/88]: " selected
+
+  if [ "$selected" = "88" ]; then
+    echo
+    echo -e "${C_RED}${C_BOLD}WARNING:${C_RESET} this will remove ALL GRE, WireGuard, and Vira7 tunnels."
+    if ! confirm_yes "Are you sure?"; then
+      echo "Cancelled."
+      return
+    fi
+
+    local ids id
+    # Remove UDP-based tunnels first, then GRE transport last.
+    ids="$(wg_collect_ids || true)"
+    while IFS= read -r id; do [ -n "$id" ] && wg_remove_one_tunnel "$id"; done <<< "$ids"
+    ids="$(vira7_collect_ids || true)"
+    while IFS= read -r id; do [ -n "$id" ] && vira7_remove_one_tunnel "$id"; done <<< "$ids"
+    ids="$(gre_collect_ids || true)"
+    while IFS= read -r id; do [ -n "$id" ] && gre_remove_one_tunnel "$id"; done <<< "$ids"
+    ok_msg "All tunnels removed."
+    return
+  fi
+
+  if ! [[ "$selected" =~ ^[0-9]+$ ]] || [ "$selected" -lt 1 ] || [ "$selected" -gt "${#INV_TYPE[@]}" ]; then
+    err_msg "Invalid selection."
+    return
+  fi
+
+  local i=$((selected - 1))
+  echo "Selected: ${INV_TYPE[$i]} tunnel ${INV_ID[$i]} (${INV_IFACE[$i]})"
+  if confirm_yes "Remove this tunnel completely?"; then
+    remove_inventory_item "$selected"
+  else
+    echo "Cancelled."
+  fi
 }
+
 
 list_saved_tunnels() {
   show_header "Saved / Active Tunnels"
@@ -2622,18 +2776,33 @@ test_all_tunnels_ping() {
 
 test_tunnels_menu() {
   show_header "Tunnel Ping Test"
-  echo "1) test all saved tunnels"
-  echo "2) test one selected tunnel"
-  echo "0) Back"
+  build_tunnel_inventory
+  print_tunnel_inventory || return
+
+  echo -e "${C_GREEN}${C_BOLD}0) ping ALL tunnels${C_RESET}"
+  echo "Select a tunnel number from the list, or 0 to ping all."
   echo
-  read -rp "Choose an option [0-2]: " TEST_CHOICE
-  case "$TEST_CHOICE" in
-    1) test_all_tunnels_ping ;;
-    2) test_one_tunnel_ping_menu ;;
-    0) return ;;
-    *) echo "Invalid option" ;;
-  esac
+  read -rp "Choose tunnel to ping [0/list number]: " selected
+
+  if [ "$selected" = "0" ]; then
+    local i total ok fail
+    total="${#INV_TYPE[@]}"; ok=0; fail=0
+    for i in "${!INV_TYPE[@]}"; do
+      if ping_inventory_item "$((i + 1))"; then ok=$((ok + 1)); else fail=$((fail + 1)); fi
+    done
+    echo
+    echo -e "${C_BOLD}Ping summary:${C_RESET} total=$total ok=${C_GREEN}$ok${C_RESET} failed_or_skipped=${C_RED}$fail${C_RESET}"
+    return
+  fi
+
+  if ! [[ "$selected" =~ ^[0-9]+$ ]] || [ "$selected" -lt 1 ] || [ "$selected" -gt "${#INV_TYPE[@]}" ]; then
+    err_msg "Invalid selection."
+    return
+  fi
+
+  ping_inventory_item "$selected"
 }
+
 
 reset_all_tunnels() {
   show_header "Reset All Tunnels"
@@ -2721,11 +2890,12 @@ reset_all_tunnels() {
 
 show_menu() {
   show_header "GRE + WireGuard + Vira7 Tunnel Management"
-  echo "1) create/update tunnel"
-  echo "2) remove tunnel"
-  echo "3) reset all tunnels"
-  echo "4) ping test tunnels"
-  echo "0) Exit"
+  echo -e "${C_BOLD}${C_WHITE}Main Menu${C_RESET}"
+  echo -e "  ${C_GREEN}1)${C_RESET} create/update tunnel"
+  echo -e "  ${C_RED}2)${C_RESET} remove tunnel"
+  echo -e "  ${C_YELLOW}3)${C_RESET} reset all tunnels"
+  echo -e "  ${C_CYAN}4)${C_RESET} ping test tunnels"
+  echo -e "  ${C_DIM}0) Exit${C_RESET}"
   echo
   read -rp "Choose an option [0-4]: " CHOICE
   case "$CHOICE" in
@@ -2734,7 +2904,7 @@ show_menu() {
     3) reset_all_tunnels ; pause ;;
     4) test_tunnels_menu ; pause ;;
     0) echo "Bye"; exit 0 ;;
-    *) echo "Invalid option"; sleep 1 ;;
+    *) err_msg "Invalid option"; sleep 1 ;;
   esac
 }
 
