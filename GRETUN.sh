@@ -1,12 +1,12 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + WireGuard + Vira7 multi-tunnel manager v7.4-original-based
+# GRE + WireGuard + Vira7 multi-tunnel manager v7.5-original-based
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
 # - Local tunnel/bind IPv4 can be selected manually for servers with multiple IPs
-# - v7.4-original-based improves unified tunnel list with local/remote inner and public IPs
+# - v7.5-original-based shows local/remote public IPs in the same tunnel list row
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -2567,18 +2567,17 @@ print_tunnel_inventory() {
   fi
 
   echo -e "${C_BOLD}${C_WHITE}Existing tunnels:${C_RESET}"
-  printf "${C_DIM}%4s  %-12s  %-6s  %-12s  %-10s${C_RESET}\n" "No" "Type" "ID" "Interface" "State"
-  printf "${C_DIM}%s${C_RESET}\n" "-------------------------------------------------------------------------------"
-  local i idx type id ifc state color local_ip target local_pub remote_pub
+  printf "${C_DIM}%4s  %-11s %-4s %-10s %-15s %-15s %-15s %-8s${C_RESET}\n" "No" "Type" "ID" "Interface" "Local-Pub" "Remote-Pub" "Remote-Tun" "State"
+  printf "${C_DIM}%s${C_RESET}\n" "------------------------------------------------------------------------------------------------------------"
+  local i idx type id ifc state color target local_pub remote_pub
   for i in "${!INV_TYPE[@]}"; do
     idx=$((i + 1))
     type="${INV_TYPE[$i]}"; id="${INV_ID[$i]}"; ifc="${INV_IFACE[$i]}"; state="${INV_STATE[$i]}"
-    local_ip="${INV_LOCAL[$i]:-N/A}"; target="${INV_TARGET[$i]:-N/A}"
-    local_pub="${INV_LOCAL_PUBLIC[$i]:-N/A}"; remote_pub="${INV_REMOTE_PUBLIC[$i]:-N/A}"
+    target="${INV_TARGET[$i]:-N/A}"
+    local_pub="${INV_LOCAL_PUBLIC[$i]:-N/A}"
+    remote_pub="${INV_REMOTE_PUBLIC[$i]:-N/A}"
     if [ "$state" = "active" ]; then color="$C_GREEN"; else color="$C_YELLOW"; fi
-    printf "%4s  %-12s  %-6s  %-12s  ${color}%-10s${C_RESET}\n" "$idx" "$type" "$id" "$ifc" "$state"
-    printf "      ${C_DIM}local ${C_RESET}: inner=%-18s public=%s\n" "$local_ip" "$local_pub"
-    printf "      ${C_DIM}remote${C_RESET}: inner=%-18s public=%s\n" "$target" "$remote_pub"
+    printf "%4s  %-11s %-4s %-10s %-15s %-15s %-15s ${color}%-8s${C_RESET}\n" "$idx" "$type" "$id" "$ifc" "$local_pub" "$remote_pub" "$target" "$state"
   done
   echo
 }
