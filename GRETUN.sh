@@ -1,12 +1,12 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + WireGuard + Vira7 multi-tunnel manager v7.3-original-based
+# GRE + WireGuard + Vira7 multi-tunnel manager v7.4-original-based
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
 # - Local tunnel/bind IPv4 can be selected manually for servers with multiple IPs
-# - v7.3-original-based adds unified delete/ping menus, pro colors, Vira7, reset-all, auto unique UDP ports, and firewall rules
+# - v7.4-original-based improves unified tunnel list with local/remote inner and public IPs
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -2502,55 +2502,62 @@ enable_ip_forward() {
 # -----------------------------
 # Unified tunnel inventory / professional menus
 # -----------------------------
-declare -a INV_TYPE INV_ID INV_IFACE INV_TARGET INV_STATE INV_DESC
+declare -a INV_TYPE INV_ID INV_IFACE INV_LOCAL INV_TARGET INV_LOCAL_PUBLIC INV_REMOTE_PUBLIC INV_STATE INV_DESC
 
 build_tunnel_inventory() {
-  INV_TYPE=(); INV_ID=(); INV_IFACE=(); INV_TARGET=(); INV_STATE=(); INV_DESC=()
-  local ids id ifc target state desc
+  INV_TYPE=(); INV_ID=(); INV_IFACE=(); INV_LOCAL=(); INV_TARGET=(); INV_LOCAL_PUBLIC=(); INV_REMOTE_PUBLIC=(); INV_STATE=(); INV_DESC=()
+  local ids id ifc local_ip target local_pub remote_pub state desc
 
   ids="$(gre_collect_ids || true)"
   while IFS= read -r id; do
     [ -n "$id" ] || continue
     ifc="$(gre_iface "$id")"
-    target=""
-    desc="Normal GRE"
+    local_ip=""; target=""; local_pub=""; remote_pub=""; desc="Normal GRE"
     if gre_load_config "$id"; then
+      local_ip="${LOCAL_GRE_IP:-}"
       target="${REMOTE_GRE_IP:-}"
+      local_pub="${LOCAL_PUBLIC_IP:-}"
+      remote_pub="${REMOTE_PUBLIC_IP:-}"
       if [ -z "$target" ] && [ -n "${ROLE:-}" ]; then
         target="$(gre_remote_inner_ip_for_role "$id" "$ROLE")"
       fi
     fi
     if ip link show "$ifc" >/dev/null 2>&1; then state="active"; else state="inactive"; fi
-    INV_TYPE+=("gre"); INV_ID+=("$id"); INV_IFACE+=("$ifc"); INV_TARGET+=("$target"); INV_STATE+=("$state"); INV_DESC+=("$desc")
+    INV_TYPE+=("gre"); INV_ID+=("$id"); INV_IFACE+=("$ifc"); INV_LOCAL+=("$local_ip"); INV_TARGET+=("$target"); INV_LOCAL_PUBLIC+=("$local_pub"); INV_REMOTE_PUBLIC+=("$remote_pub"); INV_STATE+=("$state"); INV_DESC+=("$desc")
   done <<< "$ids"
 
   ids="$(wg_collect_ids || true)"
   while IFS= read -r id; do
     [ -n "$id" ] || continue
     ifc="$(wg_iface_name "$id")"
-    target=""
-    desc="WireGuard"
+    local_ip=""; target=""; local_pub=""; remote_pub=""; desc="WireGuard"
     if wg_load_meta "$id"; then
+      local_ip="${LOCAL_WG_IP:-}"
       target="${REMOTE_WG_IP:-}"
+      local_pub="${LOCAL_PUBLIC_IP:-}"
+      remote_pub="${REMOTE_PUBLIC_IP:-${WG_ENDPOINT_IP:-}}"
       if [ -z "${REMOTE_WG_PUBLIC_KEY:-}" ]; then desc="WireGuard/PENDING"; fi
     fi
     if ip link show "$ifc" >/dev/null 2>&1; then state="active"; else state="inactive"; fi
-    INV_TYPE+=("wireguard"); INV_ID+=("$id"); INV_IFACE+=("$ifc"); INV_TARGET+=("$target"); INV_STATE+=("$state"); INV_DESC+=("$desc")
+    INV_TYPE+=("wireguard"); INV_ID+=("$id"); INV_IFACE+=("$ifc"); INV_LOCAL+=("$local_ip"); INV_TARGET+=("$target"); INV_LOCAL_PUBLIC+=("$local_pub"); INV_REMOTE_PUBLIC+=("$remote_pub"); INV_STATE+=("$state"); INV_DESC+=("$desc")
   done <<< "$ids"
 
   ids="$(vira7_collect_ids || true)"
   while IFS= read -r id; do
     [ -n "$id" ] || continue
     ifc="$(vira7_iface_name "$id")"
-    target=""
-    desc="Vira7 UDP-TUN"
+    local_ip=""; target=""; local_pub=""; remote_pub=""; desc="Vira7 UDP-TUN"
     if vira7_load_config "$id"; then
+      local_ip="${LOCAL_VIRA7_IP:-${local_priv:-}}"
       target="${REMOTE_VIRA7_IP:-${remote_priv:-}}"
+      local_pub="${LOCAL_PUBLIC_IP:-${bind_ip:-}}"
+      remote_pub="${REMOTE_PUBLIC_IP:-${remote_ip:-}}"
     fi
     if ip link show "$ifc" >/dev/null 2>&1; then state="active"; else state="inactive"; fi
-    INV_TYPE+=("vira7"); INV_ID+=("$id"); INV_IFACE+=("$ifc"); INV_TARGET+=("$target"); INV_STATE+=("$state"); INV_DESC+=("$desc")
+    INV_TYPE+=("vira7"); INV_ID+=("$id"); INV_IFACE+=("$ifc"); INV_LOCAL+=("$local_ip"); INV_TARGET+=("$target"); INV_LOCAL_PUBLIC+=("$local_pub"); INV_REMOTE_PUBLIC+=("$remote_pub"); INV_STATE+=("$state"); INV_DESC+=("$desc")
   done <<< "$ids"
 }
+
 
 print_tunnel_inventory() {
   local count="${#INV_TYPE[@]}"
@@ -2560,17 +2567,22 @@ print_tunnel_inventory() {
   fi
 
   echo -e "${C_BOLD}${C_WHITE}Existing tunnels:${C_RESET}"
-  printf "${C_DIM}%4s  %-12s  %-8s  %-12s  %-15s  %-10s${C_RESET}\n" "No" "Type" "ID" "Interface" "Remote-IP" "State"
+  printf "${C_DIM}%4s  %-12s  %-6s  %-12s  %-10s${C_RESET}\n" "No" "Type" "ID" "Interface" "State"
   printf "${C_DIM}%s${C_RESET}\n" "-------------------------------------------------------------------------------"
-  local i idx type id ifc target state color
+  local i idx type id ifc state color local_ip target local_pub remote_pub
   for i in "${!INV_TYPE[@]}"; do
     idx=$((i + 1))
-    type="${INV_TYPE[$i]}"; id="${INV_ID[$i]}"; ifc="${INV_IFACE[$i]}"; target="${INV_TARGET[$i]:-N/A}"; state="${INV_STATE[$i]}"
+    type="${INV_TYPE[$i]}"; id="${INV_ID[$i]}"; ifc="${INV_IFACE[$i]}"; state="${INV_STATE[$i]}"
+    local_ip="${INV_LOCAL[$i]:-N/A}"; target="${INV_TARGET[$i]:-N/A}"
+    local_pub="${INV_LOCAL_PUBLIC[$i]:-N/A}"; remote_pub="${INV_REMOTE_PUBLIC[$i]:-N/A}"
     if [ "$state" = "active" ]; then color="$C_GREEN"; else color="$C_YELLOW"; fi
-    printf "%4s  %-12s  %-8s  %-12s  %-15s  ${color}%-10s${C_RESET}\n" "$idx" "$type" "$id" "$ifc" "$target" "$state"
+    printf "%4s  %-12s  %-6s  %-12s  ${color}%-10s${C_RESET}\n" "$idx" "$type" "$id" "$ifc" "$state"
+    printf "      ${C_DIM}local ${C_RESET}: inner=%-18s public=%s\n" "$local_ip" "$local_pub"
+    printf "      ${C_DIM}remote${C_RESET}: inner=%-18s public=%s\n" "$target" "$remote_pub"
   done
   echo
 }
+
 
 remove_inventory_item() {
   local index="$1"
