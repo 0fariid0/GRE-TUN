@@ -1,12 +1,12 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + WireGuard + Vira7 multi-tunnel manager v7-original-based
+# GRE + WireGuard + Vira7 multi-tunnel manager v7.2-original-based
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
 # - Local tunnel/bind IPv4 can be selected manually for servers with multiple IPs
-# - v7-original-based adds Vira7 UDP-TUN as tunnel type 3, removes status menu, and adds reset-all
+# - v7.2-original-based adds Vira7 UDP-TUN, reset-all, ping test, auto unique UDP ports, and iptables/ufw port/IP rules
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -193,6 +193,149 @@ write_var() {
   local name="$1"
   local value="${2:-}"
   printf '%s=%q\n' "$name" "$value"
+}
+
+# -----------------------------
+# Shared UDP port + firewall helpers
+# -----------------------------
+udp_port_is_listening() {
+  local port="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ss -H -lun 2>/dev/null | awk '{print $5}' | grep -Eq "(^|[:.])$port$"
+    return $?
+  fi
+  if command -v netstat >/dev/null 2>&1; then
+    netstat -lun 2>/dev/null | awk '{print $4}' | grep -Eq "(^|[:.])$port$"
+    return $?
+  fi
+  return 1
+}
+
+udp_port_in_saved_configs() {
+  local want="$1"
+  local current_type="${2:-}"
+  local current_id="${3:-}"
+  local f id
+
+  if [ -d "$WG_META_DIR" ]; then
+    for f in "$WG_META_DIR"/tunnel-*.conf; do
+      [ -e "$f" ] || continue
+      id="${f##*/tunnel-}"; id="${id%.conf}"
+      [ "$current_type" = "wireguard" ] && [ "$id" = "$current_id" ] && continue
+      (
+        # shellcheck disable=SC1090
+        source "$f" 2>/dev/null || exit 1
+        [ "${LOCAL_WG_PORT:-}" = "$want" ]
+      ) && return 0
+    done
+  fi
+
+  if [ -d "$VIRA7_CONFIG_DIR" ]; then
+    for f in "$VIRA7_CONFIG_DIR"/tunnel-*.conf; do
+      [ -e "$f" ] || continue
+      id="${f##*/tunnel-}"; id="${id%.conf}"
+      [ "$current_type" = "vira7" ] && [ "$id" = "$current_id" ] && continue
+      (
+        # shellcheck disable=SC1090
+        source "$f" 2>/dev/null || exit 1
+        [ "${VIRA7_PORT:-${port:-}}" = "$want" ]
+      ) && return 0
+    done
+  fi
+
+  return 1
+}
+
+auto_select_udp_port() {
+  local base_port="$1"
+  local existing_port="${2:-}"
+  local current_type="${3:-}"
+  local current_id="${4:-}"
+  local candidate
+
+  # If this tunnel already had a saved port, keep it to avoid breaking the peer.
+  if [ -n "$existing_port" ]; then
+    echo "$existing_port"
+    return 0
+  fi
+
+  candidate="$base_port"
+  while [ "$candidate" -le 65535 ]; do
+    if ! udp_port_in_saved_configs "$candidate" "$current_type" "$current_id" && ! udp_port_is_listening "$candidate"; then
+      echo "$candidate"
+      return 0
+    fi
+    candidate=$((candidate + 1))
+  done
+
+  echo "No free UDP port found from base $base_port" >&2
+  return 1
+}
+
+firewall_allow_udp_port_and_ip() {
+  local label="$1"
+  local port="$2"
+  local peer_ip="${3:-}"
+  local peer_port="${4:-$port}"
+  local ifc="${5:-}"
+
+  if command -v iptables >/dev/null 2>&1; then
+    iptables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || iptables -A INPUT -p udp --dport "$port" -j ACCEPT || true
+    if [ -n "$peer_ip" ] && validate_ipv4 "$peer_ip"; then
+      iptables -C INPUT -s "$peer_ip" -p udp --dport "$port" -j ACCEPT 2>/dev/null || iptables -A INPUT -s "$peer_ip" -p udp --dport "$port" -j ACCEPT || true
+      iptables -C OUTPUT -d "$peer_ip" -p udp --dport "$peer_port" -j ACCEPT 2>/dev/null || iptables -A OUTPUT -d "$peer_ip" -p udp --dport "$peer_port" -j ACCEPT || true
+      # Also allow the peer IP generally, because some providers/firewalls filter before interface rules.
+      iptables -C INPUT -s "$peer_ip" -j ACCEPT 2>/dev/null || iptables -A INPUT -s "$peer_ip" -j ACCEPT || true
+      iptables -C OUTPUT -d "$peer_ip" -j ACCEPT 2>/dev/null || iptables -A OUTPUT -d "$peer_ip" -j ACCEPT || true
+    fi
+    if [ -n "$ifc" ]; then
+      iptables -C INPUT -i "$ifc" -j ACCEPT 2>/dev/null || iptables -A INPUT -i "$ifc" -j ACCEPT || true
+      iptables -C OUTPUT -o "$ifc" -j ACCEPT 2>/dev/null || iptables -A OUTPUT -o "$ifc" -j ACCEPT || true
+      iptables -C FORWARD -i "$ifc" -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$ifc" -j ACCEPT || true
+      iptables -C FORWARD -o "$ifc" -j ACCEPT 2>/dev/null || iptables -A FORWARD -o "$ifc" -j ACCEPT || true
+    fi
+  fi
+
+  if command -v ufw >/dev/null 2>&1; then
+    ufw allow "$port/udp" >/dev/null 2>&1 || true
+    if [ -n "$peer_ip" ] && validate_ipv4 "$peer_ip"; then
+      ufw allow from "$peer_ip" >/dev/null 2>&1 || true
+      ufw allow out to "$peer_ip" port "$peer_port" proto udp >/dev/null 2>&1 || true
+    fi
+    if [ -n "$ifc" ]; then
+      ufw allow in on "$ifc" >/dev/null 2>&1 || true
+    fi
+  fi
+
+  echo "Firewall opened for $label: UDP $port, peer ${peer_ip:-any}, interface ${ifc:-none}"
+}
+
+firewall_allow_ip_peer() {
+  local label="$1"
+  local peer_ip="${2:-}"
+  local ifc="${3:-}"
+  peer_ip="${peer_ip%%/*}"
+  [ -n "$peer_ip" ] || return 0
+  validate_ipv4 "$peer_ip" || return 0
+
+  if command -v iptables >/dev/null 2>&1; then
+    iptables -C INPUT -s "$peer_ip" -j ACCEPT 2>/dev/null || iptables -A INPUT -s "$peer_ip" -j ACCEPT || true
+    iptables -C OUTPUT -d "$peer_ip" -j ACCEPT 2>/dev/null || iptables -A OUTPUT -d "$peer_ip" -j ACCEPT || true
+    if [ -n "$ifc" ]; then
+      iptables -C INPUT -i "$ifc" -s "$peer_ip" -j ACCEPT 2>/dev/null || iptables -A INPUT -i "$ifc" -s "$peer_ip" -j ACCEPT || true
+      iptables -C OUTPUT -o "$ifc" -d "$peer_ip" -j ACCEPT 2>/dev/null || iptables -A OUTPUT -o "$ifc" -d "$peer_ip" -j ACCEPT || true
+    fi
+  fi
+
+  if command -v ufw >/dev/null 2>&1; then
+    ufw allow from "$peer_ip" >/dev/null 2>&1 || true
+    ufw allow out to "$peer_ip" >/dev/null 2>&1 || true
+    if [ -n "$ifc" ]; then
+      ufw allow in on "$ifc" from "$peer_ip" >/dev/null 2>&1 || true
+    fi
+  fi
+
+  echo "Firewall opened for $label IP: $peer_ip, interface ${ifc:-none}"
 }
 
 # -----------------------------
@@ -432,6 +575,8 @@ gre_create_tunnel() {
     iptables -C INPUT -p gre -s "$REMOTE_PUBLIC_IP" -j ACCEPT 2>/dev/null || iptables -A INPUT -p gre -s "$REMOTE_PUBLIC_IP" -j ACCEPT
     iptables -C OUTPUT -p gre -d "$REMOTE_PUBLIC_IP" -j ACCEPT 2>/dev/null || iptables -A OUTPUT -p gre -d "$REMOTE_PUBLIC_IP" -j ACCEPT
   fi
+  firewall_allow_ip_peer "GRE tunnel $TUNNEL_ID remote public" "$REMOTE_PUBLIC_IP" "$TUN_IFACE"
+  firewall_allow_ip_peer "GRE tunnel $TUNNEL_ID remote inner" "$REMOTE_GRE_IP" "$TUN_IFACE"
 
   echo "[OK] GRE tunnel created as $TUN_IFACE"
   echo "Local GRE IP : $LOCAL_GRE_IP"
@@ -752,7 +897,7 @@ wg_print_ip_plan() {
   echo "  WG config file  : $(wg_config_file "$id")"
   echo "  Meta file       : $(wg_meta_file "$id")"
   echo "  Service         : $(wg_service_name "$id")"
-  echo "  Default UDP port: $port"
+  echo "  Default UDP port: $port (auto-increments if busy)"
   echo "  Iran role IP    : 10.20.$id.1/30"
   echo "  Kharej role IP  : 10.20.$id.2/30"
   echo "  GRE fallback    : if gre$id is already up, WireGuard will auto-use 10.10.$id.x as its endpoint"
@@ -1159,10 +1304,13 @@ wg_menu_config_tunnel() {
   previous_endpoint_ip=""
   previous_transport_iface=""
   gre_saved_remote=""
+  local existing_wg_port
+  existing_wg_port=""
   if wg_load_meta "$TUNNEL_ID"; then
     existing_local_ip="${LOCAL_PUBLIC_IP:-}"
     existing_remote_ip="${REMOTE_PUBLIC_IP:-}"
     existing_peer_key="${REMOTE_WG_PUBLIC_KEY:-}"
+    existing_wg_port="${LOCAL_WG_PORT:-}"
     previous_endpoint_mode="${WG_ENDPOINT_MODE:-}"
     previous_endpoint_ip="${WG_ENDPOINT_IP:-}"
     previous_transport_iface="${WG_TRANSPORT_IFACE:-}"
@@ -1186,9 +1334,10 @@ wg_menu_config_tunnel() {
   echo "Use this IP as the REMOTE server Public IPv4 on the other server: $LOCAL_PUBLIC_IP"
   echo
 
-  # Fewer questions: ports and AllowedIPs are generated from the tunnel number.
-  # Tunnel N uses UDP 51800+N on both sides and allows only the peer /32 by default.
-  LOCAL_WG_PORT="$(wg_default_port "$TUNNEL_ID")"
+  # Fewer questions: port and AllowedIPs are generated automatically.
+  # Default is UDP 51800+N; if that port is already used by another tunnel/process,
+  # the next free UDP port is selected automatically.
+  LOCAL_WG_PORT="$(auto_select_udp_port "$(wg_default_port "$TUNNEL_ID")" "$existing_wg_port" "wireguard" "$TUNNEL_ID")" || return
   REMOTE_WG_PORT="$LOCAL_WG_PORT"
   EXTRA_ALLOWED_IPS=""
 
@@ -1396,6 +1545,17 @@ wg_install_service() {
 
   ifc="$(wg_iface_name "$id")"
   svc="$(wg_service_name "$id")"
+
+  # Install this manager path so systemd can re-apply firewall rules on every boot/restart.
+  mkdir -p "$(dirname "$INSTALL_BIN")"
+  cp -f "$0" "$INSTALL_BIN" 2>/dev/null || true
+  chmod 755 "$INSTALL_BIN" 2>/dev/null || true
+  mkdir -p "/etc/systemd/system/wg-quick@$ifc.service.d"
+  cat > "/etc/systemd/system/wg-quick@$ifc.service.d/10-gretun-firewall.conf" <<EOF_WG_FW
+[Service]
+ExecStartPre=/bin/bash $INSTALL_BIN --service firewall-wg $id
+EOF_WG_FW
+
   systemctl daemon-reload
 
   # Avoid the previous bug: if wg-quick already created the interface, systemd start fails.
@@ -1499,6 +1659,12 @@ wg_apply_firewall_rules() {
     endpoint_ip="${WG_ENDPOINT_IP:-${REMOTE_PUBLIC_IP:-}}"
     remote_port="${REMOTE_WG_PORT:-$port}"
     transport_ifc="${WG_TRANSPORT_IFACE:-}"
+  fi
+
+  firewall_allow_udp_port_and_ip "WireGuard tunnel $id" "$port" "$endpoint_ip" "${remote_port:-$port}" "$ifc"
+  if wg_load_meta "$id"; then
+    firewall_allow_ip_peer "WireGuard tunnel $id remote inner" "${REMOTE_WG_IP:-}" "$ifc"
+    firewall_allow_ip_peer "WireGuard tunnel $id remote public" "${REMOTE_PUBLIC_IP:-}" "$ifc"
   fi
 
   # Linux reverse-path filtering can break asymmetric/encapsulated traffic on some providers.
@@ -1999,6 +2165,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+ExecStartPre=/bin/bash $INSTALL_BIN --service firewall-vira7 %i
 ExecStart=$VIRA7_BINARY $VIRA7_CONFIG_DIR/tunnel-%i.conf
 Restart=always
 RestartSec=3
@@ -2101,11 +2268,9 @@ EOF_CONF
 vira7_apply_firewall_rules() {
   local id="$1"
   if ! vira7_load_config "$id"; then return 1; fi
-  if command -v iptables >/dev/null 2>&1; then
-    iptables -C INPUT -p udp --dport "$VIRA7_PORT" -j ACCEPT 2>/dev/null || iptables -A INPUT -p udp --dport "$VIRA7_PORT" -j ACCEPT || true
-    iptables -C FORWARD -i "$VIRA7_IFACE" -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$VIRA7_IFACE" -j ACCEPT || true
-    iptables -C FORWARD -o "$VIRA7_IFACE" -j ACCEPT 2>/dev/null || iptables -A FORWARD -o "$VIRA7_IFACE" -j ACCEPT || true
-  fi
+  firewall_allow_udp_port_and_ip "Vira7 tunnel $id" "$VIRA7_PORT" "$REMOTE_PUBLIC_IP" "$VIRA7_PORT" "$VIRA7_IFACE"
+  firewall_allow_ip_peer "Vira7 tunnel $id remote inner" "${REMOTE_VIRA7_IP:-${remote_priv:-}}" "$VIRA7_IFACE"
+  firewall_allow_ip_peer "Vira7 tunnel $id remote public" "$REMOTE_PUBLIC_IP" "$VIRA7_IFACE"
 }
 
 vira7_install_service() {
@@ -2113,6 +2278,9 @@ vira7_install_service() {
   validate_tunnel_id "$id" || return 1
   command -v systemctl >/dev/null 2>&1 || return 1
   [ -x "$VIRA7_BINARY" ] || vira7_compile_engine || return 1
+  mkdir -p "$(dirname "$INSTALL_BIN")"
+  cp -f "$0" "$INSTALL_BIN" 2>/dev/null || true
+  chmod 755 "$INSTALL_BIN" 2>/dev/null || true
   vira7_write_service_template
   systemctl enable "$(vira7_service_name "$id")" || return 1
   if systemctl restart "$(vira7_service_name "$id")"; then
@@ -2197,12 +2365,8 @@ vira7_menu_config_tunnel() {
   echo
   prompt_remote_public_ip "$existing_remote_ip" || return
   echo
-  read -rp "Enter Vira7 UDP port [${existing_port:-$(vira7_default_port "$TUNNEL_ID")}]: " VIRA7_PORT_INPUT
-  VIRA7_PORT="${VIRA7_PORT_INPUT:-${existing_port:-$(vira7_default_port "$TUNNEL_ID")}}"
-  if ! [[ "$VIRA7_PORT" =~ ^[0-9]+$ ]] || [ "$VIRA7_PORT" -lt 1 ] || [ "$VIRA7_PORT" -gt 65535 ]; then
-    echo "Invalid UDP port."
-    return
-  fi
+  VIRA7_PORT="$(auto_select_udp_port "$(vira7_default_port "$TUNNEL_ID")" "$existing_port" "vira7" "$TUNNEL_ID")" || return
+  echo "Auto-selected Vira7 UDP port: $VIRA7_PORT"
   read -rp "Enter Vira7 MTU [${existing_mtu:-$VIRA7_DEFAULT_MTU}]: " VIRA7_MTU_INPUT
   VIRA7_MTU="${VIRA7_MTU_INPUT:-${existing_mtu:-$VIRA7_DEFAULT_MTU}}"
   if ! [[ "$VIRA7_MTU" =~ ^[0-9]+$ ]] || [ "$VIRA7_MTU" -lt 576 ] || [ "$VIRA7_MTU" -gt 1600 ]; then
@@ -2351,6 +2515,126 @@ list_saved_tunnels() {
   vira7_list_tunnels
 }
 
+ping4_target() {
+  local label="$1"
+  local target_ip="$2"
+  if [ -z "${target_ip:-}" ]; then
+    echo "[SKIP] $label: remote IP is empty"
+    return 1
+  fi
+  target_ip="${target_ip%%/*}"
+  echo
+  echo "============================================================"
+  echo "Testing: $label"
+  echo "Target : $target_ip"
+  echo "Command: ping -c 4 -W 2 $target_ip"
+  echo "------------------------------------------------------------"
+  if ping -c 4 -W 2 "$target_ip"; then
+    echo "[OK] $label ping success"
+    return 0
+  fi
+  echo "[FAIL] $label ping failed"
+  return 1
+}
+
+test_gre_tunnel_ping() {
+  local id="$1"
+  if ! gre_load_config "$id"; then
+    echo "[SKIP] GRE tunnel $id: no saved config"
+    return 1
+  fi
+  local target="${REMOTE_GRE_IP:-}"
+  if [ -z "$target" ] && [ -n "${ROLE:-}" ]; then
+    target="$(gre_remote_inner_ip_for_role "$id" "$ROLE")"
+  fi
+  ping4_target "GRE tunnel $id ($(gre_iface "$id")) remote inner IP" "$target"
+}
+
+test_wg_tunnel_ping() {
+  local id="$1"
+  if ! wg_load_meta "$id"; then
+    echo "[SKIP] WireGuard tunnel $id: no saved metadata"
+    return 1
+  fi
+  if [ -z "${REMOTE_WG_PUBLIC_KEY:-}" ]; then
+    echo "[SKIP] WireGuard tunnel $id: pending peer public key"
+    return 1
+  fi
+  ping4_target "WireGuard tunnel $id ($(wg_iface_name "$id")) remote inner IP" "${REMOTE_WG_IP:-}"
+}
+
+test_vira7_tunnel_ping() {
+  local id="$1"
+  if ! vira7_load_config "$id"; then
+    echo "[SKIP] Vira7 tunnel $id: no saved config"
+    return 1
+  fi
+  ping4_target "Vira7 tunnel $id ($(vira7_iface_name "$id")) remote inner IP" "${REMOTE_VIRA7_IP:-${remote_priv:-}}"
+}
+
+test_one_tunnel_ping_menu() {
+  show_header "Test One Tunnel"
+  ask_tunnel_type || return
+  echo
+  prompt_tunnel_id "Enter tunnel number to test [1-254]: " || return
+  case "$SELECTED_TUNNEL_TYPE" in
+    gre) test_gre_tunnel_ping "$TUNNEL_ID" ;;
+    wireguard) test_wg_tunnel_ping "$TUNNEL_ID" ;;
+    vira7) test_vira7_tunnel_ping "$TUNNEL_ID" ;;
+  esac
+}
+
+test_all_tunnels_ping() {
+  show_header "Test All Tunnels"
+  local ids id total=0 ok=0 fail=0
+
+  echo "Testing all saved GRE tunnels..."
+  ids="$(gre_collect_ids || true)"
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    total=$((total + 1))
+    if test_gre_tunnel_ping "$id"; then ok=$((ok + 1)); else fail=$((fail + 1)); fi
+  done <<< "$ids"
+
+  echo
+  echo "Testing all saved WireGuard tunnels..."
+  ids="$(wg_collect_ids || true)"
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    total=$((total + 1))
+    if test_wg_tunnel_ping "$id"; then ok=$((ok + 1)); else fail=$((fail + 1)); fi
+  done <<< "$ids"
+
+  echo
+  echo "Testing all saved Vira7 tunnels..."
+  ids="$(vira7_collect_ids || true)"
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    total=$((total + 1))
+    if test_vira7_tunnel_ping "$id"; then ok=$((ok + 1)); else fail=$((fail + 1)); fi
+  done <<< "$ids"
+
+  echo
+  echo "============================================================"
+  echo "Ping test summary: total=$total ok=$ok failed_or_skipped=$fail"
+  echo "============================================================"
+}
+
+test_tunnels_menu() {
+  show_header "Tunnel Ping Test"
+  echo "1) test all saved tunnels"
+  echo "2) test one selected tunnel"
+  echo "0) Back"
+  echo
+  read -rp "Choose an option [0-2]: " TEST_CHOICE
+  case "$TEST_CHOICE" in
+    1) test_all_tunnels_ping ;;
+    2) test_one_tunnel_ping_menu ;;
+    0) return ;;
+    *) echo "Invalid option" ;;
+  esac
+}
+
 reset_all_tunnels() {
   show_header "Reset All Tunnels"
   echo "This will restart/recreate all saved GRE, WireGuard, and Vira7 tunnels from their saved configs."
@@ -2440,13 +2724,15 @@ show_menu() {
   echo "1) create/update tunnel"
   echo "2) remove tunnel"
   echo "3) reset all tunnels"
+  echo "4) ping test tunnels"
   echo "0) Exit"
   echo
-  read -rp "Choose an option [0-3]: " CHOICE
+  read -rp "Choose an option [0-4]: " CHOICE
   case "$CHOICE" in
     1) menu_config_tunnel ; pause ;;
     2) remove_tun ; pause ;;
     3) reset_all_tunnels ; pause ;;
+    4) test_tunnels_menu ; pause ;;
     0) echo "Bye"; exit 0 ;;
     *) echo "Invalid option"; sleep 1 ;;
   esac
@@ -2464,6 +2750,16 @@ if [[ "${1:-}" == "--service" ]]; then
       # Backward compatibility with older gre-tunnel@ service template.
       ensure_root
       gre_service_start "${3:-}"
+      exit $?
+      ;;
+    firewall-wg)
+      ensure_root
+      wg_apply_firewall_rules "${3:-}"
+      exit $?
+      ;;
+    firewall-vira7)
+      ensure_root
+      vira7_apply_firewall_rules "${3:-}"
       exit $?
       ;;
     start-vira7)
