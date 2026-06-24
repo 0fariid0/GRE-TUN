@@ -1,12 +1,12 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + WireGuard + Vira7 multi-tunnel manager v7.5-original-based
+# GRE + WireGuard + Vira7 + HAProxy multi-tunnel manager v7.6-original-based
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
 # - Local tunnel/bind IPv4 can be selected manually for servers with multiple IPs
-# - v7.5-original-based shows local/remote public IPs in the same tunnel list row
+# - v7.6-original-based adds 00 back-to-main, Vira7 transport for WireGuard, and HAProxy port manager
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -30,6 +30,9 @@ VIRA7_DEFAULT_KEEPALIVE=5
 VIRA7_DEFAULT_BUFFER_SIZE=2097152
 VIRA7_DEFAULT_QUEUE_LEN=1000
 
+HAPROXY_CONFIG="/etc/haproxy/haproxy.cfg"
+HAPROXY_BACKUP_DIR="/etc/haproxy/gretun-backups"
+
 # Color/theme helpers
 if [ -t 1 ]; then
   C_RESET='\033[0m'
@@ -50,6 +53,9 @@ ok_msg() { echo -e "${C_GREEN}[OK]${C_RESET} $*"; }
 warn_msg() { echo -e "${C_YELLOW}[WARN]${C_RESET} $*"; }
 err_msg() { echo -e "${C_RED}[ERR]${C_RESET} $*"; }
 info_msg() { echo -e "${C_CYAN}[INFO]${C_RESET} $*"; }
+
+is_main_menu_token() { [ "${1:-}" = "00" ]; }
+return_main_msg() { echo -e "${C_CYAN}Returning to main menu...${C_RESET}"; }
 
 ensure_root() {
   if [ "$(id -u)" -ne 0 ]; then
@@ -104,10 +110,12 @@ prompt_local_tunnel_ip() {
   echo
 
   if [ -n "$default_ip" ]; then
-    read -rp "$prompt_label [$default_ip]: " input
+    read -rp "$prompt_label [$default_ip] (00=menu): " input
+    if is_main_menu_token "$input"; then return_main_msg; return 99; fi
     input="${input:-$default_ip}"
   else
-    read -rp "$prompt_label: " input
+    read -rp "$prompt_label (00=menu): " input
+    if is_main_menu_token "$input"; then return_main_msg; return 99; fi
   fi
 
   if ! validate_ipv4 "$input"; then
@@ -122,10 +130,12 @@ prompt_remote_public_ip() {
   local default_ip="${1:-}"
   local input
   if [ -n "$default_ip" ]; then
-    read -rp "Enter REMOTE server Public IPv4 [$default_ip]: " input
+    read -rp "Enter REMOTE server Public IPv4 [$default_ip] (00=menu): " input
+    if is_main_menu_token "$input"; then return_main_msg; return 99; fi
     REMOTE_PUBLIC_IP="${input:-$default_ip}"
   else
-    read -rp "Enter REMOTE server Public IPv4: " REMOTE_PUBLIC_IP
+    read -rp "Enter REMOTE server Public IPv4 (00=menu): " REMOTE_PUBLIC_IP
+    if is_main_menu_token "$REMOTE_PUBLIC_IP"; then return_main_msg; return 99; fi
   fi
   if ! validate_ipv4 "$REMOTE_PUBLIC_IP"; then
     echo "Invalid remote IPv4 address: ${REMOTE_PUBLIC_IP:-empty}"
@@ -157,9 +167,16 @@ validate_tunnel_id() {
   [ "$id" -ge 1 ] && [ "$id" -le 254 ]
 }
 
+validate_port() {
+  local port="${1:-}"
+  [[ "$port" =~ ^[0-9]+$ ]] || return 1
+  [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
+}
+
 prompt_tunnel_id() {
   local prompt="${1:-Enter tunnel number [1-254]: }"
   read -rp "$prompt" TUNNEL_ID
+  if is_main_menu_token "$TUNNEL_ID"; then return_main_msg; return 99; fi
   if ! validate_tunnel_id "$TUNNEL_ID"; then
     echo "Invalid tunnel number. Use a number from 1 to 254."
     return 1
@@ -170,7 +187,8 @@ prompt_role() {
   echo "1) Iran / local-side role"
   echo "2) Kharej / remote-side role"
   echo
-  read -rp "Select server role [1-2]: " ROLE
+  read -rp "Select server role [1-2] (00=menu): " ROLE
+  if is_main_menu_token "$ROLE"; then return_main_msg; return 99; fi
   if [[ "$ROLE" != "1" && "$ROLE" != "2" ]]; then
     echo "Invalid selection"
     return 1
@@ -183,7 +201,8 @@ ask_tunnel_type() {
   echo "2) WireGuard tunnel"
   echo "3) Vira7 UDP-TUN tunnel"
   echo
-  read -rp "Choose [1-3]: " TUNNEL_TYPE_CHOICE
+  read -rp "Choose [1-3] (00=menu): " TUNNEL_TYPE_CHOICE
+  if is_main_menu_token "$TUNNEL_TYPE_CHOICE"; then return_main_msg; return 99; fi
   case "$TUNNEL_TYPE_CHOICE" in
     1) SELECTED_TUNNEL_TYPE="gre" ;;
     2) SELECTED_TUNNEL_TYPE="wireguard" ;;
@@ -195,7 +214,8 @@ ask_tunnel_type() {
 confirm_yes() {
   local prompt="$1"
   local answer
-  read -rp "$prompt [y/N]: " answer
+  read -rp "$prompt [y/N] (00=menu): " answer
+  if is_main_menu_token "$answer"; then return_main_msg; return 99; fi
   case "$answer" in
     [Yy]*) return 0 ;;
     *) return 1 ;;
@@ -205,7 +225,8 @@ confirm_yes() {
 confirm_default_yes() {
   local prompt="$1"
   local answer
-  read -rp "$prompt [Y/n]: " answer
+  read -rp "$prompt [Y/n] (00=menu): " answer
+  if is_main_menu_token "$answer"; then return_main_msg; return 99; fi
   case "$answer" in
     [Nn]*) return 1 ;;
     *) return 0 ;;
@@ -689,7 +710,8 @@ gre_status_check() {
   show_header "Normal GRE Tunnel Status"
   gre_list_tunnels
   echo
-  read -rp "Enter GRE tunnel number to check, or leave empty to check all listed GRE tunnels: " selected_id
+  read -rp "Enter GRE tunnel number to check, leave empty for all, or 00=menu: " selected_id
+  if is_main_menu_token "$selected_id"; then return_main_msg; return 99; fi
 
   if [ -n "$selected_id" ]; then
     if ! validate_tunnel_id "$selected_id"; then
@@ -754,7 +776,8 @@ gre_remove_menu() {
     echo "No GRE tunnels found."
     return
   fi
-  read -rp "Enter GRE tunnel number to remove, for example 1: " selected_id
+  read -rp "Enter GRE tunnel number to remove, for example 1, or 00=menu: " selected_id
+  if is_main_menu_token "$selected_id"; then return_main_msg; return 99; fi
   if ! validate_tunnel_id "$selected_id"; then
     echo "Invalid tunnel number."
     return
@@ -870,11 +893,10 @@ wg_default_public_endpoint_ip() {
 }
 
 wg_auto_endpoint_ip() {
-  if [ "${WG_ENDPOINT_MODE:-public}" = "gre" ]; then
-    printf '%s' "${WG_ENDPOINT_IP:-}"
-  else
-    wg_default_public_endpoint_ip
-  fi
+  case "${WG_ENDPOINT_MODE:-public}" in
+    gre|vira7) printf '%s' "${WG_ENDPOINT_IP:-}" ;;
+    *) wg_default_public_endpoint_ip ;;
+  esac
 }
 
 wg_service_name() {
@@ -923,9 +945,10 @@ wg_print_ip_plan() {
   echo "  Default UDP port: $port (auto-increments if busy)"
   echo "  Iran role IP    : 10.20.$id.1/30"
   echo "  Kharej role IP  : 10.20.$id.2/30"
-  echo "  GRE fallback    : if gre$id is already up, WireGuard will auto-use 10.10.$id.x as its endpoint"
+  echo "  GRE transport   : if gre$id is up/reachable, WireGuard can use 10.10.$id.x"
+  echo "  Vira7 transport : if vira7$id is up/reachable, WireGuard can use 10.71.$id.x"
   echo
-  echo "GRE uses 10.10.N.x and greN. WireGuard uses 10.20.N.x and wgtunN, so they do not conflict."
+  echo "GRE uses 10.10.N.x, WireGuard uses 10.20.N.x, Vira7 uses 10.71.N.x, so they do not conflict."
 }
 
 wg_ensure_tools() {
@@ -1114,9 +1137,9 @@ wg_write_config() {
   endpoint_ip="$(wg_auto_endpoint_ip)"
   endpoint_mode_note="${WG_ENDPOINT_MODE:-public}"
   mtu_value="${WG_MTU:-1420}"
-  if [ "$endpoint_mode_note" = "gre" ]; then
-    mtu_value="${WG_MTU:-1280}"
-  fi
+  case "$endpoint_mode_note" in
+    gre|vira7) mtu_value="${WG_MTU:-1280}" ;;
+  esac
   if [ -z "$endpoint_ip" ]; then
     echo "WireGuard endpoint IP is empty. Cannot write config." >&2
     return 1
@@ -1180,11 +1203,10 @@ wg_create_tunnel() {
   WG_ENDPOINT_IP="${WG_ENDPOINT_IP:-${REMOTE_PUBLIC_IP:-}}"
   WG_TRANSPORT_IFACE="${WG_TRANSPORT_IFACE:-}"
   if [ -z "${WG_MTU:-}" ]; then
-    if [ "$WG_ENDPOINT_MODE" = "gre" ]; then
-      WG_MTU="1280"
-    else
-      WG_MTU="1420"
-    fi
+    case "$WG_ENDPOINT_MODE" in
+      gre|vira7) WG_MTU="1280" ;;
+      *) WG_MTU="1420" ;;
+    esac
   fi
   EXTRA_ALLOWED_IPS="${EXTRA_ALLOWED_IPS:-}"
   REMOTE_WG_PUBLIC_KEY="$(normalize_wg_public_key "${REMOTE_WG_PUBLIC_KEY:-}")"
@@ -1207,6 +1229,8 @@ wg_create_tunnel() {
   echo "[*] WireGuard MTU: ${WG_MTU:-1420}"
   if [ "${WG_ENDPOINT_MODE:-public}" = "gre" ]; then
     echo "[*] WireGuard transport: inside GRE interface ${WG_TRANSPORT_IFACE:-gre$TUNNEL_ID}"
+  elif [ "${WG_ENDPOINT_MODE:-public}" = "vira7" ]; then
+    echo "[*] WireGuard transport: inside Vira7 interface ${WG_TRANSPORT_IFACE:-vira7$TUNNEL_ID}"
   fi
   echo
   echo "Your LOCAL WireGuard public key for tunnel $TUNNEL_ID:"
@@ -1216,7 +1240,8 @@ wg_create_tunnel() {
   if [ "$interactive" -eq 1 ] && [ -z "$REMOTE_WG_PUBLIC_KEY" ]; then
     echo "Paste the OTHER server public key here."
     echo "If you do not have it yet, press Enter; this tunnel will be saved as pending."
-    read -rp "REMOTE WireGuard public key: " REMOTE_WG_PUBLIC_KEY
+    read -rp "REMOTE WireGuard public key (00=menu): " REMOTE_WG_PUBLIC_KEY
+    if is_main_menu_token "$REMOTE_WG_PUBLIC_KEY"; then return_main_msg; return 99; fi
     REMOTE_WG_PUBLIC_KEY="$(normalize_wg_public_key "$REMOTE_WG_PUBLIC_KEY")"
     echo
   fi
@@ -1281,33 +1306,64 @@ wg_create_tunnel() {
 wg_choose_auto_endpoint() {
   local id="$1"
   local role="$2"
-  local gre_ifc gre_remote_ip gre_remote_ok
+  local gre_ifc gre_remote_ip gre_ok
+  local vira_ifc vira_remote_ip vira_ok
+  local choice
+
   gre_ifc="$(wg_transport_iface "$id")"
   gre_remote_ip="$(gre_remote_inner_ip_for_role "$id" "$role")"
+  vira_ifc="$(vira7_iface_name "$id")"
+  vira_remote_ip="$(vira7_remote_inner_ip_for_role "$id" "$role")"
 
   WG_ENDPOINT_MODE="public"
   WG_ENDPOINT_IP="${REMOTE_PUBLIC_IP:-}"
   WG_TRANSPORT_IFACE=""
 
-  # If a same-number GRE tunnel is already up and its inner IP replies, use it as WireGuard transport.
-  # This is useful when public UDP/WireGuard is blocked but GRE is reachable.
+  gre_ok=0
   if ip link show "$gre_ifc" >/dev/null 2>&1; then
-    gre_remote_ok=0
-    if ping -c 1 -W 1 "$gre_remote_ip" >/dev/null 2>&1; then
-      gre_remote_ok=1
-    fi
-    if [ "$gre_remote_ok" -eq 1 ]; then
-      WG_ENDPOINT_MODE="gre"
-      WG_ENDPOINT_IP="$gre_remote_ip"
-      WG_TRANSPORT_IFACE="$gre_ifc"
-      return 0
-    fi
+    gre_ok=1
   fi
 
-  # If a previous WireGuard config used GRE transport, keep that choice when the GRE interface still exists.
+  vira_ok=0
+  if ip link show "$vira_ifc" >/dev/null 2>&1; then
+    vira_ok=1
+  fi
+
+  if [ "$gre_ok" -eq 1 ] && [ "$vira_ok" -eq 1 ]; then
+    echo "Same-number GRE and Vira7 tunnels both exist."
+    echo "1) Use GRE as WireGuard transport ($gre_ifc -> $gre_remote_ip)"
+    echo "2) Use Vira7 as WireGuard transport ($vira_ifc -> $vira_remote_ip)"
+    echo "00) Back to main menu"
+    read -rp "Choose WireGuard transport [1-2] (00=menu): " choice
+    if is_main_menu_token "$choice"; then return_main_msg; return 99; fi
+    case "$choice" in
+      1) WG_ENDPOINT_MODE="gre"; WG_ENDPOINT_IP="$gre_remote_ip"; WG_TRANSPORT_IFACE="$gre_ifc"; return 0 ;;
+      2) WG_ENDPOINT_MODE="vira7"; WG_ENDPOINT_IP="$vira_remote_ip"; WG_TRANSPORT_IFACE="$vira_ifc"; return 0 ;;
+      *) warn_msg "Invalid transport choice. Using GRE by default."; WG_ENDPOINT_MODE="gre"; WG_ENDPOINT_IP="$gre_remote_ip"; WG_TRANSPORT_IFACE="$gre_ifc"; return 0 ;;
+    esac
+  fi
+
+  if [ "$gre_ok" -eq 1 ]; then
+    WG_ENDPOINT_MODE="gre"
+    WG_ENDPOINT_IP="$gre_remote_ip"
+    WG_TRANSPORT_IFACE="$gre_ifc"
+    return 0
+  fi
+
+  if [ "$vira_ok" -eq 1 ]; then
+    WG_ENDPOINT_MODE="vira7"
+    WG_ENDPOINT_IP="$vira_remote_ip"
+    WG_TRANSPORT_IFACE="$vira_ifc"
+    return 0
+  fi
+
+  # Keep previous transport choice only if its interface still exists.
   if [ "${WG_ENDPOINT_MODE:-public}" = "gre" ] && ip link show "$gre_ifc" >/dev/null 2>&1; then
     WG_ENDPOINT_IP="$gre_remote_ip"
     WG_TRANSPORT_IFACE="$gre_ifc"
+  elif [ "${WG_ENDPOINT_MODE:-public}" = "vira7" ] && ip link show "$vira_ifc" >/dev/null 2>&1; then
+    WG_ENDPOINT_IP="$vira_remote_ip"
+    WG_TRANSPORT_IFACE="$vira_ifc"
   fi
 }
 
@@ -1322,11 +1378,12 @@ wg_menu_config_tunnel() {
   existing_local_ip=""
   existing_remote_ip=""
   existing_peer_key=""
-  local previous_endpoint_mode previous_endpoint_ip previous_transport_iface gre_saved_remote
+  local previous_endpoint_mode previous_endpoint_ip previous_transport_iface gre_saved_remote vira_saved_remote
   previous_endpoint_mode=""
   previous_endpoint_ip=""
   previous_transport_iface=""
   gre_saved_remote=""
+  vira_saved_remote=""
   local existing_wg_port
   existing_wg_port=""
   if wg_load_meta "$TUNNEL_ID"; then
@@ -1341,11 +1398,15 @@ wg_menu_config_tunnel() {
   ROLE="$selected_role"
   REMOTE_WG_PUBLIC_KEY="$existing_peer_key"
 
-  # Try to reuse the remote public IP saved by the same-number GRE tunnel.
-  # Run this in a subshell so GRE variables do not overwrite the selected WireGuard role.
-  gre_saved_remote="$(bash -c 'set -e; f="'"$GRE_CONFIG_DIR"'/tunnel-'"$TUNNEL_ID"'.conf"; [ -f "$f" ] && . "$f" && printf "%s" "${REMOTE_PUBLIC_IP:-}"' 2>/dev/null || true)"
+  # Try to reuse the remote public IP saved by same-number GRE or Vira7 tunnel.
+  # Run these in subshells so tunnel variables do not overwrite the selected WireGuard role.
+  gre_saved_remote="$(bash -c 'set -e; f="'"$GRE_CONFIG_DIR""'/tunnel-'"$TUNNEL_ID""'.conf"; [ -f "$f" ] && . "$f" && printf "%s" "${REMOTE_PUBLIC_IP:-}"' 2>/dev/null || true)"
+  vira_saved_remote="$(bash -c 'set -e; f="'"$VIRA7_CONFIG_DIR""'/tunnel-'"$TUNNEL_ID""'.conf"; [ -f "$f" ] && . "$f" && printf "%s" "${REMOTE_PUBLIC_IP:-${remote_ip:-}}"' 2>/dev/null || true)"
   if [ -z "$existing_remote_ip" ] && [ -n "$gre_saved_remote" ]; then
     existing_remote_ip="$gre_saved_remote"
+  fi
+  if [ -z "$existing_remote_ip" ] && [ -n "$vira_saved_remote" ]; then
+    existing_remote_ip="$vira_saved_remote"
   fi
 
   echo
@@ -1368,26 +1429,25 @@ wg_menu_config_tunnel() {
   WG_ENDPOINT_MODE="$previous_endpoint_mode"
   WG_ENDPOINT_IP="$previous_endpoint_ip"
   WG_TRANSPORT_IFACE="$previous_transport_iface"
-  wg_choose_auto_endpoint "$TUNNEL_ID" "$ROLE"
+  wg_choose_auto_endpoint "$TUNNEL_ID" "$ROLE" || return
 
-  if [ "${WG_ENDPOINT_MODE:-public}" != "gre" ]; then
+  if [ "${WG_ENDPOINT_MODE:-public}" = "public" ]; then
     prompt_remote_public_ip "$existing_remote_ip" || return
     WG_ENDPOINT_MODE="public"
     WG_ENDPOINT_IP="$REMOTE_PUBLIC_IP"
     WG_TRANSPORT_IFACE=""
   else
-    echo "Same-number GRE tunnel is active and reachable."
-    echo "WireGuard will automatically use GRE as transport to avoid public UDP/WireGuard blocking."
+    echo "Same-number ${WG_ENDPOINT_MODE} tunnel exists."
+    echo "WireGuard will automatically use ${WG_ENDPOINT_MODE} as transport to avoid public UDP/WireGuard blocking."
     echo "No remote public IP is needed for the WireGuard endpoint in this mode."
     # Keep the public IP in metadata if it was previously known, but do not require it for the endpoint.
     REMOTE_PUBLIC_IP="${REMOTE_PUBLIC_IP:-$existing_remote_ip}"
   fi
 
-  if [ "${WG_ENDPOINT_MODE:-public}" = "gre" ]; then
-    WG_MTU="1280"
-  else
-    WG_MTU="1420"
-  fi
+  case "${WG_ENDPOINT_MODE:-public}" in
+    gre|vira7) WG_MTU="1280" ;;
+    *) WG_MTU="1420" ;;
+  esac
 
   echo
   echo "Auto WireGuard values for tunnel $TUNNEL_ID:"
@@ -1399,6 +1459,8 @@ wg_menu_config_tunnel() {
   echo "  MTU                    : $WG_MTU"
   if [ "${WG_ENDPOINT_MODE:-public}" = "gre" ]; then
     echo "  Transport interface    : ${WG_TRANSPORT_IFACE:-gre$TUNNEL_ID}"
+  elif [ "${WG_ENDPOINT_MODE:-public}" = "vira7" ]; then
+    echo "  Transport interface    : ${WG_TRANSPORT_IFACE:-vira7$TUNNEL_ID}"
   fi
   echo "  AllowedIPs             : peer /32 only"
   if [ -n "$REMOTE_WG_PUBLIC_KEY" ]; then
@@ -1407,7 +1469,8 @@ wg_menu_config_tunnel() {
     echo "Saved remote peer key found."
     echo "Press Enter to keep it, paste a new peer public key to replace it, or type CLEAR to reset this tunnel to pending."
     local peer_key_input
-    read -rp "REMOTE WireGuard public key [keep/CLEAR/new]: " peer_key_input
+    read -rp "REMOTE WireGuard public key [keep/CLEAR/new] (00=menu): " peer_key_input
+    if is_main_menu_token "$peer_key_input"; then return_main_msg; return 99; fi
     if [ "${peer_key_input^^}" = "CLEAR" ]; then
       REMOTE_WG_PUBLIC_KEY=""
     elif [ -n "$peer_key_input" ]; then
@@ -1436,9 +1499,9 @@ wg_check_one_tunnel() {
     echo "Remote WG IP        : ${REMOTE_WG_IP:-unknown}"
     echo "Endpoint mode       : ${WG_ENDPOINT_MODE:-public}"
     echo "Remote endpoint     : ${WG_ENDPOINT_IP:-${REMOTE_PUBLIC_IP:-unknown}}:${REMOTE_WG_PORT:-$(wg_default_port "$id")}" 
-    if [ "${WG_ENDPOINT_MODE:-public}" = "gre" ]; then
-      echo "Transport interface : ${WG_TRANSPORT_IFACE:-gre$id}"
-    fi
+    case "${WG_ENDPOINT_MODE:-public}" in
+      gre|vira7) echo "Transport interface : ${WG_TRANSPORT_IFACE:-}" ;;
+    esac
     echo "Local UDP port      : ${LOCAL_WG_PORT:-$(wg_default_port "$id")}" 
     echo "WireGuard MTU       : ${WG_MTU:-unknown}" 
     if [ -n "${REMOTE_WG_PUBLIC_KEY:-}" ]; then
@@ -1488,8 +1551,8 @@ wg_check_one_tunnel() {
         echo "[WARN] WireGuard inner ping failed"
         last="$(wg show "$ifc" latest-handshakes 2>/dev/null | awk 'NR==1{print $2}' || true)"
         if [ -z "$last" ] || [ "$last" = "0" ]; then
-          if [ "${WG_ENDPOINT_MODE:-public}" = "gre" ]; then
-            echo "Diagnosis: no WireGuard handshake yet. WireGuard is using GRE transport. Check that GRE tunnel $id still pings, the peer public key is correct, and UDP $(wg_default_port "$id") is allowed over gre$id on both servers."
+          if [ "${WG_ENDPOINT_MODE:-public}" = "gre" ] || [ "${WG_ENDPOINT_MODE:-public}" = "vira7" ]; then
+            echo "Diagnosis: no WireGuard handshake yet. WireGuard is using ${WG_ENDPOINT_MODE} transport. Check that transport tunnel $id still pings, the peer public key is correct, and UDP $(wg_default_port "$id") is allowed over ${WG_TRANSPORT_IFACE:-transport interface} on both servers."
           else
             echo "Diagnosis: no WireGuard handshake yet. Check the peer public key, remote public IP, UDP port $(wg_default_port "$id"), and firewall/NAT on both servers. If public UDP/WireGuard is blocked but GRE works, re-run create/update after GRE is up; v6 will auto-use GRE as WireGuard transport."
           fi
@@ -1528,7 +1591,8 @@ wg_status_check() {
   show_header "WireGuard Tunnel Status"
   wg_list_tunnels
   echo
-  read -rp "Enter WireGuard tunnel number to check, or leave empty to check all listed WireGuard tunnels: " selected_id
+  read -rp "Enter WireGuard tunnel number to check, leave empty for all, or 00=menu: " selected_id
+  if is_main_menu_token "$selected_id"; then return_main_msg; return 99; fi
 
   if [ -n "$selected_id" ]; then
     if ! validate_tunnel_id "$selected_id"; then
@@ -1654,7 +1718,8 @@ wg_repair_menu() {
     echo "No WireGuard tunnels found."
     return
   fi
-  read -rp "Enter WireGuard tunnel number to repair/restart, for example 1: " selected_id
+  read -rp "Enter WireGuard tunnel number to repair/restart, for example 1, or 00=menu: " selected_id
+  if is_main_menu_token "$selected_id"; then return_main_msg; return 99; fi
   if ! validate_tunnel_id "$selected_id"; then
     echo "Invalid tunnel number."
     return
@@ -1703,7 +1768,7 @@ wg_apply_firewall_rules() {
     if [ -n "$endpoint_ip" ] && [ -n "$remote_port" ]; then
       iptables -C OUTPUT -p udp -d "$endpoint_ip" --dport "$remote_port" -j ACCEPT 2>/dev/null || iptables -A OUTPUT -p udp -d "$endpoint_ip" --dport "$remote_port" -j ACCEPT || true
     fi
-    if [ "$endpoint_mode" = "gre" ] && [ -n "$transport_ifc" ]; then
+    if { [ "$endpoint_mode" = "gre" ] || [ "$endpoint_mode" = "vira7" ]; } && [ -n "$transport_ifc" ]; then
       iptables -C INPUT -i "$transport_ifc" -p udp --dport "$port" -j ACCEPT 2>/dev/null || iptables -A INPUT -i "$transport_ifc" -p udp --dport "$port" -j ACCEPT || true
       if [ -n "$endpoint_ip" ]; then
         iptables -C OUTPUT -o "$transport_ifc" -p udp -d "$endpoint_ip" --dport "$remote_port" -j ACCEPT 2>/dev/null || iptables -A OUTPUT -o "$transport_ifc" -p udp -d "$endpoint_ip" --dport "$remote_port" -j ACCEPT || true
@@ -1714,7 +1779,7 @@ wg_apply_firewall_rules() {
   if command -v ufw >/dev/null 2>&1; then
     ufw allow "$port/udp" comment "wgtun$id" >/dev/null 2>&1 || true
     ufw allow in on "$ifc" >/dev/null 2>&1 || true
-    if [ "$endpoint_mode" = "gre" ] && [ -n "$transport_ifc" ]; then
+    if { [ "$endpoint_mode" = "gre" ] || [ "$endpoint_mode" = "vira7" ]; } && [ -n "$transport_ifc" ]; then
       ufw allow in on "$transport_ifc" to any port "$port" proto udp >/dev/null 2>&1 || true
     fi
   fi
@@ -1722,7 +1787,7 @@ wg_apply_firewall_rules() {
   if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
     firewall-cmd --permanent --add-port="$port/udp" >/dev/null 2>&1 || true
     firewall-cmd --permanent --add-interface="$ifc" >/dev/null 2>&1 || true
-    if [ "$endpoint_mode" = "gre" ] && [ -n "$transport_ifc" ]; then
+    if { [ "$endpoint_mode" = "gre" ] || [ "$endpoint_mode" = "vira7" ]; } && [ -n "$transport_ifc" ]; then
       firewall-cmd --permanent --add-interface="$transport_ifc" >/dev/null 2>&1 || true
     fi
     firewall-cmd --reload >/dev/null 2>&1 || true
@@ -1823,7 +1888,8 @@ wg_remove_menu() {
     echo "No WireGuard tunnels found."
     return
   fi
-  read -rp "Enter WireGuard tunnel number to remove, for example 1: " selected_id
+  read -rp "Enter WireGuard tunnel number to remove, for example 1, or 00=menu: " selected_id
+  if is_main_menu_token "$selected_id"; then return_main_msg; return 99; fi
   if ! validate_tunnel_id "$selected_id"; then
     echo "Invalid tunnel number."
     return
@@ -2390,7 +2456,8 @@ vira7_menu_config_tunnel() {
   echo
   VIRA7_PORT="$(auto_select_udp_port "$(vira7_default_port "$TUNNEL_ID")" "$existing_port" "vira7" "$TUNNEL_ID")" || return
   echo "Auto-selected Vira7 UDP port: $VIRA7_PORT"
-  read -rp "Enter Vira7 MTU [${existing_mtu:-$VIRA7_DEFAULT_MTU}]: " VIRA7_MTU_INPUT
+  read -rp "Enter Vira7 MTU [${existing_mtu:-$VIRA7_DEFAULT_MTU}] (00=menu): " VIRA7_MTU_INPUT
+  if is_main_menu_token "$VIRA7_MTU_INPUT"; then return_main_msg; return 99; fi
   VIRA7_MTU="${VIRA7_MTU_INPUT:-${existing_mtu:-$VIRA7_DEFAULT_MTU}}"
   if ! [[ "$VIRA7_MTU" =~ ^[0-9]+$ ]] || [ "$VIRA7_MTU" -lt 576 ] || [ "$VIRA7_MTU" -gt 1600 ]; then
     echo "Invalid MTU."
@@ -2455,7 +2522,8 @@ vira7_remove_menu() {
   local ids selected_id
   ids="$(vira7_collect_ids || true)"
   if [ -z "$ids" ]; then echo "No Vira7 tunnels found."; return; fi
-  read -rp "Enter Vira7 tunnel number to remove, for example 1: " selected_id
+  read -rp "Enter Vira7 tunnel number to remove, for example 1, or 00=menu: " selected_id
+  if is_main_menu_token "$selected_id"; then return_main_msg; return 99; fi
   validate_tunnel_id "$selected_id" || { echo "Invalid tunnel number."; return; }
   if ! echo "$ids" | grep -qx "$selected_id"; then
     echo "Vira7 tunnel $selected_id was not found in the list."
@@ -2634,7 +2702,8 @@ remove_tun() {
   echo -e "${C_RED}${C_BOLD}88) remove ALL tunnels${C_RESET}"
   echo "Select a tunnel number from the list, or 88 to remove everything."
   echo
-  read -rp "Choose tunnel to remove [number/88]: " selected
+  read -rp "Choose tunnel to remove [number/88] (00=menu): " selected
+  if is_main_menu_token "$selected"; then return_main_msg; return 99; fi
 
   if [ "$selected" = "88" ]; then
     echo
@@ -2793,7 +2862,8 @@ test_tunnels_menu() {
   echo -e "${C_GREEN}${C_BOLD}0) ping ALL tunnels${C_RESET}"
   echo "Select a tunnel number from the list, or 0 to ping all."
   echo
-  read -rp "Choose tunnel to ping [0/list number]: " selected
+  read -rp "Choose tunnel to ping [0/list number] (00=menu): " selected
+  if is_main_menu_token "$selected"; then return_main_msg; return 99; fi
 
   if [ "$selected" = "0" ]; then
     local i total ok fail
@@ -2899,6 +2969,274 @@ reset_all_tunnels() {
   echo "[OK] Reset all finished."
 }
 
+# -----------------------------
+# HAProxy port forward manager
+# -----------------------------
+haproxy_base_header() {
+  cat <<'EOF_HEADER'
+global
+    log /dev/log local0
+    log /dev/log local1 notice
+    maxconn 50000
+    daemon
+
+defaults
+    log global
+    mode http
+    option httplog
+    option dontlognull
+    timeout connect 10s
+    timeout client 1h
+    timeout server 1h
+    timeout tunnel 1h
+EOF_HEADER
+}
+
+haproxy_is_installed() {
+  command -v haproxy >/dev/null 2>&1
+}
+
+haproxy_install_package() {
+  if haproxy_is_installed; then
+    ok_msg "HAProxy is already installed."
+    return 0
+  fi
+
+  info_msg "HAProxy is not installed. Installing now..."
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y haproxy
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y haproxy
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y haproxy
+  else
+    err_msg "No supported package manager found. Install haproxy manually first."
+    return 1
+  fi
+
+  if ! haproxy_is_installed; then
+    err_msg "HAProxy نصب نشد. این بخش بدون نصب HAProxy کار نمی‌کند؛ حتماً باید نصبش کنی."
+    return 1
+  fi
+
+  systemctl enable haproxy >/dev/null 2>&1 || true
+  ok_msg "HAProxy installed."
+}
+
+haproxy_ensure_ready() {
+  haproxy_install_package || return 1
+  mkdir -p /etc/haproxy "$HAPROXY_BACKUP_DIR"
+  if [ ! -f "$HAPROXY_CONFIG" ]; then
+    haproxy_base_header > "$HAPROXY_CONFIG"
+    systemctl restart haproxy >/dev/null 2>&1 || true
+  fi
+}
+
+haproxy_export_entries() {
+  # Output: local_port target_ip target_port
+  [ -f "$HAPROXY_CONFIG" ] || return 0
+  awk '
+    /^[[:space:]]*backend[[:space:]]+ws_[0-9]+_out[[:space:]]*$/ {
+      p=$2; sub(/^ws_/, "", p); sub(/_out$/, "", p); next
+    }
+    /^[[:space:]]*server[[:space:]]+/ && p != "" {
+      split($3, a, ":");
+      if (a[1] != "" && a[2] != "") print p, a[1], a[2];
+      p="";
+    }
+  ' "$HAPROXY_CONFIG" | sort -n -k1,1 -u
+}
+
+haproxy_list_forwards() {
+  echo -e "${C_BOLD}${C_WHITE}HAProxy forwarded ports:${C_RESET}"
+  local entries
+  entries="$(haproxy_export_entries || true)"
+  if [ -z "$entries" ]; then
+    warn_msg "No forwarded ports found in $HAPROXY_CONFIG"
+    return 0
+  fi
+  printf "${C_DIM}%8s  %-15s %-12s${C_RESET}\n" "Port" "Target-IP" "Target-Port"
+  printf "${C_DIM}%s${C_RESET}\n" "----------------------------------------"
+  while read -r port ip tport; do
+    [ -n "${port:-}" ] || continue
+    printf "%8s  ${C_MAGENTA}%-15s${C_RESET} %-12s\n" "$port" "$ip" "$tport"
+  done <<< "$entries"
+}
+
+haproxy_open_firewall_tcp() {
+  local port="$1"
+  validate_port "$port" || return 0
+  if command -v iptables >/dev/null 2>&1; then
+    iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || iptables -A INPUT -p tcp --dport "$port" -j ACCEPT || true
+    iptables -C OUTPUT -p tcp --sport "$port" -j ACCEPT 2>/dev/null || iptables -A OUTPUT -p tcp --sport "$port" -j ACCEPT || true
+  fi
+  if command -v ufw >/dev/null 2>&1; then
+    ufw allow "$port/tcp" >/dev/null 2>&1 || true
+  fi
+}
+
+haproxy_validate_and_restart() {
+  local tmp="$1"
+  if ! haproxy -c -f "$tmp"; then
+    err_msg "HAProxy config validation failed. Nothing changed."
+    rm -f "$tmp"
+    return 1
+  fi
+  mkdir -p "$HAPROXY_BACKUP_DIR"
+  if [ -f "$HAPROXY_CONFIG" ]; then
+    cp -f "$HAPROXY_CONFIG" "$HAPROXY_BACKUP_DIR/haproxy.cfg.$(date +%Y%m%d-%H%M%S).bak" 2>/dev/null || true
+  fi
+  mv -f "$tmp" "$HAPROXY_CONFIG"
+  systemctl enable haproxy >/dev/null 2>&1 || true
+  if systemctl restart haproxy; then
+    ok_msg "HAProxy restarted successfully."
+    return 0
+  fi
+  err_msg "HAProxy restart failed. Check: journalctl -u haproxy -n 50 --no-pager"
+  return 1
+}
+
+haproxy_write_entries_file() {
+  local entries_file="$1"
+  local tmp
+  tmp="$(mktemp)"
+  haproxy_base_header > "$tmp"
+  if [ -s "$entries_file" ]; then
+    while read -r port ip tport; do
+      [ -n "${port:-}" ] || continue
+      validate_port "$port" || continue
+      validate_ipv4 "$ip" || continue
+      validate_port "${tport:-$port}" || tport="$port"
+      cat >> "$tmp" <<EOF_BLOCK
+
+frontend ws_${port}_in
+    bind *:${port}
+    mode http
+    option forwardfor
+    default_backend ws_${port}_out
+
+backend ws_${port}_out
+    mode http
+    option http-keep-alive
+    server foreign_${port} ${ip}:${tport}
+EOF_BLOCK
+      haproxy_open_firewall_tcp "$port"
+    done < <(sort -n -k1,1 -u "$entries_file")
+  fi
+  haproxy_validate_and_restart "$tmp"
+}
+
+haproxy_entries_tmp() {
+  local tmp
+  tmp="$(mktemp)"
+  haproxy_export_entries > "$tmp" || true
+  echo "$tmp"
+}
+
+haproxy_add_port() {
+  local port ip tmp
+  echo "00) Back to main menu"
+  read -rp "Enter local port to forward (00=menu): " port
+  if is_main_menu_token "$port"; then return_main_msg; return 99; fi
+  validate_port "$port" || { err_msg "Invalid port."; return 1; }
+  read -rp "Enter target IP for port $port (00=menu): " ip
+  if is_main_menu_token "$ip"; then return_main_msg; return 99; fi
+  validate_ipv4 "$ip" || { err_msg "Invalid IPv4."; return 1; }
+
+  tmp="$(haproxy_entries_tmp)"
+  if awk -v p="$port" '$1==p{found=1} END{exit found?0:1}' "$tmp"; then
+    warn_msg "Port $port already exists; replacing its target IP."
+  fi
+  awk -v p="$port" '$1!=p' "$tmp" > "$tmp.new" || true
+  printf '%s %s %s\n' "$port" "$ip" "$port" >> "$tmp.new"
+  mv -f "$tmp.new" "$tmp"
+  haproxy_write_entries_file "$tmp"
+  rm -f "$tmp"
+}
+
+haproxy_change_all_ips() {
+  local ip tmp
+  tmp="$(haproxy_entries_tmp)"
+  if [ ! -s "$tmp" ]; then warn_msg "No forwarded ports to update."; rm -f "$tmp"; return 0; fi
+  echo "00) Back to main menu"
+  read -rp "Enter new target IP for ALL ports (00=menu): " ip
+  if is_main_menu_token "$ip"; then rm -f "$tmp"; return_main_msg; return 99; fi
+  validate_ipv4 "$ip" || { err_msg "Invalid IPv4."; rm -f "$tmp"; return 1; }
+  awk -v ip="$ip" '{print $1, ip, $3}' "$tmp" > "$tmp.new"
+  mv -f "$tmp.new" "$tmp"
+  haproxy_write_entries_file "$tmp"
+  rm -f "$tmp"
+}
+
+haproxy_delete_port() {
+  local port tmp before after
+  tmp="$(haproxy_entries_tmp)"
+  if [ ! -s "$tmp" ]; then warn_msg "No forwarded ports to delete."; rm -f "$tmp"; return 0; fi
+  haproxy_list_forwards
+  echo
+  echo "00) Back to main menu"
+  read -rp "Enter local port to delete (00=menu): " port
+  if is_main_menu_token "$port"; then rm -f "$tmp"; return_main_msg; return 99; fi
+  validate_port "$port" || { err_msg "Invalid port."; rm -f "$tmp"; return 1; }
+  before="$(wc -l < "$tmp" | tr -d ' ')"
+  awk -v p="$port" '$1!=p' "$tmp" > "$tmp.new" || true
+  after="$(wc -l < "$tmp.new" | tr -d ' ')"
+  if [ "$before" = "$after" ]; then warn_msg "Port $port was not found."; rm -f "$tmp" "$tmp.new"; return 0; fi
+  mv -f "$tmp.new" "$tmp"
+  haproxy_write_entries_file "$tmp"
+  rm -f "$tmp"
+}
+
+haproxy_change_one_ip() {
+  local port ip tmp found
+  tmp="$(haproxy_entries_tmp)"
+  if [ ! -s "$tmp" ]; then warn_msg "No forwarded ports to update."; rm -f "$tmp"; return 0; fi
+  haproxy_list_forwards
+  echo
+  echo "00) Back to main menu"
+  read -rp "Enter local port to change IP (00=menu): " port
+  if is_main_menu_token "$port"; then rm -f "$tmp"; return_main_msg; return 99; fi
+  validate_port "$port" || { err_msg "Invalid port."; rm -f "$tmp"; return 1; }
+  if ! awk -v p="$port" '$1==p{found=1} END{exit found?0:1}' "$tmp"; then
+    warn_msg "Port $port was not found."
+    rm -f "$tmp"
+    return 0
+  fi
+  read -rp "Enter new target IP for port $port (00=menu): " ip
+  if is_main_menu_token "$ip"; then rm -f "$tmp"; return_main_msg; return 99; fi
+  validate_ipv4 "$ip" || { err_msg "Invalid IPv4."; rm -f "$tmp"; return 1; }
+  awk -v p="$port" -v ip="$ip" '{if ($1==p) print $1, ip, $3; else print $0}' "$tmp" > "$tmp.new"
+  mv -f "$tmp.new" "$tmp"
+  haproxy_write_entries_file "$tmp"
+  rm -f "$tmp"
+}
+
+haproxy_menu() {
+  haproxy_ensure_ready || return 1
+  while true; do
+    show_header "HAProxy Port Forward Manager"
+    echo -e "${C_BOLD}${C_WHITE}HAProxy Menu${C_RESET}"
+    echo -e "  ${C_GREEN}1)${C_RESET} list forwarded ports"
+    echo -e "  ${C_GREEN}2)${C_RESET} add/update port"
+    echo -e "  ${C_YELLOW}3)${C_RESET} change ALL target IPs"
+    echo -e "  ${C_RED}4)${C_RESET} delete port"
+    echo -e "  ${C_CYAN}5)${C_RESET} change target IP for one port"
+    echo -e "  ${C_DIM}00) Back to main menu${C_RESET}"
+    echo
+    read -rp "Choose HAProxy option [1-5/00]: " HAP_CHOICE
+    case "$HAP_CHOICE" in
+      1) haproxy_list_forwards; pause ;;
+      2) haproxy_add_port; pause ;;
+      3) haproxy_change_all_ips; pause ;;
+      4) haproxy_delete_port; pause ;;
+      5) haproxy_change_one_ip; pause ;;
+      00) return_main_msg; return 0 ;;
+      *) err_msg "Invalid option"; sleep 1 ;;
+    esac
+  done
+}
+
 show_menu() {
   show_header "GRE + WireGuard + Vira7 Tunnel Management"
   echo -e "${C_BOLD}${C_WHITE}Main Menu${C_RESET}"
@@ -2906,14 +3244,18 @@ show_menu() {
   echo -e "  ${C_RED}2)${C_RESET} remove tunnel"
   echo -e "  ${C_YELLOW}3)${C_RESET} reset all tunnels"
   echo -e "  ${C_CYAN}4)${C_RESET} ping test tunnels"
+  echo -e "  ${C_MAGENTA}5)${C_RESET} haproxy port manager"
+  echo -e "  ${C_DIM}00) Main menu / back${C_RESET}"
   echo -e "  ${C_DIM}0) Exit${C_RESET}"
   echo
-  read -rp "Choose an option [0-4]: " CHOICE
+  read -rp "Choose an option [0-5]: " CHOICE
   case "$CHOICE" in
     1) menu_config_tunnel ; pause ;;
     2) remove_tun ; pause ;;
     3) reset_all_tunnels ; pause ;;
     4) test_tunnels_menu ; pause ;;
+    5) haproxy_menu ;;
+    00) return_main_msg ;;
     0) echo "Bye"; exit 0 ;;
     *) err_msg "Invalid option"; sleep 1 ;;
   esac
