@@ -3033,34 +3033,62 @@ haproxy_ensure_ready() {
   fi
 }
 
+haproxy_normalize_proto() {
+  local proto="${1:-http}"
+  proto="$(printf '%s' "$proto" | tr '[:upper:]' '[:lower:]')"
+  case "$proto" in
+    tcp) echo "tcp" ;;
+    *) echo "http" ;;
+  esac
+}
+
+haproxy_toggle_proto() {
+  local proto
+  proto="$(haproxy_normalize_proto "${1:-http}")"
+  if [ "$proto" = "tcp" ]; then
+    echo "http"
+  else
+    echo "tcp"
+  fi
+}
+
 haproxy_export_entries() {
-  # Output: local_port target_ip target_port
+  # Output: local_port target_ip target_port protocol
+  # Older configs without a saved protocol are treated as http.
   [ -f "$HAPROXY_CONFIG" ] || return 0
   awk '
     /^[[:space:]]*backend[[:space:]]+ws_[0-9]+_out[[:space:]]*$/ {
-      p=$2; sub(/^ws_/, "", p); sub(/_out$/, "", p); next
+      p=$2; sub(/^ws_/, "", p); sub(/_out$/, "", p); proto="http"; next
+    }
+    p != "" && /^[[:space:]]*mode[[:space:]]+/ {
+      proto=$2; next
     }
     /^[[:space:]]*server[[:space:]]+/ && p != "" {
       split($3, a, ":");
-      if (a[1] != "" && a[2] != "") print p, a[1], a[2];
-      p="";
+      if (a[1] != "" && a[2] != "") {
+        if (proto != "tcp") proto="http";
+        print p, a[1], a[2], proto;
+      }
+      p=""; proto="http";
     }
   ' "$HAPROXY_CONFIG" | sort -n -k1,1 -u
 }
 
 haproxy_list_forwards() {
   echo -e "${C_BOLD}${C_WHITE}HAProxy forwarded ports:${C_RESET}"
-  local entries
+  local entries proto color
   entries="$(haproxy_export_entries || true)"
   if [ -z "$entries" ]; then
     warn_msg "No forwarded ports found in $HAPROXY_CONFIG"
     return 0
   fi
-  printf "${C_DIM}%8s  %-15s %-12s${C_RESET}\n" "Port" "Target-IP" "Target-Port"
-  printf "${C_DIM}%s${C_RESET}\n" "----------------------------------------"
-  while read -r port ip tport; do
+  printf "${C_DIM}%8s  %-15s %-12s %-8s${C_RESET}\n" "Port" "Target-IP" "Target-Port" "Protocol"
+  printf "${C_DIM}%s${C_RESET}\n" "-----------------------------------------------------"
+  while read -r port ip tport proto; do
     [ -n "${port:-}" ] || continue
-    printf "%8s  ${C_MAGENTA}%-15s${C_RESET} %-12s\n" "$port" "$ip" "$tport"
+    proto="$(haproxy_normalize_proto "${proto:-http}")"
+    if [ "$proto" = "tcp" ]; then color="$C_YELLOW"; else color="$C_CYAN"; fi
+    printf "%8s  ${C_MAGENTA}%-15s${C_RESET} %-12s ${color}%-8s${C_RESET}\n" "$port" "$ip" "$tport" "$proto"
   done <<< "$entries"
 }
 
@@ -3099,16 +3127,31 @@ haproxy_validate_and_restart() {
 
 haproxy_write_entries_file() {
   local entries_file="$1"
-  local tmp
+  local tmp proto
   tmp="$(mktemp)"
   haproxy_base_header > "$tmp"
   if [ -s "$entries_file" ]; then
-    while read -r port ip tport; do
+    while read -r port ip tport proto; do
       [ -n "${port:-}" ] || continue
       validate_port "$port" || continue
       validate_ipv4 "$ip" || continue
       validate_port "${tport:-$port}" || tport="$port"
-      cat >> "$tmp" <<EOF_BLOCK
+      proto="$(haproxy_normalize_proto "${proto:-http}")"
+
+      if [ "$proto" = "tcp" ]; then
+        cat >> "$tmp" <<EOF_BLOCK
+
+frontend ws_${port}_in
+    bind *:${port}
+    mode tcp
+    default_backend ws_${port}_out
+
+backend ws_${port}_out
+    mode tcp
+    server foreign_${port} ${ip}:${tport}
+EOF_BLOCK
+      else
+        cat >> "$tmp" <<EOF_BLOCK
 
 frontend ws_${port}_in
     bind *:${port}
@@ -3121,6 +3164,7 @@ backend ws_${port}_out
     option http-keep-alive
     server foreign_${port} ${ip}:${tport}
 EOF_BLOCK
+      fi
       haproxy_open_firewall_tcp "$port"
     done < <(sort -n -k1,1 -u "$entries_file")
   fi
@@ -3135,7 +3179,7 @@ haproxy_entries_tmp() {
 }
 
 haproxy_add_port() {
-  local port ip tmp
+  local port ip tmp existing_proto
   echo "00) Back to main menu"
   read -rp "Enter local port to forward (00=menu): " port
   if is_main_menu_token "$port"; then return_main_msg; return 99; fi
@@ -3145,11 +3189,13 @@ haproxy_add_port() {
   validate_ipv4 "$ip" || { err_msg "Invalid IPv4."; return 1; }
 
   tmp="$(haproxy_entries_tmp)"
+  existing_proto="$(awk -v p="$port" '$1==p{print $4; exit}' "$tmp")"
+  existing_proto="$(haproxy_normalize_proto "${existing_proto:-http}")"
   if awk -v p="$port" '$1==p{found=1} END{exit found?0:1}' "$tmp"; then
-    warn_msg "Port $port already exists; replacing its target IP."
+    warn_msg "Port $port already exists; replacing its target IP and keeping protocol: $existing_proto"
   fi
   awk -v p="$port" '$1!=p' "$tmp" > "$tmp.new" || true
-  printf '%s %s %s\n' "$port" "$ip" "$port" >> "$tmp.new"
+  printf '%s %s %s %s\n' "$port" "$ip" "$port" "$existing_proto" >> "$tmp.new"
   mv -f "$tmp.new" "$tmp"
   haproxy_write_entries_file "$tmp"
   rm -f "$tmp"
@@ -3163,7 +3209,7 @@ haproxy_change_all_ips() {
   read -rp "Enter new target IP for ALL ports (00=menu): " ip
   if is_main_menu_token "$ip"; then rm -f "$tmp"; return_main_msg; return 99; fi
   validate_ipv4 "$ip" || { err_msg "Invalid IPv4."; rm -f "$tmp"; return 1; }
-  awk -v ip="$ip" '{print $1, ip, $3}' "$tmp" > "$tmp.new"
+  awk -v ip="$ip" '{proto=$4; if(proto=="") proto="http"; print $1, ip, $3, proto}' "$tmp" > "$tmp.new"
   mv -f "$tmp.new" "$tmp"
   haproxy_write_entries_file "$tmp"
   rm -f "$tmp"
@@ -3189,7 +3235,7 @@ haproxy_delete_port() {
 }
 
 haproxy_change_one_ip() {
-  local port ip tmp found
+  local port ip tmp
   tmp="$(haproxy_entries_tmp)"
   if [ ! -s "$tmp" ]; then warn_msg "No forwarded ports to update."; rm -f "$tmp"; return 0; fi
   haproxy_list_forwards
@@ -3206,10 +3252,86 @@ haproxy_change_one_ip() {
   read -rp "Enter new target IP for port $port (00=menu): " ip
   if is_main_menu_token "$ip"; then rm -f "$tmp"; return_main_msg; return 99; fi
   validate_ipv4 "$ip" || { err_msg "Invalid IPv4."; rm -f "$tmp"; return 1; }
-  awk -v p="$port" -v ip="$ip" '{if ($1==p) print $1, ip, $3; else print $0}' "$tmp" > "$tmp.new"
+  awk -v p="$port" -v ip="$ip" '{proto=$4; if(proto=="") proto="http"; if ($1==p) print $1, ip, $3, proto; else print $1, $2, $3, proto}' "$tmp" > "$tmp.new"
   mv -f "$tmp.new" "$tmp"
   haproxy_write_entries_file "$tmp"
   rm -f "$tmp"
+}
+
+haproxy_show_protocol_rows() {
+  local entries="$1"
+  local n=0 proto color
+  printf "${C_DIM}%4s  %8s  %-15s %-12s %-8s${C_RESET}\n" "No" "Port" "Target-IP" "Target-Port" "Protocol"
+  printf "${C_DIM}%s${C_RESET}\n" "------------------------------------------------------------"
+  while read -r port ip tport proto; do
+    [ -n "${port:-}" ] || continue
+    n=$((n + 1))
+    proto="$(haproxy_normalize_proto "${proto:-http}")"
+    if [ "$proto" = "tcp" ]; then color="$C_YELLOW"; else color="$C_CYAN"; fi
+    printf "%4s  %8s  ${C_MAGENTA}%-15s${C_RESET} %-12s ${color}%-8s${C_RESET}\n" "$n" "$port" "$ip" "$tport" "$proto"
+  done <<< "$entries"
+}
+
+haproxy_change_protocol() {
+  local tmp entries selected total port old_proto new_proto
+  tmp="$(haproxy_entries_tmp)"
+  entries="$(cat "$tmp")"
+  if [ ! -s "$tmp" ]; then
+    warn_msg "No forwarded ports found."
+    rm -f "$tmp"
+    return 0
+  fi
+
+  echo -e "${C_BOLD}${C_WHITE}Change HAProxy protocol:${C_RESET}"
+  haproxy_show_protocol_rows "$entries"
+  echo
+  echo -e "${C_GREEN}0)${C_RESET} toggle protocol for ALL ports"
+  echo -e "${C_DIM}00) Back to main menu${C_RESET}"
+  echo
+  read -rp "Choose row number to toggle protocol [number/0/00]: " selected
+
+  if is_main_menu_token "$selected"; then rm -f "$tmp"; return_main_msg; return 99; fi
+
+  if [ "$selected" = "0" ]; then
+    awk '{proto=$4; if(proto=="") proto="http"; if(proto=="tcp") proto="http"; else proto="tcp"; print $1, $2, $3, proto}' "$tmp" > "$tmp.new"
+    mv -f "$tmp.new" "$tmp"
+    haproxy_write_entries_file "$tmp"
+    rm -f "$tmp"
+    ok_msg "Protocol toggled for all HAProxy ports."
+    return 0
+  fi
+
+  [[ "$selected" =~ ^[0-9]+$ ]] || { err_msg "Invalid selection."; rm -f "$tmp"; return 1; }
+  total="$(wc -l < "$tmp" | tr -d ' ')"
+  if [ "$selected" -lt 1 ] || [ "$selected" -gt "$total" ]; then
+    err_msg "Selected row not found."
+    rm -f "$tmp"
+    return 1
+  fi
+
+  port="$(awk -v n="$selected" 'NR==n{print $1}' "$tmp")"
+  old_proto="$(awk -v n="$selected" 'NR==n{print $4}' "$tmp")"
+  old_proto="$(haproxy_normalize_proto "${old_proto:-http}")"
+  new_proto="$(haproxy_toggle_proto "$old_proto")"
+
+  awk -v n="$selected" -v newp="$new_proto" '{proto=$4; if(proto=="") proto="http"; if(NR==n) proto=newp; print $1, $2, $3, proto}' "$tmp" > "$tmp.new"
+  mv -f "$tmp.new" "$tmp"
+  haproxy_write_entries_file "$tmp"
+  rm -f "$tmp"
+  ok_msg "Port $port protocol changed: $old_proto -> $new_proto"
+}
+
+haproxy_run_action() {
+  local rc
+  set +e
+  "$@"
+  rc=$?
+  set -e
+  if [ "$rc" -eq 99 ]; then
+    return 99
+  fi
+  pause
+  return 0
 }
 
 haproxy_menu() {
@@ -3222,15 +3344,17 @@ haproxy_menu() {
     echo -e "  ${C_YELLOW}3)${C_RESET} change ALL target IPs"
     echo -e "  ${C_RED}4)${C_RESET} delete port"
     echo -e "  ${C_CYAN}5)${C_RESET} change target IP for one port"
+    echo -e "  ${C_MAGENTA}6)${C_RESET} change protocol http/tcp"
     echo -e "  ${C_DIM}00) Back to main menu${C_RESET}"
     echo
-    read -rp "Choose HAProxy option [1-5/00]: " HAP_CHOICE
+    read -rp "Choose HAProxy option [1-6/00]: " HAP_CHOICE
     case "$HAP_CHOICE" in
-      1) haproxy_list_forwards; pause ;;
-      2) haproxy_add_port; pause ;;
-      3) haproxy_change_all_ips; pause ;;
-      4) haproxy_delete_port; pause ;;
-      5) haproxy_change_one_ip; pause ;;
+      1) haproxy_run_action haproxy_list_forwards || return 0 ;;
+      2) haproxy_run_action haproxy_add_port || return 0 ;;
+      3) haproxy_run_action haproxy_change_all_ips || return 0 ;;
+      4) haproxy_run_action haproxy_delete_port || return 0 ;;
+      5) haproxy_run_action haproxy_change_one_ip || return 0 ;;
+      6) haproxy_run_action haproxy_change_protocol || return 0 ;;
       00) return_main_msg; return 0 ;;
       *) err_msg "Invalid option"; sleep 1 ;;
     esac
