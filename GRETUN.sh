@@ -3106,7 +3106,10 @@ haproxy_open_firewall_tcp() {
 
 haproxy_validate_and_restart() {
   local tmp="$1"
-  if ! haproxy -c -f "$tmp"; then
+  # Validate quietly first so HAProxy NOTICE/WARNING lines do not confuse the menu output.
+  # If validation fails, run it again without -q to print the real error.
+  if ! haproxy -c -q -f "$tmp" >/dev/null 2>&1; then
+    haproxy -c -f "$tmp" || true
     err_msg "HAProxy config validation failed. Nothing changed."
     rm -f "$tmp"
     return 1
@@ -3144,6 +3147,8 @@ haproxy_write_entries_file() {
 frontend ws_${port}_in
     bind *:${port}
     mode tcp
+    no option httplog
+    option tcplog
     default_backend ws_${port}_out
 
 backend ws_${port}_out
