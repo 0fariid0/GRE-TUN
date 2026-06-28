@@ -1,12 +1,12 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + WireGuard + Vira7 + HAProxy multi-tunnel manager v7.6-original-based
+# GRE + WireGuard + Vira7 + HAProxy multi-tunnel manager v7.9-original-based
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
 # - Local tunnel/bind IPv4 can be selected manually for servers with multiple IPs
-# - v7.6-original-based adds 00 back-to-main, Vira7 transport for WireGuard, and HAProxy port manager
+# - v7.9-original-based adds high HAProxy maxconn/NOFILE tuning
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -32,6 +32,8 @@ VIRA7_DEFAULT_QUEUE_LEN=1000
 
 HAPROXY_CONFIG="/etc/haproxy/haproxy.cfg"
 HAPROXY_BACKUP_DIR="/etc/haproxy/gretun-backups"
+HAPROXY_MAXCONN=500000
+HAPROXY_NOFILE_LIMIT=1048576
 
 # Color/theme helpers
 if [ -t 1 ]; then
@@ -2973,11 +2975,11 @@ reset_all_tunnels() {
 # HAProxy port forward manager
 # -----------------------------
 haproxy_base_header() {
-  cat <<'EOF_HEADER'
+  cat <<EOF_HEADER
 global
     log /dev/log local0
     log /dev/log local1 notice
-    maxconn 50000
+    maxconn ${HAPROXY_MAXCONN}
     daemon
 
 defaults
@@ -3024,13 +3026,60 @@ haproxy_install_package() {
   ok_msg "HAProxy installed."
 }
 
+haproxy_apply_high_limits() {
+  # HAProxy cannot truly have an unlimited connection count; it is bound by RAM, CPU,
+  # kernel limits, and available file descriptors. Use a high practical limit instead.
+  mkdir -p /etc/systemd/system/haproxy.service.d /etc/security/limits.d /etc/sysctl.d 2>/dev/null || true
+
+  cat > /etc/systemd/system/haproxy.service.d/99-gretun-limits.conf <<EOF_LIMIT
+[Service]
+LimitNOFILE=${HAPROXY_NOFILE_LIMIT}
+TasksMax=infinity
+EOF_LIMIT
+
+  cat > /etc/security/limits.d/99-gretun-haproxy.conf <<EOF_SECURITY
+* soft nofile ${HAPROXY_NOFILE_LIMIT}
+* hard nofile ${HAPROXY_NOFILE_LIMIT}
+root soft nofile ${HAPROXY_NOFILE_LIMIT}
+root hard nofile ${HAPROXY_NOFILE_LIMIT}
+EOF_SECURITY
+
+  cat > /etc/sysctl.d/99-gretun-haproxy.conf <<EOF_SYSCTL
+fs.file-max = 2097152
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+net.ipv4.ip_local_port_range = 1024 65535
+EOF_SYSCTL
+  sysctl -p /etc/sysctl.d/99-gretun-haproxy.conf >/dev/null 2>&1 || true
+  systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
+haproxy_ensure_maxconn_in_config() {
+  [ -f "$HAPROXY_CONFIG" ] || return 0
+
+  if grep -Eq '^[[:space:]]*maxconn[[:space:]]+' "$HAPROXY_CONFIG"; then
+    sed -i -E "s/^[[:space:]]*maxconn[[:space:]]+[0-9]+/    maxconn ${HAPROXY_MAXCONN}/" "$HAPROXY_CONFIG" || true
+  else
+    awk -v mc="$HAPROXY_MAXCONN" '
+      BEGIN { in_global=0; inserted=0 }
+      /^[[:space:]]*global[[:space:]]*$/ { print; in_global=1; next }
+      in_global && !inserted && /^[[:space:]]*defaults[[:space:]]*$/ { print "    maxconn " mc; inserted=1; in_global=0; print; next }
+      { print }
+      END { if (in_global && !inserted) print "    maxconn " mc }
+    ' "$HAPROXY_CONFIG" > "$HAPROXY_CONFIG.tmp.$$" && mv -f "$HAPROXY_CONFIG.tmp.$$" "$HAPROXY_CONFIG"
+  fi
+}
+
 haproxy_ensure_ready() {
   haproxy_install_package || return 1
+  haproxy_apply_high_limits
   mkdir -p /etc/haproxy "$HAPROXY_BACKUP_DIR"
   if [ ! -f "$HAPROXY_CONFIG" ]; then
     haproxy_base_header > "$HAPROXY_CONFIG"
-    systemctl restart haproxy >/dev/null 2>&1 || true
+  else
+    haproxy_ensure_maxconn_in_config
   fi
+  systemctl restart haproxy >/dev/null 2>&1 || true
 }
 
 haproxy_normalize_proto() {
@@ -3119,6 +3168,8 @@ haproxy_validate_and_restart() {
     cp -f "$HAPROXY_CONFIG" "$HAPROXY_BACKUP_DIR/haproxy.cfg.$(date +%Y%m%d-%H%M%S).bak" 2>/dev/null || true
   fi
   mv -f "$tmp" "$HAPROXY_CONFIG"
+  haproxy_apply_high_limits
+  haproxy_ensure_maxconn_in_config
   systemctl enable haproxy >/dev/null 2>&1 || true
   if systemctl restart haproxy; then
     ok_msg "HAProxy restarted successfully."
