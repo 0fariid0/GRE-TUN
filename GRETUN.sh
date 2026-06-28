@@ -1,12 +1,12 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + WireGuard + Vira7 + HAProxy multi-tunnel manager v7.9-original-based
+# GRE + WireGuard + Vira7 + HAProxy multi-tunnel manager v8.1-original-based
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
 # - Local tunnel/bind IPv4 can be selected manually for servers with multiple IPs
-# - v7.9-original-based adds high HAProxy maxconn/NOFILE tuning
+# - v8.1-original-based adds high HAProxy maxconn/NOFILE tuning
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -2975,22 +2975,29 @@ reset_all_tunnels() {
 # HAProxy port forward manager
 # -----------------------------
 haproxy_base_header() {
+  # Silent WebSocket-safe profile:
+  # - no access logging by default, so HAProxy does not spam journald/syslog for every WS request
+  # - keep HTTP mode for WebSocket forwarding
+  # - longer tunnel timeout + TCP keepalive to avoid random long-lived WS drops
   cat <<EOF_HEADER
 global
-    log /dev/log local0
-    log /dev/log local1 notice
     maxconn ${HAPROXY_MAXCONN}
     daemon
+    stats socket /run/haproxy/admin.sock mode 660 level admin
 
 defaults
-    log global
     mode http
-    option httplog
     option dontlognull
+    option clitcpka
+    option srvtcpka
     timeout connect 10s
-    timeout client 1h
-    timeout server 1h
-    timeout tunnel 1h
+    timeout http-request 15s
+    timeout queue 30s
+    timeout client 2h
+    timeout server 2h
+    timeout client-fin 30s
+    timeout server-fin 30s
+    timeout tunnel 12h
 EOF_HEADER
 }
 
@@ -3049,6 +3056,11 @@ fs.file-max = 2097152
 net.core.somaxconn = 65535
 net.ipv4.tcp_max_syn_backlog = 65535
 net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_keepalive_intvl = 30
+net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.tcp_tw_reuse = 1
+net.netfilter.nf_conntrack_max = 1048576
 EOF_SYSCTL
   sysctl -p /etc/sysctl.d/99-gretun-haproxy.conf >/dev/null 2>&1 || true
   systemctl daemon-reload >/dev/null 2>&1 || true
@@ -3389,11 +3401,11 @@ haproxy_optimize_websocket_nolog() {
     return 0
   fi
   count="$(wc -l < "$tmp" | tr -d ' ')"
-  info_msg "Rewriting $count HAProxy forward(s) with WebSocket-safe no-log mode..."
-  echo "This keeps the current protocol of each port unchanged; it only disables access logs for generated frontends/backends."
+  info_msg "Rewriting $count HAProxy forward(s) with silent WebSocket-safe mode..."
+  echo "This keeps the current protocol/IP/port unchanged; it disables HAProxy access logs and applies longer tunnel timeout + TCP keepalive."
   haproxy_write_entries_file "$tmp"
   rm -f "$tmp"
-  ok_msg "HAProxy logs disabled for generated forwarded ports. WebSocket/http mode is preserved."
+  ok_msg "HAProxy silent WebSocket optimization applied. HTTP/WebSocket mode is preserved."
 }
 
 haproxy_run_action() {
@@ -3420,7 +3432,7 @@ haproxy_menu() {
     echo -e "  ${C_RED}4)${C_RESET} delete port"
     echo -e "  ${C_CYAN}5)${C_RESET} change target IP for one port"
     echo -e "  ${C_MAGENTA}6)${C_RESET} change protocol http/tcp"
-    echo -e "  ${C_CYAN}7)${C_RESET} optimize WebSocket / disable HAProxy logs"
+    echo -e "  ${C_CYAN}7)${C_RESET} optimize WebSocket / silent HAProxy no access-log"
     echo -e "  ${C_DIM}00) Back to main menu${C_RESET}"
     echo
     read -rp "Choose HAProxy option [1-7/00]: " HAP_CHOICE
