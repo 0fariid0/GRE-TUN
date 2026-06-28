@@ -3198,12 +3198,12 @@ haproxy_write_entries_file() {
 frontend ws_${port}_in
     bind *:${port}
     mode tcp
-    no option httplog
-    option tcplog
+    no log
     default_backend ws_${port}_out
 
 backend ws_${port}_out
     mode tcp
+    no log
     server foreign_${port} ${ip}:${tport}
 EOF_BLOCK
       else
@@ -3212,11 +3212,13 @@ EOF_BLOCK
 frontend ws_${port}_in
     bind *:${port}
     mode http
+    no log
     option forwardfor
     default_backend ws_${port}_out
 
 backend ws_${port}_out
     mode http
+    no log
     option http-keep-alive
     server foreign_${port} ${ip}:${tport}
 EOF_BLOCK
@@ -3377,6 +3379,23 @@ haproxy_change_protocol() {
   ok_msg "Port $port protocol changed: $old_proto -> $new_proto"
 }
 
+
+haproxy_optimize_websocket_nolog() {
+  local tmp count
+  tmp="$(haproxy_entries_tmp)"
+  if [ ! -s "$tmp" ]; then
+    warn_msg "No forwarded ports found to optimize."
+    rm -f "$tmp"
+    return 0
+  fi
+  count="$(wc -l < "$tmp" | tr -d ' ')"
+  info_msg "Rewriting $count HAProxy forward(s) with WebSocket-safe no-log mode..."
+  echo "This keeps the current protocol of each port unchanged; it only disables access logs for generated frontends/backends."
+  haproxy_write_entries_file "$tmp"
+  rm -f "$tmp"
+  ok_msg "HAProxy logs disabled for generated forwarded ports. WebSocket/http mode is preserved."
+}
+
 haproxy_run_action() {
   local rc
   set +e
@@ -3401,9 +3420,10 @@ haproxy_menu() {
     echo -e "  ${C_RED}4)${C_RESET} delete port"
     echo -e "  ${C_CYAN}5)${C_RESET} change target IP for one port"
     echo -e "  ${C_MAGENTA}6)${C_RESET} change protocol http/tcp"
+    echo -e "  ${C_CYAN}7)${C_RESET} optimize WebSocket / disable HAProxy logs"
     echo -e "  ${C_DIM}00) Back to main menu${C_RESET}"
     echo
-    read -rp "Choose HAProxy option [1-6/00]: " HAP_CHOICE
+    read -rp "Choose HAProxy option [1-7/00]: " HAP_CHOICE
     case "$HAP_CHOICE" in
       1) haproxy_run_action haproxy_list_forwards || return 0 ;;
       2) haproxy_run_action haproxy_add_port || return 0 ;;
@@ -3411,6 +3431,7 @@ haproxy_menu() {
       4) haproxy_run_action haproxy_delete_port || return 0 ;;
       5) haproxy_run_action haproxy_change_one_ip || return 0 ;;
       6) haproxy_run_action haproxy_change_protocol || return 0 ;;
+      7) haproxy_run_action haproxy_optimize_websocket_nolog || return 0 ;;
       00) return_main_msg; return 0 ;;
       *) err_msg "Invalid option"; sleep 1 ;;
     esac
