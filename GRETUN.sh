@@ -29,6 +29,13 @@ VIRA7_DEFAULT_PORT_BASE=5571
 VIRA7_DEFAULT_KEEPALIVE=5
 VIRA7_DEFAULT_BUFFER_SIZE=2097152
 VIRA7_DEFAULT_QUEUE_LEN=1000
+# Vira7 CPU optimization defaults:
+# checksum=1 keeps packet format compatible with older engines.
+# verify_checksum=0 trusts UDP checksum and skips expensive userspace checksum validation on receive.
+# batch=128 drains packet bursts per select() wakeup and reduces syscall/loop overhead.
+VIRA7_DEFAULT_CHECKSUM=1
+VIRA7_DEFAULT_VERIFY_CHECKSUM=0
+VIRA7_DEFAULT_BATCH=128
 
 HAPROXY_CONFIG="/etc/haproxy/haproxy.cfg"
 HAPROXY_BACKUP_DIR="/etc/haproxy/gretun-backups"
@@ -2066,10 +2073,15 @@ typedef struct {
     int keepalive;
     int buffer_size;
     int queue_len;
+    int checksum;
+    int verify_checksum;
+    int batch;
 } v7_config_t;
 
 static volatile sig_atomic_t running = 1;
 static uint32_t seqno = 1;
+static int g_send_checksum = 1;
+static int g_verify_checksum = 0;
 
 static void on_signal(int sig) { (void)sig; running = 0; }
 
@@ -2099,6 +2111,9 @@ static int load_config(const char *path, v7_config_t *c) {
     c->keepalive = 5;
     c->buffer_size = 2097152;
     c->queue_len = 1000;
+    c->checksum = 1;
+    c->verify_checksum = 0;
+    c->batch = 128;
 
     FILE *f = fopen(path, "r");
     if (!f) return -1;
@@ -2124,6 +2139,9 @@ static int load_config(const char *path, v7_config_t *c) {
         else if (!strcmp(key, "keepalive")) c->keepalive = atoi(val);
         else if (!strcmp(key, "buffer_size")) c->buffer_size = atoi(val);
         else if (!strcmp(key, "queue_len")) c->queue_len = atoi(val);
+        else if (!strcmp(key, "checksum")) c->checksum = atoi(val);
+        else if (!strcmp(key, "verify_checksum")) c->verify_checksum = atoi(val);
+        else if (!strcmp(key, "batch")) c->batch = atoi(val);
     }
     fclose(f);
     if (!c->local_priv[0] || !c->remote_priv[0] || c->port <= 0 || c->port > 65535) return -1;
@@ -2132,6 +2150,10 @@ static int load_config(const char *path, v7_config_t *c) {
     if (c->keepalive < 1 || c->keepalive > 60) c->keepalive = 5;
     if (c->queue_len < 100) c->queue_len = 1000;
     if (c->buffer_size < 65536) c->buffer_size = 2097152;
+    c->checksum = c->checksum ? 1 : 0;
+    c->verify_checksum = c->verify_checksum ? 1 : 0;
+    if (c->batch < 1) c->batch = 1;
+    if (c->batch > 512) c->batch = 512;
     return 0;
 }
 
@@ -2194,7 +2216,11 @@ static int send_v7(int fd, const struct sockaddr_in *dst, uint16_t type, const u
     h->length = htons(len);
     h->checksum = 0;
     if (payload && len) memcpy(buf + sizeof(v7_hdr_t), payload, len);
-    h->checksum = htons(csum16(buf, sizeof(v7_hdr_t) + len));
+    if (g_send_checksum) {
+        h->checksum = htons(csum16(buf, sizeof(v7_hdr_t) + len));
+    } else {
+        h->checksum = 0;
+    }
     ssize_t n = sendto(fd, buf, sizeof(v7_hdr_t) + len, 0, (const struct sockaddr *)dst, sizeof(*dst));
     return n == (ssize_t)(sizeof(v7_hdr_t) + len) ? 0 : -1;
 }
@@ -2206,9 +2232,11 @@ static int verify_packet(uint8_t *buf, ssize_t n, uint16_t *type, uint8_t **payl
     *len = ntohs(h->length);
     if ((ssize_t)(sizeof(v7_hdr_t) + *len) != n || *len > MAX_PKT_SIZE) return -1;
     uint16_t got = ntohs(h->checksum);
-    h->checksum = 0;
-    uint16_t calc = csum16(buf, (size_t)n);
-    if (got != calc) return -1;
+    if (got != 0 && g_verify_checksum) {
+        h->checksum = 0;
+        uint16_t calc = csum16(buf, (size_t)n);
+        if (got != calc) return -1;
+    }
     *type = ntohs(h->type);
     *payload = buf + sizeof(v7_hdr_t);
     return 0;
@@ -2218,6 +2246,8 @@ int main(int argc, char **argv) {
     if (argc < 2 || getuid() != 0) return 1;
     v7_config_t cfg;
     if (load_config(argv[1], &cfg) != 0) return 1;
+    g_send_checksum = cfg.checksum ? 1 : 0;
+    g_verify_checksum = cfg.verify_checksum ? 1 : 0;
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
     signal(SIGPIPE, SIG_IGN);
@@ -2267,14 +2297,26 @@ int main(int argc, char **argv) {
             last_keepalive = now;
         }
         if (FD_ISSET(tun_fd, &rfds)) {
-            ssize_t n = read(tun_fd, tun_buf, sizeof(tun_buf));
-            if (n > 0 && remote_known) send_v7(udp_fd, &remote, PKT_DATA, tun_buf, (uint16_t)n);
+            for (int i = 0; i < cfg.batch; i++) {
+                ssize_t n = read(tun_fd, tun_buf, sizeof(tun_buf));
+                if (n > 0) {
+                    if (remote_known) send_v7(udp_fd, &remote, PKT_DATA, tun_buf, (uint16_t)n);
+                    continue;
+                }
+                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+                break;
+            }
         }
         if (FD_ISSET(udp_fd, &rfds)) {
-            struct sockaddr_in sender;
-            socklen_t slen = sizeof(sender);
-            ssize_t n = recvfrom(udp_fd, udp_buf, sizeof(udp_buf), 0, (struct sockaddr *)&sender, &slen);
-            if (n > 0) {
+            for (int i = 0; i < cfg.batch; i++) {
+                struct sockaddr_in sender;
+                socklen_t slen = sizeof(sender);
+                ssize_t n = recvfrom(udp_fd, udp_buf, sizeof(udp_buf), 0, (struct sockaddr *)&sender, &slen);
+                if (n < 0) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                    break;
+                }
+                if (n == 0) break;
                 uint16_t type, len;
                 uint8_t *payload;
                 if (verify_packet(udp_buf, n, &type, &payload, &len) != 0) continue;
@@ -2294,7 +2336,8 @@ int main(int argc, char **argv) {
     return 0;
 }
 ENGINEEOF
-  gcc -O2 -Wall -Wextra -o "$VIRA7_BINARY" "$VIRA7_SOURCE"
+  gcc -O3 -flto -Wall -Wextra -o "$VIRA7_BINARY" "$VIRA7_SOURCE" 2>/dev/null || \
+    gcc -O3 -Wall -Wextra -o "$VIRA7_BINARY" "$VIRA7_SOURCE"
   chmod 755 "$VIRA7_BINARY"
 }
 
@@ -2336,6 +2379,9 @@ vira7_save_config() {
     write_var REMOTE_VIRA7_IP "$REMOTE_VIRA7_IP"
     write_var VIRA7_PORT "$VIRA7_PORT"
     write_var VIRA7_MTU "$VIRA7_MTU"
+    write_var VIRA7_CHECKSUM "${VIRA7_CHECKSUM:-$VIRA7_DEFAULT_CHECKSUM}"
+    write_var VIRA7_VERIFY_CHECKSUM "${VIRA7_VERIFY_CHECKSUM:-$VIRA7_DEFAULT_VERIFY_CHECKSUM}"
+    write_var VIRA7_BATCH "${VIRA7_BATCH:-$VIRA7_DEFAULT_BATCH}"
     echo
     # Engine config used directly by vira7-engine systemd service.
     printf 'iface=%s
@@ -2360,6 +2406,12 @@ vira7_save_config() {
 ' "$VIRA7_DEFAULT_BUFFER_SIZE"
     printf 'queue_len=%s
 ' "$VIRA7_DEFAULT_QUEUE_LEN"
+    printf 'checksum=%s
+' "${VIRA7_CHECKSUM:-$VIRA7_DEFAULT_CHECKSUM}"
+    printf 'verify_checksum=%s
+' "${VIRA7_VERIFY_CHECKSUM:-$VIRA7_DEFAULT_VERIFY_CHECKSUM}"
+    printf 'batch=%s
+' "${VIRA7_BATCH:-$VIRA7_DEFAULT_BATCH}"
   } > "$file"
   chmod 600 "$file"
   echo "Saved Vira7 tunnel $TUNNEL_ID configuration to $file"
@@ -2381,6 +2433,9 @@ vira7_load_config() {
   REMOTE_VIRA7_IP="${REMOTE_VIRA7_IP:-${remote_priv:-}}"
   VIRA7_PORT="${VIRA7_PORT:-${port:-$(vira7_default_port "$id")}}"
   VIRA7_MTU="${VIRA7_MTU:-${mtu:-$VIRA7_DEFAULT_MTU}}"
+  VIRA7_CHECKSUM="${VIRA7_CHECKSUM:-${checksum:-$VIRA7_DEFAULT_CHECKSUM}}"
+  VIRA7_VERIFY_CHECKSUM="${VIRA7_VERIFY_CHECKSUM:-${verify_checksum:-$VIRA7_DEFAULT_VERIFY_CHECKSUM}}"
+  VIRA7_BATCH="${VIRA7_BATCH:-${batch:-$VIRA7_DEFAULT_BATCH}}"
   if [ -z "${ROLE:-}" ]; then
     if [ "${LOCAL_VIRA7_IP:-}" = "10.71.$id.1" ]; then ROLE="1"; else ROLE="2"; fi
   fi
@@ -2403,6 +2458,9 @@ mtu=$VIRA7_MTU
 keepalive=$VIRA7_DEFAULT_KEEPALIVE
 buffer_size=$VIRA7_DEFAULT_BUFFER_SIZE
 queue_len=$VIRA7_DEFAULT_QUEUE_LEN
+checksum=${VIRA7_CHECKSUM:-$VIRA7_DEFAULT_CHECKSUM}
+verify_checksum=${VIRA7_VERIFY_CHECKSUM:-$VIRA7_DEFAULT_VERIFY_CHECKSUM}
+batch=${VIRA7_BATCH:-$VIRA7_DEFAULT_BATCH}
 EOF_CONF
   chmod 600 "$file"
 }
@@ -2458,6 +2516,9 @@ vira7_create_tunnel() {
   fi
   VIRA7_PORT="${VIRA7_PORT:-$(vira7_default_port "$TUNNEL_ID")}" 
   VIRA7_MTU="${VIRA7_MTU:-$VIRA7_DEFAULT_MTU}"
+  VIRA7_CHECKSUM="${VIRA7_CHECKSUM:-$VIRA7_DEFAULT_CHECKSUM}"
+  VIRA7_VERIFY_CHECKSUM="${VIRA7_VERIFY_CHECKSUM:-$VIRA7_DEFAULT_VERIFY_CHECKSUM}"
+  VIRA7_BATCH="${VIRA7_BATCH:-$VIRA7_DEFAULT_BATCH}"
 
   echo "[*] Local server public IP: $LOCAL_PUBLIC_IP"
   echo "[*] Tunnel type: Vira7 UDP-TUN"
@@ -2468,6 +2529,7 @@ vira7_create_tunnel() {
   echo "[*] Local Vira7 IP: $LOCAL_VIRA7_IP"
   echo "[*] Remote Vira7 IP: $REMOTE_VIRA7_IP"
   echo "[*] UDP Port: $VIRA7_PORT"
+  echo "[*] CPU mode: checksum=$VIRA7_CHECKSUM verify_checksum=$VIRA7_VERIFY_CHECKSUM batch=$VIRA7_BATCH"
 
   enable_ip_forward
   modprobe tun || true
@@ -2516,6 +2578,10 @@ vira7_menu_config_tunnel() {
     echo "Invalid MTU."
     return
   fi
+  # Safe CPU optimization: keep checksum generation for compatibility, skip expensive receive-side verification, use packet batching.
+  VIRA7_CHECKSUM="${VIRA7_CHECKSUM:-$VIRA7_DEFAULT_CHECKSUM}"
+  VIRA7_VERIFY_CHECKSUM="${VIRA7_VERIFY_CHECKSUM:-$VIRA7_DEFAULT_VERIFY_CHECKSUM}"
+  VIRA7_BATCH="${VIRA7_BATCH:-$VIRA7_DEFAULT_BATCH}"
   vira7_create_tunnel 1 || echo "Vira7 tunnel creation failed"
 }
 
@@ -2602,6 +2668,82 @@ vira7_restart_one_tunnel() {
   enable_ip_forward
   vira7_apply_firewall_rules "$id" || true
   vira7_install_service "$id"
+}
+
+
+set_config_kv() {
+  local file="$1" key="$2" value="$3"
+  [ -f "$file" ] || return 1
+  if grep -q "^${key}=" "$file" 2>/dev/null; then
+    sed -i "s|^${key}=.*|${key}=${value}|" "$file"
+  else
+    printf '%s=%s\n' "$key" "$value" >> "$file"
+  fi
+}
+
+vira7_optimize_cpu_one() {
+  local id="$1" mode="${2:-safe}" file svc
+  validate_tunnel_id "$id" || { echo "Invalid Vira7 tunnel number." >&2; return 1; }
+  file="$(vira7_config_file "$id")"
+  svc="$(vira7_service_name "$id")"
+  [ -f "$file" ] || { echo "No Vira7 config found: $file" >&2; return 1; }
+
+  # Always safe: skip userspace receive checksum verification and batch packets.
+  # Fast mode additionally disables checksum generation; use it only when BOTH sides run this optimized engine.
+  set_config_kv "$file" verify_checksum 0
+  set_config_kv "$file" batch 128
+  if [ "$mode" = "fast" ]; then
+    set_config_kv "$file" checksum 0
+  else
+    set_config_kv "$file" checksum 1
+  fi
+
+  echo "Recompiling optimized Vira7 engine..."
+  vira7_compile_engine || return 1
+  enable_ip_forward
+  vira7_apply_firewall_rules "$id" || true
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl enable "$svc" >/dev/null 2>&1 || true
+  if systemctl restart "$svc"; then
+    echo "[OK] Vira7 tunnel $id optimized and restarted. mode=$mode"
+    echo "Current CPU settings:"
+    grep -E '^(checksum|verify_checksum|batch|mtu|port)=' "$file" || true
+    return 0
+  fi
+  echo "[WARN] Restart failed. Last logs:" >&2
+  systemctl status "$svc" --no-pager -l 2>/dev/null || true
+  journalctl -u "$svc" -n 40 --no-pager 2>/dev/null || true
+  return 1
+}
+
+vira7_optimize_cpu_menu() {
+  show_header "Optimize Vira7 CPU"
+  vira7_list_tunnels
+  echo
+  local id mode_choice mode
+  read -rp "Enter Vira7 tunnel number to optimize, 0=all, 00=menu: " id
+  if is_main_menu_token "$id"; then return_main_msg; return 99; fi
+  echo
+  echo "1) Safe low CPU mode (compatible, recommended first)"
+  echo "2) Fast low CPU mode (must be applied on BOTH servers for this Vira7 tunnel)"
+  echo "00) Back to main menu"
+  read -rp "Choose CPU mode [1-2/00]: " mode_choice
+  if is_main_menu_token "$mode_choice"; then return_main_msg; return 99; fi
+  case "$mode_choice" in
+    1) mode="safe" ;;
+    2) mode="fast" ;;
+    *) echo "Invalid mode."; return 1 ;;
+  esac
+  if [ "$id" = "0" ]; then
+    local ids one
+    ids="$(vira7_collect_ids || true)"
+    [ -n "$ids" ] || { echo "No Vira7 tunnels found."; return 0; }
+    while IFS= read -r one; do
+      [ -n "$one" ] && vira7_optimize_cpu_one "$one" "$mode" || true
+    done <<< "$ids"
+  else
+    vira7_optimize_cpu_one "$id" "$mode"
+  fi
 }
 
 # -----------------------------
@@ -3509,16 +3651,18 @@ show_menu() {
   echo -e "  ${C_YELLOW}3)${C_RESET} reset all tunnels"
   echo -e "  ${C_CYAN}4)${C_RESET} ping test tunnels"
   echo -e "  ${C_MAGENTA}5)${C_RESET} haproxy port manager"
+  echo -e "  ${C_BLUE}6)${C_RESET} optimize Vira7 CPU"
   echo -e "  ${C_DIM}00) Main menu / back${C_RESET}"
   echo -e "  ${C_DIM}0) Exit${C_RESET}"
   echo
-  read -rp "Choose an option [0-5]: " CHOICE
+  read -rp "Choose an option [0-6]: " CHOICE
   case "$CHOICE" in
     1) if menu_config_tunnel; then pause; fi ;;
     2) if remove_tun; then pause; fi ;;
     3) if reset_all_tunnels; then pause; fi ;;
     4) if test_tunnels_menu; then pause; fi ;;
     5) haproxy_menu || true ;;
+    6) if vira7_optimize_cpu_menu; then pause; fi ;;
     00) return_main_msg ;;
     0) echo "Bye"; exit 0 ;;
     *) err_msg "Invalid option"; sleep 1 ;;
