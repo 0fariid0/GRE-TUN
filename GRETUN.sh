@@ -1,12 +1,12 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + WireGuard + Vira7 + HAProxy multi-tunnel manager v8.1-original-based
+# GRE + WireGuard + Vira7 + HAProxy multi-tunnel manager v8.2-safe-wireguard
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
 # - Local tunnel/bind IPv4 can be selected manually for servers with multiple IPs
-# - v8.1-original-based adds high HAProxy maxconn/NOFILE tuning
+# - v8.2-safe-wireguard adds high HAProxy maxconn/NOFILE tuning
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -299,10 +299,14 @@ auto_select_udp_port() {
   local current_id="${4:-}"
   local candidate
 
-  # If this tunnel already had a saved port, keep it to avoid breaking the peer.
+  # If this tunnel already had a saved port, keep it only when it is really free.
+  # This prevents WireGuard "Address already in use" when a stale process/interface still owns the old port.
   if [ -n "$existing_port" ]; then
-    echo "$existing_port"
-    return 0
+    if ! udp_port_in_saved_configs "$existing_port" "$current_type" "$current_id" && ! udp_port_is_listening "$existing_port"; then
+      echo "$existing_port"
+      return 0
+    fi
+    warn_msg "Saved UDP port $existing_port is busy; selecting the next free UDP port..." >&2
   fi
 
   candidate="$base_port"
@@ -1420,6 +1424,10 @@ wg_menu_config_tunnel() {
   echo "Use this IP as the REMOTE server Public IPv4 on the other server: $LOCAL_PUBLIC_IP"
   echo
 
+  # Safely stop/delete only this old wgtunN before choosing a port.
+  # This prevents stale WireGuard sockets from causing "Address already in use".
+  wg_safe_cleanup_runtime "$TUNNEL_ID" >/dev/null 2>&1 || true
+
   # Fewer questions: port and AllowedIPs are generated automatically.
   # Default is UDP 51800+N; if that port is already used by another tunnel/process,
   # the next free UDP port is selected automatically.
@@ -1616,6 +1624,46 @@ wg_status_check() {
   done <<< "$ids"
 }
 
+
+wg_safe_cleanup_runtime() {
+  local id="$1"
+  local ifc svc
+  validate_tunnel_id "$id" || return 1
+  ifc="$(wg_iface_name "$id")"
+  svc="$(wg_service_name "$id")"
+
+  # Safe cleanup only for this WireGuard tunnel. Never flush main routing table.
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl stop "$svc" >/dev/null 2>&1 || true
+  fi
+  if command -v wg-quick >/dev/null 2>&1; then
+    wg-quick down "$ifc" >/dev/null 2>&1 || true
+  fi
+  ip link delete "$ifc" 2>/dev/null || true
+
+  # Remove only stale routes that belong to this interface/this tunnel subnet.
+  # This is intentionally narrow and cannot remove the server default route.
+  ip route show 2>/dev/null | awk -v ifc="$ifc" -v pfx="10.20.$id." '$0 ~ "dev "ifc && $1 ~ "^"pfx {print $1}' | while read -r dst; do
+    [ -n "$dst" ] && ip route del "$dst" dev "$ifc" 2>/dev/null || true
+  done
+  ip route del "10.20.$id.0/30" dev "$ifc" 2>/dev/null || true
+  ip route del "10.20.$id.1/32" dev "$ifc" 2>/dev/null || true
+  ip route del "10.20.$id.2/32" dev "$ifc" 2>/dev/null || true
+
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl reset-failed "$svc" >/dev/null 2>&1 || true
+  fi
+}
+
+wg_udp_port_busy_after_cleanup() {
+  local id="$1"
+  local port="$2"
+  validate_tunnel_id "$id" || return 1
+  [ -n "$port" ] || return 1
+  wg_safe_cleanup_runtime "$id" >/dev/null 2>&1 || true
+  udp_port_is_listening "$port"
+}
+
 wg_install_service() {
   local id="${1:-${TUNNEL_ID:-}}"
   local ifc svc
@@ -1647,10 +1695,15 @@ EOF_WG_FW
 
   systemctl daemon-reload
 
-  # Avoid the previous bug: if wg-quick already created the interface, systemd start fails.
-  # Bring only this WireGuard interface down first, then let systemd own it.
-  wg-quick down "$ifc" >/dev/null 2>&1 || true
-  ip link delete "$ifc" 2>/dev/null || true
+  # Avoid stale interface/socket/route bugs, but only touch this WireGuard tunnel.
+  wg_safe_cleanup_runtime "$id" >/dev/null 2>&1 || true
+
+  if wg_load_meta "$id" && [ -n "${LOCAL_WG_PORT:-}" ] && udp_port_is_listening "$LOCAL_WG_PORT"; then
+    err_msg "UDP port $LOCAL_WG_PORT is still busy after cleaning $ifc."
+    echo "Check what owns it with: ss -lunp | grep ':$LOCAL_WG_PORT'" >&2
+    echo "Then re-run create/update; the script can choose another free port if the saved one is cleared or changed." >&2
+    return 1
+  fi
 
   systemctl enable "$svc" || return 1
   if systemctl restart "$svc"; then
@@ -1693,8 +1746,7 @@ wg_restart_one_tunnel() {
   echo "Restarting WireGuard tunnel $id ($ifc)..."
   if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload || true
-    wg-quick down "$ifc" >/dev/null 2>&1 || true
-    ip link delete "$ifc" 2>/dev/null || true
+    wg_safe_cleanup_runtime "$id" >/dev/null 2>&1 || true
     systemctl enable "$svc" >/dev/null 2>&1 || true
     if ! systemctl restart "$svc"; then
       wg_print_service_failure "$id"
@@ -1863,12 +1915,11 @@ wg_remove_one_tunnel() {
     systemctl disable --now "$(wg_service_name "$id")" 2>/dev/null || true
   fi
 
-  if command -v wg-quick >/dev/null 2>&1; then
-    wg-quick down "$ifc" >/dev/null 2>&1 || true
-  fi
-  ip link delete "$ifc" 2>/dev/null || true
+  # Safe cleanup only for this WireGuard tunnel. Do not touch the main route table.
+  wg_safe_cleanup_runtime "$id" >/dev/null 2>&1 || true
   wg_remove_firewall_rules "$id"
 
+  rm -rf "/etc/systemd/system/wg-quick@$ifc.service.d"
   rm -f "$conf" "$meta" "$private" "$public"
   echo "- Config removed: $conf"
   echo "- Metadata removed: $meta"
@@ -3463,11 +3514,11 @@ show_menu() {
   echo
   read -rp "Choose an option [0-5]: " CHOICE
   case "$CHOICE" in
-    1) menu_config_tunnel ; pause ;;
-    2) remove_tun ; pause ;;
-    3) reset_all_tunnels ; pause ;;
-    4) test_tunnels_menu ; pause ;;
-    5) haproxy_menu ;;
+    1) if menu_config_tunnel; then pause; fi ;;
+    2) if remove_tun; then pause; fi ;;
+    3) if reset_all_tunnels; then pause; fi ;;
+    4) if test_tunnels_menu; then pause; fi ;;
+    5) haproxy_menu || true ;;
     00) return_main_msg ;;
     0) echo "Bye"; exit 0 ;;
     *) err_msg "Invalid option"; sleep 1 ;;
