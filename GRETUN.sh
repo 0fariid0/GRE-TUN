@@ -1,12 +1,12 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + WireGuard + Vira7 + HAProxy multi-tunnel manager v8.2-safe-wireguard
+# GRE + WireGuard + Vira7 + HAProxy multi-tunnel manager v8.4-multi-remove
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
 # - Local tunnel/bind IPv4 can be selected manually for servers with multiple IPs
-# - v8.2-safe-wireguard adds high HAProxy maxconn/NOFILE tuning
+# - v8.4-multi-remove adds safe multi-select tunnel removal, e.g. 1 2 5 or 1,2,5
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -2895,9 +2895,12 @@ remove_tun() {
   print_tunnel_inventory || return
 
   echo -e "${C_RED}${C_BOLD}88) remove ALL tunnels${C_RESET}"
-  echo "Select a tunnel number from the list, or 88 to remove everything."
+  echo "Select one or more tunnel row numbers from the list."
+  echo "Examples: 1 2 5  OR  1,2,5"
+  echo "Use 88 to remove everything. Use 00 to return to main menu."
   echo
-  read -rp "Choose tunnel to remove [number/88] (00=menu): " selected
+  local selected normalized token count idx i phase
+  read -rp "Choose tunnel(s) to remove [number(s)/88/00]: " selected
   if is_main_menu_token "$selected"; then return_main_msg; return 99; fi
 
   if [ "$selected" = "88" ]; then
@@ -2909,7 +2912,7 @@ remove_tun() {
     fi
 
     local ids id
-    # Remove UDP-based tunnels first, then GRE transport last.
+    # Remove UDP/overlay tunnels first, then GRE transport last.
     ids="$(wg_collect_ids || true)"
     while IFS= read -r id; do [ -n "$id" ] && wg_remove_one_tunnel "$id"; done <<< "$ids"
     ids="$(vira7_collect_ids || true)"
@@ -2920,19 +2923,65 @@ remove_tun() {
     return
   fi
 
-  if ! [[ "$selected" =~ ^[0-9]+$ ]] || [ "$selected" -lt 1 ] || [ "$selected" -gt "${#INV_TYPE[@]}" ]; then
-    err_msg "Invalid selection."
+  normalized="$(printf '%s' "$selected" | tr ',' ' ')"
+  count="${#INV_TYPE[@]}"
+
+  local -a SELECTED_INDEXES=()
+  local seen=" "
+
+  for token in $normalized; do
+    if ! [[ "$token" =~ ^[0-9]+$ ]]; then
+      err_msg "Invalid selection: $token"
+      return
+    fi
+    if [ "$token" -lt 1 ] || [ "$token" -gt "$count" ]; then
+      err_msg "Tunnel row number out of range: $token"
+      return
+    fi
+    # de-duplicate while preserving user's order.
+    if [[ "$seen" != *" $token "* ]]; then
+      SELECTED_INDEXES+=("$token")
+      seen+="$token "
+    fi
+  done
+
+  if [ "${#SELECTED_INDEXES[@]}" -eq 0 ]; then
+    err_msg "No tunnel selected."
     return
   fi
 
-  local i=$((selected - 1))
-  echo "Selected: ${INV_TYPE[$i]} tunnel ${INV_ID[$i]} (${INV_IFACE[$i]})"
-  if confirm_yes "Remove this tunnel completely?"; then
-    remove_inventory_item "$selected"
-  else
+  echo
+  echo -e "${C_BOLD}${C_WHITE}Selected tunnel(s) for removal:${C_RESET}"
+  for idx in "${SELECTED_INDEXES[@]}"; do
+    i=$((idx - 1))
+    printf "  - row %s: %s tunnel %s (%s) -> remote %s
+"       "$idx" "${INV_TYPE[$i]}" "${INV_ID[$i]}" "${INV_IFACE[$i]}" "${INV_TARGET[$i]:-N/A}"
+  done
+  echo
+
+  if ! confirm_yes "Remove selected tunnel(s) completely?"; then
     echo "Cancelled."
+    return
   fi
+
+  # Remove in dependency-safe order. WireGuard may depend on GRE/Vira transport,
+  # so overlay tunnels are removed first, GRE transport last.
+  for phase in wireguard vira7 gre; do
+    for idx in "${SELECTED_INDEXES[@]}"; do
+      i=$((idx - 1))
+      if [ "${INV_TYPE[$i]}" = "$phase" ]; then
+        echo
+        echo -e "${C_CYAN}Removing row $idx: ${INV_TYPE[$i]} ${INV_ID[$i]} (${INV_IFACE[$i]})${C_RESET}"
+        if ! remove_inventory_item "$idx"; then
+          warn_msg "Could not fully remove row $idx (${INV_TYPE[$i]} ${INV_ID[$i]}). Continue with the next selected tunnel."
+        fi
+      fi
+    done
+  done
+
+  ok_msg "Selected tunnel removal finished."
 }
+
 
 
 list_saved_tunnels() {
