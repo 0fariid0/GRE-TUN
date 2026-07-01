@@ -6,7 +6,7 @@ set -euo pipefail
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
 # - Local tunnel/bind IPv4 can be selected manually for servers with multiple IPs
-# - v8.4-multi-remove adds safe multi-select tunnel removal, e.g. 1 2 5 or 1,2,5
+# - v8.5-safe-remove-heal prevents removing active transports used by WireGuard and re-heals remaining tunnels after deletion
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -2870,6 +2870,146 @@ ping_inventory_item() {
   esac
 }
 
+
+# Return 0 if the current selected row list contains a tunnel by type/id.
+selection_has_type_id() {
+  local want_type="$1"
+  local want_id="$2"
+  shift 2
+  local idx i
+  for idx in "$@"; do
+    i=$((idx - 1))
+    [ "${INV_TYPE[$i]:-}" = "$want_type" ] && [ "${INV_ID[$i]:-}" = "$want_id" ] && return 0
+  done
+  return 1
+}
+
+# Return 0 if WireGuard tunnel <wg_id> uses the selected transport tunnel.
+wg_uses_transport_tunnel() {
+  local wg_id="$1"
+  local transport_type="$2"
+  local transport_id="$3"
+  local expected_ifc=""
+
+  wg_load_meta "$wg_id" || return 1
+
+  case "$transport_type" in
+    gre)
+      expected_ifc="$(gre_iface "$transport_id")"
+      [ "${WG_ENDPOINT_MODE:-}" = "gre" ] || return 1
+      ;;
+    vira7)
+      expected_ifc="$(vira7_iface_name "$transport_id")"
+      [ "${WG_ENDPOINT_MODE:-}" = "vira7" ] || return 1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+
+  # Normal case: transport interface is saved explicitly.
+  if [ -n "${WG_TRANSPORT_IFACE:-}" ] && [ "${WG_TRANSPORT_IFACE}" = "$expected_ifc" ]; then
+    return 0
+  fi
+
+  # Backward compatibility: older metadata may only use same-number transport.
+  [ "$wg_id" = "$transport_id" ]
+}
+
+# Prevent accidental removal of a GRE/Vira7 transport that still has a WireGuard tunnel on top.
+# This avoids the common "I removed one tunnel and the others stopped" case.
+remove_selection_dependency_guard() {
+  local -a selected=("$@")
+  local idx i type id wg_ids wg_id blocked=0
+
+  for idx in "${selected[@]}"; do
+    i=$((idx - 1))
+    type="${INV_TYPE[$i]:-}"
+    id="${INV_ID[$i]:-}"
+
+    case "$type" in
+      gre|vira7)
+        wg_ids="$(wg_collect_ids || true)"
+        while IFS= read -r wg_id; do
+          [ -n "$wg_id" ] || continue
+          if wg_uses_transport_tunnel "$wg_id" "$type" "$id"; then
+            if ! selection_has_type_id "wireguard" "$wg_id" "${selected[@]}"; then
+              warn_msg "Cannot remove $type tunnel $id alone: WireGuard tunnel $wg_id is using it as transport."
+              echo "  Select the WireGuard tunnel row too, or remove/change that WireGuard tunnel first."
+              blocked=1
+            fi
+          fi
+        done <<< "$wg_ids"
+        ;;
+    esac
+  done
+
+  [ "$blocked" -eq 0 ]
+}
+
+gre_apply_firewall_rules() {
+  local id="$1"
+  local ifc
+  validate_tunnel_id "$id" || return 1
+  gre_load_config "$id" || return 1
+  ifc="$(gre_iface "$id")"
+  enable_ip_forward
+  firewall_allow_ip_peer "GRE tunnel $id remote public" "${REMOTE_PUBLIC_IP:-}" "$ifc" >/dev/null 2>&1 || true
+  firewall_allow_ip_peer "GRE tunnel $id remote inner" "${REMOTE_GRE_IP:-}" "$ifc" >/dev/null 2>&1 || true
+}
+
+# After deleting selected tunnels, re-apply firewall rules and revive only remaining tunnels
+# that are enabled but inactive. Active tunnels are not restarted.
+heal_remaining_tunnels_after_remove() {
+  local ids id ifc svc
+  echo
+  echo -e "${C_CYAN}Re-checking remaining tunnels and re-applying firewall rules...${C_RESET}"
+
+  ids="$(gre_collect_ids || true)"
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    if gre_load_config "$id"; then
+      ifc="$(gre_iface "$id")"
+      gre_apply_firewall_rules "$id" || true
+      svc="$(gre_service_name "$id")"
+      if command -v systemctl >/dev/null 2>&1 && systemctl is-enabled --quiet "$svc" 2>/dev/null && ! ip link show "$ifc" >/dev/null 2>&1; then
+        warn_msg "Remaining GRE tunnel $id is enabled but inactive; restarting only this tunnel."
+        systemctl restart "$svc" 2>/dev/null || gre_service_start "$id" || true
+      fi
+    fi
+  done <<< "$ids"
+
+  ids="$(vira7_collect_ids || true)"
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    if vira7_load_config "$id"; then
+      ifc="$(vira7_iface_name "$id")"
+      vira7_apply_firewall_rules "$id" >/dev/null 2>&1 || true
+      svc="$(vira7_service_name "$id")"
+      if command -v systemctl >/dev/null 2>&1 && systemctl is-enabled --quiet "$svc" 2>/dev/null && ! ip link show "$ifc" >/dev/null 2>&1; then
+        warn_msg "Remaining Vira7 tunnel $id is enabled but inactive; restarting only this tunnel."
+        systemctl restart "$svc" 2>/dev/null || true
+      fi
+    fi
+  done <<< "$ids"
+
+  ids="$(wg_collect_ids || true)"
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    if wg_load_meta "$id"; then
+      ifc="$(wg_iface_name "$id")"
+      wg_apply_firewall_rules "$id" >/dev/null 2>&1 || true
+      svc="$(wg_service_name "$id")"
+      if [ -n "${REMOTE_WG_PUBLIC_KEY:-}" ] && command -v systemctl >/dev/null 2>&1 && systemctl is-enabled --quiet "$svc" 2>/dev/null && ! ip link show "$ifc" >/dev/null 2>&1; then
+        warn_msg "Remaining WireGuard tunnel $id is enabled but inactive; restarting only this tunnel."
+        systemctl restart "$svc" 2>/dev/null || true
+      fi
+    fi
+  done <<< "$ids"
+
+  ok_msg "Remaining tunnel firewall/health check finished."
+}
+
 menu_config_tunnel() {
   show_header "Create / Update Tunnel"
   ask_tunnel_type || return
@@ -2950,6 +3090,13 @@ remove_tun() {
     return
   fi
 
+  if ! remove_selection_dependency_guard "${SELECTED_INDEXES[@]}"; then
+    echo
+    err_msg "Removal stopped to avoid breaking dependent tunnels."
+    echo "Tip: if you really want to remove the transport tunnel too, select its WireGuard row together with it."
+    return 1
+  fi
+
   echo
   echo -e "${C_BOLD}${C_WHITE}Selected tunnel(s) for removal:${C_RESET}"
   for idx in "${SELECTED_INDEXES[@]}"; do
@@ -2979,6 +3126,7 @@ remove_tun() {
     done
   done
 
+  heal_remaining_tunnels_after_remove || true
   ok_msg "Selected tunnel removal finished."
 }
 
