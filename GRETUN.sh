@@ -1,12 +1,14 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + WireGuard + Vira7 + HAProxy multi-tunnel manager v8.5-gre-key-fix
+# GRE + WireGuard + Vira7 Stable + HAProxy multi-tunnel manager v9.1.0
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
 # - Local tunnel/bind IPv4 can be selected manually for servers with multiple IPs
-# - v8.5-safe-remove-heal prevents removing active transports used by WireGuard and re-heals remaining tunnels after deletion
+# - v9.1 fixes Vira update port drift, recommends Iran-client direction, lowers MTU, and adds automatic UDP recovery
+
+SCRIPT_VERSION="9.1.0-vira-stable"
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -24,11 +26,11 @@ VIRA7_BINARY="/usr/local/bin/vira7-engine"
 VIRA7_SOURCE="$VIRA7_CONFIG_DIR/vira7_engine.c"
 VIRA7_SERVICE_TEMPLATE="/etc/systemd/system/vira7-tunnel@.service"
 VIRA7_IFACE_PREFIX="vira7"
-VIRA7_DEFAULT_MTU=1400
+VIRA7_DEFAULT_MTU=1280
 VIRA7_DEFAULT_PORT_BASE=5571
-VIRA7_DEFAULT_KEEPALIVE=5
-VIRA7_DEFAULT_BUFFER_SIZE=2097152
-VIRA7_DEFAULT_QUEUE_LEN=1000
+VIRA7_DEFAULT_KEEPALIVE=3
+VIRA7_DEFAULT_BUFFER_SIZE=8388608
+VIRA7_DEFAULT_QUEUE_LEN=4000
 # Vira7 CPU optimization defaults:
 # checksum=1 keeps packet format compatible with older engines.
 # verify_checksum=0 trusts UDP checksum and skips expensive userspace checksum validation on receive.
@@ -36,6 +38,9 @@ VIRA7_DEFAULT_QUEUE_LEN=1000
 VIRA7_DEFAULT_CHECKSUM=1
 VIRA7_DEFAULT_VERIFY_CHECKSUM=0
 VIRA7_DEFAULT_BATCH=128
+VIRA7_DEFAULT_PEER_LOCK=1
+VIRA7_DEFAULT_PEER_TIMEOUT=30
+VIRA7_DEFAULT_RECONNECT_TIMEOUT=25
 
 HAPROXY_CONFIG="/etc/haproxy/haproxy.cfg"
 HAPROXY_BACKUP_DIR="/etc/haproxy/gretun-backups"
@@ -208,7 +213,7 @@ ask_tunnel_type() {
   echo "Select tunnel type:"
   echo "1) Normal GRE tunnel"
   echo "2) WireGuard tunnel"
-  echo "3) Vira7 UDP-TUN tunnel"
+  echo "3) Vira7 Stable UDP-TUN tunnel"
   echo
   read -rp "Choose [1-3] (00=menu): " TUNNEL_TYPE_CHOICE
   if is_main_menu_token "$TUNNEL_TYPE_CHOICE"; then return_main_msg; return 99; fi
@@ -1997,7 +2002,7 @@ wg_remove_menu() {
 }
 
 # -----------------------------
-# Vira7 UDP-TUN helpers (type only, no Vira7 menu/status/log UI)
+# Vira7 Stable UDP-TUN helpers
 # -----------------------------
 vira7_iface_name() {
   echo "${VIRA7_IFACE_PREFIX}$1"
@@ -2009,6 +2014,10 @@ vira7_config_file() {
 
 vira7_service_name() {
   echo "vira7-tunnel@$1.service"
+}
+
+vira7_stats_file() {
+  echo "/run/vira7-$(vira7_iface_name "$1").stats"
 }
 
 vira7_default_port() {
@@ -2036,6 +2045,27 @@ vira7_remote_inner_ip_for_role() {
   fi
 }
 
+vira7_mode_for_role() {
+  local role="$1"
+  local direction="${2:-recommended}"
+  if [ "$direction" = "legacy" ]; then
+    if [ "$role" = "1" ]; then echo "server"; else echo "client"; fi
+  else
+    # Recommended for filtered networks: Iran initiates outbound UDP to Kharej.
+    if [ "$role" = "1" ]; then echo "client"; else echo "server"; fi
+  fi
+}
+
+vira7_infer_direction() {
+  local role="${1:-}"
+  local mode="${2:-}"
+  if { [ "$role" = "1" ] && [ "$mode" = "server" ]; } || { [ "$role" = "2" ] && [ "$mode" = "client" ]; }; then
+    echo "legacy"
+  else
+    echo "recommended"
+  fi
+}
+
 vira7_ensure_deps() {
   if command -v gcc >/dev/null 2>&1 && command -v ip >/dev/null 2>&1; then
     return 0
@@ -2043,14 +2073,35 @@ vira7_ensure_deps() {
   echo "Installing Vira7 build/runtime dependencies..."
   if command -v apt-get >/dev/null 2>&1; then
     apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential gcc iproute2 iptables kmod
+    DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential gcc iproute2 iptables kmod procps
   elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y gcc make iproute iptables kmod
+    dnf install -y gcc make iproute iptables kmod procps-ng
   elif command -v yum >/dev/null 2>&1; then
-    yum install -y gcc make iproute iptables kmod
+    yum install -y gcc make iproute iptables kmod procps-ng
   else
-    echo "No supported package manager found. Install gcc, iproute2, iptables and kmod manually." >&2
+    echo "No supported package manager found. Install gcc, iproute2, iptables, kmod and procps manually." >&2
     return 1
+  fi
+}
+
+vira7_tune_kernel() {
+  local id="${1:-}"
+  mkdir -p /etc/sysctl.d
+  cat > /etc/sysctl.d/99-vira7-stable.conf <<EOF_SYSCTL
+net.ipv4.ip_forward = 1
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.core.rmem_default = 4194304
+net.core.wmem_default = 4194304
+net.core.netdev_max_backlog = 16384
+net.ipv4.udp_rmem_min = 131072
+net.ipv4.udp_wmem_min = 131072
+net.ipv4.conf.all.rp_filter = 0
+net.ipv4.conf.default.rp_filter = 0
+EOF_SYSCTL
+  sysctl -p /etc/sysctl.d/99-vira7-stable.conf >/dev/null 2>&1 || true
+  if validate_tunnel_id "$id"; then
+    sysctl -w "net.ipv4.conf.$(vira7_iface_name "$id").rp_filter=0" >/dev/null 2>&1 || true
   fi
 }
 
@@ -2058,12 +2109,14 @@ vira7_compile_engine() {
   vira7_ensure_deps || return 1
   mkdir -p "$VIRA7_CONFIG_DIR"
   cat > "$VIRA7_SOURCE" <<'ENGINEEOF'
+#define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/if_tun.h>
 #include <net/if.h>
 #include <netinet/in.h>
+#include <netinet/ip.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -2078,7 +2131,7 @@ vira7_compile_engine() {
 #include <unistd.h>
 
 #define TUN_DEVICE "/dev/net/tun"
-#define MAX_PKT_SIZE 2000
+#define MAX_PKT_SIZE 4096
 #define VIRA7_MAGIC 0x5637
 #define PKT_DATA 1
 #define PKT_KEEPALIVE 2
@@ -2107,6 +2160,10 @@ typedef struct {
     int checksum;
     int verify_checksum;
     int batch;
+    int peer_lock;
+    int peer_timeout;
+    int reconnect_timeout;
+    int stats_interval;
 } v7_config_t;
 
 static volatile sig_atomic_t running = 1;
@@ -2137,14 +2194,18 @@ static int load_config(const char *path, v7_config_t *c) {
     memset(c, 0, sizeof(*c));
     snprintf(c->iface, sizeof(c->iface), "vira7");
     snprintf(c->mode, sizeof(c->mode), "client");
-    c->port = 5571;
-    c->mtu = 1400;
-    c->keepalive = 5;
-    c->buffer_size = 2097152;
-    c->queue_len = 1000;
+    c->port = 5572;
+    c->mtu = 1280;
+    c->keepalive = 3;
+    c->buffer_size = 8388608;
+    c->queue_len = 4000;
     c->checksum = 1;
     c->verify_checksum = 0;
     c->batch = 128;
+    c->peer_lock = 1;
+    c->peer_timeout = 30;
+    c->reconnect_timeout = 25;
+    c->stats_interval = 5;
 
     FILE *f = fopen(path, "r");
     if (!f) return -1;
@@ -2173,18 +2234,28 @@ static int load_config(const char *path, v7_config_t *c) {
         else if (!strcmp(key, "checksum")) c->checksum = atoi(val);
         else if (!strcmp(key, "verify_checksum")) c->verify_checksum = atoi(val);
         else if (!strcmp(key, "batch")) c->batch = atoi(val);
+        else if (!strcmp(key, "peer_lock")) c->peer_lock = atoi(val);
+        else if (!strcmp(key, "peer_timeout")) c->peer_timeout = atoi(val);
+        else if (!strcmp(key, "reconnect_timeout")) c->reconnect_timeout = atoi(val);
+        else if (!strcmp(key, "stats_interval")) c->stats_interval = atoi(val);
     }
     fclose(f);
-    if (!c->local_priv[0] || !c->remote_priv[0] || c->port <= 0 || c->port > 65535) return -1;
-    if (!strcmp(c->mode, "client") && !c->remote_ip[0]) return -1;
-    if (c->mtu < 576 || c->mtu > 1600) c->mtu = 1400;
-    if (c->keepalive < 1 || c->keepalive > 60) c->keepalive = 5;
-    if (c->queue_len < 100) c->queue_len = 1000;
-    if (c->buffer_size < 65536) c->buffer_size = 2097152;
+
+    if (!c->local_priv[0] || !c->remote_priv[0] || !c->remote_ip[0]) return -1;
+    if (strcmp(c->mode, "client") && strcmp(c->mode, "server")) return -1;
+    if (c->port <= 0 || c->port > 65535) return -1;
+    if (c->mtu < 576 || c->mtu > 1600) c->mtu = 1280;
+    if (c->keepalive < 1 || c->keepalive > 30) c->keepalive = 3;
+    if (c->queue_len < 100) c->queue_len = 4000;
+    if (c->buffer_size < 65536) c->buffer_size = 8388608;
     c->checksum = c->checksum ? 1 : 0;
     c->verify_checksum = c->verify_checksum ? 1 : 0;
+    c->peer_lock = c->peer_lock ? 1 : 0;
     if (c->batch < 1) c->batch = 1;
     if (c->batch > 512) c->batch = 512;
+    if (c->peer_timeout < 10 || c->peer_timeout > 300) c->peer_timeout = 30;
+    if (c->reconnect_timeout < 10 || c->reconnect_timeout > 300) c->reconnect_timeout = 25;
+    if (c->stats_interval < 1 || c->stats_interval > 60) c->stats_interval = 5;
     return 0;
 }
 
@@ -2197,43 +2268,50 @@ static int tun_alloc_named(const char *dev) {
     snprintf(ifr.ifr_name, IFNAMSIZ, "%s", dev);
     if (ioctl(fd, TUNSETIFF, &ifr) < 0) { close(fd); return -1; }
     int flags = fcntl(fd, F_GETFL, 0);
-    if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    if (flags >= 0) (void)fcntl(fd, F_SETFL, flags | O_NONBLOCK);
     return fd;
 }
 
 static void cleanup_iface(const char *iface) {
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "ip link del %s 2>/dev/null", iface);
-    system(cmd);
+    (void)system(cmd);
 }
 
 static int configure_tun(const v7_config_t *c) {
     char cmd[512];
     snprintf(cmd, sizeof(cmd), "ip link set dev %s up mtu %d txqueuelen %d", c->iface, c->mtu, c->queue_len);
     if (system(cmd) != 0) return -1;
-    snprintf(cmd, sizeof(cmd), "ip addr add %s/32 peer %s dev %s 2>/dev/null || true", c->local_priv, c->remote_priv, c->iface);
-    return system(cmd) == 0 ? 0 : -1;
+    snprintf(cmd, sizeof(cmd), "ip addr replace %s/32 peer %s dev %s", c->local_priv, c->remote_priv, c->iface);
+    if (system(cmd) != 0) return -1;
+    snprintf(cmd, sizeof(cmd), "sysctl -w net.ipv4.conf.%s.rp_filter=0 >/dev/null 2>&1 || true", c->iface);
+    (void)system(cmd);
+    return 0;
 }
 
 static int udp_socket_create(const v7_config_t *c) {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) return -1;
     int yes = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &c->buffer_size, sizeof(c->buffer_size));
-    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &c->buffer_size, sizeof(c->buffer_size));
+    (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &c->buffer_size, sizeof(c->buffer_size));
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &c->buffer_size, sizeof(c->buffer_size));
+#ifdef IP_MTU_DISCOVER
+    int pmtu = IP_PMTUDISC_DONT;
+    (void)setsockopt(fd, IPPROTO_IP, IP_MTU_DISCOVER, &pmtu, sizeof(pmtu));
+#endif
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons((uint16_t)c->port);
-    if (c->bind_ip[0]) {
+    if (c->bind_ip[0] && strcmp(c->bind_ip, "0.0.0.0")) {
         if (inet_pton(AF_INET, c->bind_ip, &addr.sin_addr) != 1) { close(fd); return -1; }
     } else {
         addr.sin_addr.s_addr = htonl(INADDR_ANY);
     }
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) { close(fd); return -1; }
     int flags = fcntl(fd, F_GETFL, 0);
-    if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    if (flags >= 0) (void)fcntl(fd, F_SETFL, flags | O_NONBLOCK);
     return fd;
 }
 
@@ -2247,11 +2325,7 @@ static int send_v7(int fd, const struct sockaddr_in *dst, uint16_t type, const u
     h->length = htons(len);
     h->checksum = 0;
     if (payload && len) memcpy(buf + sizeof(v7_hdr_t), payload, len);
-    if (g_send_checksum) {
-        h->checksum = htons(csum16(buf, sizeof(v7_hdr_t) + len));
-    } else {
-        h->checksum = 0;
-    }
+    if (g_send_checksum) h->checksum = htons(csum16(buf, sizeof(v7_hdr_t) + len));
     ssize_t n = sendto(fd, buf, sizeof(v7_hdr_t) + len, 0, (const struct sockaddr *)dst, sizeof(*dst));
     return n == (ssize_t)(sizeof(v7_hdr_t) + len) ? 0 : -1;
 }
@@ -2269,49 +2343,109 @@ static int verify_packet(uint8_t *buf, ssize_t n, uint16_t *type, uint8_t **payl
         if (got != calc) return -1;
     }
     *type = ntohs(h->type);
+    if (*type != PKT_DATA && *type != PKT_KEEPALIVE && *type != PKT_ACK) return -1;
     *payload = buf + sizeof(v7_hdr_t);
     return 0;
 }
 
+static int peer_ip_matches(const v7_config_t *cfg, const struct sockaddr_in *sender) {
+    if (!cfg->peer_lock) return 1;
+    struct in_addr expected;
+    if (inet_pton(AF_INET, cfg->remote_ip, &expected) != 1) return 0;
+    return expected.s_addr == sender->sin_addr.s_addr;
+}
+
+static int write_tun_packet(int fd, const uint8_t *buf, size_t len) {
+    ssize_t n;
+    do { n = write(fd, buf, len); } while (n < 0 && errno == EINTR);
+    return n == (ssize_t)len ? 0 : -1;
+}
+
+static void write_stats(const v7_config_t *cfg, int remote_known, const struct sockaddr_in *remote,
+                        time_t last_rx, unsigned long long tx_packets, unsigned long long rx_packets,
+                        unsigned long long drops, unsigned long long reconnects) {
+    char path[160], tmp[180], peer[INET_ADDRSTRLEN] = "unknown";
+    snprintf(path, sizeof(path), "/run/vira7-%s.stats", cfg->iface);
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    if (remote_known) (void)inet_ntop(AF_INET, &remote->sin_addr, peer, sizeof(peer));
+    FILE *f = fopen(tmp, "w");
+    if (!f) return;
+    fprintf(f, "mode=%s\n", cfg->mode);
+    fprintf(f, "peer=%s:%u\n", peer, remote_known ? (unsigned)ntohs(remote->sin_port) : 0U);
+    fprintf(f, "connected=%d\n", remote_known ? 1 : 0);
+    fprintf(f, "last_rx_epoch=%lld\n", (long long)last_rx);
+    fprintf(f, "tx_packets=%llu\n", tx_packets);
+    fprintf(f, "rx_packets=%llu\n", rx_packets);
+    fprintf(f, "drops=%llu\n", drops);
+    fprintf(f, "reconnects=%llu\n", reconnects);
+    fclose(f);
+    (void)rename(tmp, path);
+}
+
 int main(int argc, char **argv) {
-    if (argc < 2 || getuid() != 0) return 1;
+    if (argc < 2 || getuid() != 0) {
+        fprintf(stderr, "vira7-engine must run as root with a config file\n");
+        return 1;
+    }
+
     v7_config_t cfg;
-    if (load_config(argv[1], &cfg) != 0) return 1;
+    if (load_config(argv[1], &cfg) != 0) {
+        fprintf(stderr, "failed to load Vira7 config: %s\n", argv[1]);
+        return 1;
+    }
     g_send_checksum = cfg.checksum ? 1 : 0;
     g_verify_checksum = cfg.verify_checksum ? 1 : 0;
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
     signal(SIGPIPE, SIG_IGN);
-    mkdir("/dev/net", 0755);
-    if (access(TUN_DEVICE, F_OK) != 0) system("mknod /dev/net/tun c 10 200 2>/dev/null || true");
-    system("modprobe tun 2>/dev/null || true");
-    cleanup_iface(cfg.iface);
-    int tun_fd = tun_alloc_named(cfg.iface);
-    if (tun_fd < 0) return 1;
-    if (configure_tun(&cfg) != 0) { cleanup_iface(cfg.iface); close(tun_fd); return 1; }
-    int udp_fd = udp_socket_create(&cfg);
-    if (udp_fd < 0) { cleanup_iface(cfg.iface); close(tun_fd); return 1; }
 
-    struct sockaddr_in remote;
-    memset(&remote, 0, sizeof(remote));
-    remote.sin_family = AF_INET;
-    remote.sin_port = htons((uint16_t)cfg.port);
-    int remote_known = 0;
-    if (!strcmp(cfg.mode, "client")) {
-        if (inet_pton(AF_INET, cfg.remote_ip, &remote.sin_addr) != 1) {
-            close(udp_fd); close(tun_fd); cleanup_iface(cfg.iface); return 1;
-        }
-        remote_known = 1;
+    (void)mkdir("/dev/net", 0755);
+    if (access(TUN_DEVICE, F_OK) != 0) (void)system("mknod /dev/net/tun c 10 200 2>/dev/null || true");
+    (void)system("modprobe tun 2>/dev/null || true");
+    cleanup_iface(cfg.iface);
+
+    int tun_fd = tun_alloc_named(cfg.iface);
+    if (tun_fd < 0) { perror("open tun"); return 1; }
+    if (configure_tun(&cfg) != 0) {
+        fprintf(stderr, "failed to configure TUN interface %s\n", cfg.iface);
+        cleanup_iface(cfg.iface); close(tun_fd); return 1;
     }
 
+    int udp_fd = udp_socket_create(&cfg);
+    if (udp_fd < 0) {
+        perror("bind UDP socket");
+        cleanup_iface(cfg.iface); close(tun_fd); return 1;
+    }
+
+    struct sockaddr_in configured_remote;
+    memset(&configured_remote, 0, sizeof(configured_remote));
+    configured_remote.sin_family = AF_INET;
+    configured_remote.sin_port = htons((uint16_t)cfg.port);
+    if (inet_pton(AF_INET, cfg.remote_ip, &configured_remote.sin_addr) != 1) {
+        fprintf(stderr, "invalid remote_ip: %s\n", cfg.remote_ip);
+        close(udp_fd); close(tun_fd); cleanup_iface(cfg.iface); return 1;
+    }
+
+    struct sockaddr_in remote = configured_remote;
+    int remote_known = !strcmp(cfg.mode, "client") ? 1 : 0;
+
     char pidfile[128];
-    snprintf(pidfile, sizeof(pidfile), "/var/run/%s.pid", cfg.iface);
+    snprintf(pidfile, sizeof(pidfile), "/run/%s.pid", cfg.iface);
     FILE *pf = fopen(pidfile, "w");
     if (pf) { fprintf(pf, "%d\n", getpid()); fclose(pf); }
 
+    fprintf(stderr, "Vira7 Stable started: iface=%s mode=%s bind=%s:%d remote=%s:%d mtu=%d\n",
+            cfg.iface, cfg.mode, cfg.bind_ip[0] ? cfg.bind_ip : "0.0.0.0", cfg.port,
+            cfg.remote_ip, cfg.port, cfg.mtu);
+
     uint8_t tun_buf[MAX_PKT_SIZE];
     uint8_t udp_buf[sizeof(v7_hdr_t) + MAX_PKT_SIZE];
+    time_t now = time(NULL);
     time_t last_keepalive = 0;
+    time_t last_rx = now;
+    time_t last_stats = 0;
+    time_t last_reconnect = now;
+    unsigned long long tx_packets = 0, rx_packets = 0, drops = 0, reconnects = 0;
 
     while (running) {
         fd_set rfds;
@@ -2321,71 +2455,139 @@ int main(int argc, char **argv) {
         int maxfd = tun_fd > udp_fd ? tun_fd : udp_fd;
         struct timeval tv = {1, 0};
         int rc = select(maxfd + 1, &rfds, NULL, NULL, &tv);
-        if (rc < 0) { if (errno == EINTR) continue; break; }
-        time_t now = time(NULL);
+        if (rc < 0) { if (errno == EINTR) continue; perror("select"); break; }
+
+        now = time(NULL);
         if (remote_known && now - last_keepalive >= cfg.keepalive) {
-            send_v7(udp_fd, &remote, PKT_KEEPALIVE, NULL, 0);
+            if (send_v7(udp_fd, &remote, PKT_KEEPALIVE, NULL, 0) == 0) tx_packets++; else drops++;
             last_keepalive = now;
         }
+
+        if (!strcmp(cfg.mode, "server") && remote_known && now - last_rx >= cfg.peer_timeout) {
+            fprintf(stderr, "peer timeout; waiting for a fresh authenticated peer packet\n");
+            remote_known = 0;
+        }
+
         if (FD_ISSET(tun_fd, &rfds)) {
             for (int i = 0; i < cfg.batch; i++) {
                 ssize_t n = read(tun_fd, tun_buf, sizeof(tun_buf));
                 if (n > 0) {
-                    if (remote_known) send_v7(udp_fd, &remote, PKT_DATA, tun_buf, (uint16_t)n);
+                    if (remote_known && send_v7(udp_fd, &remote, PKT_DATA, tun_buf, (uint16_t)n) == 0) tx_packets++;
+                    else drops++;
                     continue;
                 }
+                if (n < 0 && errno == EINTR) continue;
                 if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
                 break;
             }
         }
+
         if (FD_ISSET(udp_fd, &rfds)) {
             for (int i = 0; i < cfg.batch; i++) {
                 struct sockaddr_in sender;
                 socklen_t slen = sizeof(sender);
                 ssize_t n = recvfrom(udp_fd, udp_buf, sizeof(udp_buf), 0, (struct sockaddr *)&sender, &slen);
                 if (n < 0) {
+                    if (errno == EINTR) continue;
                     if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                    drops++;
                     break;
                 }
                 if (n == 0) break;
+
                 uint16_t type, len;
                 uint8_t *payload;
-                if (verify_packet(udp_buf, n, &type, &payload, &len) != 0) continue;
-                if (strcmp(cfg.mode, "server") == 0) {
-                    memcpy(&remote, &sender, sizeof(remote));
-                    remote_known = 1;
+                if (verify_packet(udp_buf, n, &type, &payload, &len) != 0) { drops++; continue; }
+                if (!peer_ip_matches(&cfg, &sender)) { drops++; continue; }
+
+                if (!strcmp(cfg.mode, "server")) {
+                    if (!remote_known || sender.sin_addr.s_addr == remote.sin_addr.s_addr || now - last_rx >= cfg.peer_timeout) {
+                        remote = sender;
+                        remote_known = 1;
+                    } else {
+                        drops++;
+                        continue;
+                    }
+                } else {
+                    // Accept NAT/source-port changes from the configured remote IP.
+                    remote.sin_port = sender.sin_port;
                 }
-                if (type == PKT_DATA && len > 0) write(tun_fd, payload, len);
-                else if (type == PKT_KEEPALIVE && remote_known) send_v7(udp_fd, &remote, PKT_ACK, NULL, 0);
+
+                last_rx = now;
+                rx_packets++;
+                if (type == PKT_DATA && len > 0) {
+                    if (write_tun_packet(tun_fd, payload, len) != 0) drops++;
+                } else if (type == PKT_KEEPALIVE && remote_known) {
+                    if (send_v7(udp_fd, &remote, PKT_ACK, NULL, 0) == 0) tx_packets++; else drops++;
+                }
             }
         }
+
+        if (!strcmp(cfg.mode, "client") && now - last_rx >= cfg.reconnect_timeout && now - last_reconnect >= cfg.reconnect_timeout) {
+            int new_fd;
+            close(udp_fd);
+            new_fd = udp_socket_create(&cfg);
+            if (new_fd < 0) {
+                perror("recreate UDP socket");
+                break;
+            }
+            udp_fd = new_fd;
+            remote = configured_remote;
+            remote_known = 1;
+            reconnects++;
+            last_reconnect = now;
+            last_keepalive = 0;
+            fprintf(stderr, "no reply for %d seconds; UDP socket recreated (reconnect=%llu)\n",
+                    cfg.reconnect_timeout, reconnects);
+        }
+
+        if (now - last_stats >= cfg.stats_interval) {
+            write_stats(&cfg, remote_known, &remote, last_rx, tx_packets, rx_packets, drops, reconnects);
+            last_stats = now;
+        }
     }
+
+    write_stats(&cfg, remote_known, &remote, last_rx, tx_packets, rx_packets, drops, reconnects);
     close(udp_fd);
     close(tun_fd);
     unlink(pidfile);
     cleanup_iface(cfg.iface);
+    fprintf(stderr, "Vira7 Stable stopped\n");
     return 0;
 }
 ENGINEEOF
-  gcc -O3 -flto -Wall -Wextra -o "$VIRA7_BINARY" "$VIRA7_SOURCE" 2>/dev/null || \
-    gcc -O3 -Wall -Wextra -o "$VIRA7_BINARY" "$VIRA7_SOURCE"
-  chmod 755 "$VIRA7_BINARY"
+
+  if gcc -std=c11 -O3 -flto -Wall -Wextra -Werror -o "$VIRA7_BINARY.tmp" "$VIRA7_SOURCE"; then
+    :
+  elif gcc -std=c11 -O3 -Wall -Wextra -o "$VIRA7_BINARY.tmp" "$VIRA7_SOURCE"; then
+    warn_msg "Vira7 engine compiled without LTO/Werror fallback."
+  else
+    rm -f "$VIRA7_BINARY.tmp"
+    return 1
+  fi
+  install -m 755 "$VIRA7_BINARY.tmp" "$VIRA7_BINARY"
+  rm -f "$VIRA7_BINARY.tmp"
 }
 
 vira7_write_service_template() {
   cat > "$VIRA7_SERVICE_TEMPLATE" <<EOF_SERVICE
 [Unit]
-Description=Vira7 UDP-TUN Tunnel %i Service
+Description=Vira7 Stable UDP-TUN Tunnel %i
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+ExecStartPre=/sbin/modprobe tun
 ExecStartPre=/bin/bash $INSTALL_BIN --service firewall-vira7 %i
 ExecStart=$VIRA7_BINARY $VIRA7_CONFIG_DIR/tunnel-%i.conf
 Restart=always
-RestartSec=3
-LimitNOFILE=65535
+RestartSec=2
+TimeoutStopSec=8
+KillSignal=SIGTERM
+LimitNOFILE=131072
+Nice=-5
 
 [Install]
 WantedBy=multi-user.target
@@ -2395,56 +2597,60 @@ EOF_SERVICE
 
 vira7_save_config() {
   mkdir -p "$VIRA7_CONFIG_DIR"
-  local file
+  local file tmp backup
   file="$(vira7_config_file "$TUNNEL_ID")"
+  tmp="${file}.tmp.$$"
+  backup="${file}.last-good"
+  [ -f "$file" ] && cp -f "$file" "$backup"
+
   {
     # Shell metadata used by this manager.
     write_var TUNNEL_TYPE "vira7"
     write_var TUNNEL_ID "$TUNNEL_ID"
+    write_var VIRA7_CONFIG_VERSION "2"
     write_var VIRA7_IFACE "$VIRA7_IFACE"
     write_var ROLE "$ROLE"
     write_var SERVER_ROLE "$SERVER_ROLE"
+    write_var VIRA7_DIRECTION "$VIRA7_DIRECTION"
+    write_var VIRA7_MODE "$VIRA7_MODE"
     write_var LOCAL_PUBLIC_IP "$LOCAL_PUBLIC_IP"
     write_var REMOTE_PUBLIC_IP "$REMOTE_PUBLIC_IP"
     write_var LOCAL_VIRA7_IP "$LOCAL_VIRA7_IP"
     write_var REMOTE_VIRA7_IP "$REMOTE_VIRA7_IP"
     write_var VIRA7_PORT "$VIRA7_PORT"
     write_var VIRA7_MTU "$VIRA7_MTU"
-    write_var VIRA7_CHECKSUM "${VIRA7_CHECKSUM:-$VIRA7_DEFAULT_CHECKSUM}"
-    write_var VIRA7_VERIFY_CHECKSUM "${VIRA7_VERIFY_CHECKSUM:-$VIRA7_DEFAULT_VERIFY_CHECKSUM}"
-    write_var VIRA7_BATCH "${VIRA7_BATCH:-$VIRA7_DEFAULT_BATCH}"
+    write_var VIRA7_KEEPALIVE "$VIRA7_KEEPALIVE"
+    write_var VIRA7_BUFFER_SIZE "$VIRA7_BUFFER_SIZE"
+    write_var VIRA7_QUEUE_LEN "$VIRA7_QUEUE_LEN"
+    write_var VIRA7_CHECKSUM "$VIRA7_CHECKSUM"
+    write_var VIRA7_VERIFY_CHECKSUM "$VIRA7_VERIFY_CHECKSUM"
+    write_var VIRA7_BATCH "$VIRA7_BATCH"
+    write_var VIRA7_PEER_LOCK "$VIRA7_PEER_LOCK"
+    write_var VIRA7_PEER_TIMEOUT "$VIRA7_PEER_TIMEOUT"
+    write_var VIRA7_RECONNECT_TIMEOUT "$VIRA7_RECONNECT_TIMEOUT"
     echo
-    # Engine config used directly by vira7-engine systemd service.
-    printf 'iface=%s
-' "$VIRA7_IFACE"
-    printf 'mode=%s
-' "$VIRA7_MODE"
-    printf 'bind_ip=%s
-' "$LOCAL_PUBLIC_IP"
-    printf 'remote_ip=%s
-' "$REMOTE_PUBLIC_IP"
-    printf 'local_priv=%s
-' "$LOCAL_VIRA7_IP"
-    printf 'remote_priv=%s
-' "$REMOTE_VIRA7_IP"
-    printf 'port=%s
-' "$VIRA7_PORT"
-    printf 'mtu=%s
-' "$VIRA7_MTU"
-    printf 'keepalive=%s
-' "$VIRA7_DEFAULT_KEEPALIVE"
-    printf 'buffer_size=%s
-' "$VIRA7_DEFAULT_BUFFER_SIZE"
-    printf 'queue_len=%s
-' "$VIRA7_DEFAULT_QUEUE_LEN"
-    printf 'checksum=%s
-' "${VIRA7_CHECKSUM:-$VIRA7_DEFAULT_CHECKSUM}"
-    printf 'verify_checksum=%s
-' "${VIRA7_VERIFY_CHECKSUM:-$VIRA7_DEFAULT_VERIFY_CHECKSUM}"
-    printf 'batch=%s
-' "${VIRA7_BATCH:-$VIRA7_DEFAULT_BATCH}"
-  } > "$file"
-  chmod 600 "$file"
+    # Engine configuration. Lower-case keys are read by vira7-engine.
+    printf 'iface=%s\n' "$VIRA7_IFACE"
+    printf 'mode=%s\n' "$VIRA7_MODE"
+    printf 'bind_ip=%s\n' "$LOCAL_PUBLIC_IP"
+    printf 'remote_ip=%s\n' "$REMOTE_PUBLIC_IP"
+    printf 'local_priv=%s\n' "$LOCAL_VIRA7_IP"
+    printf 'remote_priv=%s\n' "$REMOTE_VIRA7_IP"
+    printf 'port=%s\n' "$VIRA7_PORT"
+    printf 'mtu=%s\n' "$VIRA7_MTU"
+    printf 'keepalive=%s\n' "$VIRA7_KEEPALIVE"
+    printf 'buffer_size=%s\n' "$VIRA7_BUFFER_SIZE"
+    printf 'queue_len=%s\n' "$VIRA7_QUEUE_LEN"
+    printf 'checksum=%s\n' "$VIRA7_CHECKSUM"
+    printf 'verify_checksum=%s\n' "$VIRA7_VERIFY_CHECKSUM"
+    printf 'batch=%s\n' "$VIRA7_BATCH"
+    printf 'peer_lock=%s\n' "$VIRA7_PEER_LOCK"
+    printf 'peer_timeout=%s\n' "$VIRA7_PEER_TIMEOUT"
+    printf 'reconnect_timeout=%s\n' "$VIRA7_RECONNECT_TIMEOUT"
+    printf 'stats_interval=5\n'
+  } > "$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$file"
   echo "Saved Vira7 tunnel $TUNNEL_ID configuration to $file"
 }
 
@@ -2454,9 +2660,19 @@ vira7_load_config() {
   local file
   file="$(vira7_config_file "$id")"
   [ -f "$file" ] || return 1
+
+  # Prevent values from a previously loaded Vira tunnel leaking into this one.
+  unset TUNNEL_TYPE TUNNEL_ID VIRA7_CONFIG_VERSION VIRA7_IFACE ROLE SERVER_ROLE VIRA7_DIRECTION VIRA7_MODE
+  unset LOCAL_PUBLIC_IP REMOTE_PUBLIC_IP LOCAL_VIRA7_IP REMOTE_VIRA7_IP VIRA7_PORT VIRA7_MTU
+  unset VIRA7_KEEPALIVE VIRA7_BUFFER_SIZE VIRA7_QUEUE_LEN VIRA7_CHECKSUM VIRA7_VERIFY_CHECKSUM
+  unset VIRA7_BATCH VIRA7_PEER_LOCK VIRA7_PEER_TIMEOUT VIRA7_RECONNECT_TIMEOUT
+  unset iface mode bind_ip remote_ip local_priv remote_priv port mtu keepalive buffer_size queue_len
+  unset checksum verify_checksum batch peer_lock peer_timeout reconnect_timeout stats_interval
+
   # shellcheck disable=SC1090
   source "$file"
   TUNNEL_ID="$id"
+  VIRA7_CONFIG_VERSION="${VIRA7_CONFIG_VERSION:-1}"
   VIRA7_IFACE="${VIRA7_IFACE:-${iface:-$(vira7_iface_name "$id")}}"
   LOCAL_PUBLIC_IP="${LOCAL_PUBLIC_IP:-${bind_ip:-}}"
   REMOTE_PUBLIC_IP="${REMOTE_PUBLIC_IP:-${remote_ip:-}}"
@@ -2464,43 +2680,48 @@ vira7_load_config() {
   REMOTE_VIRA7_IP="${REMOTE_VIRA7_IP:-${remote_priv:-}}"
   VIRA7_PORT="${VIRA7_PORT:-${port:-$(vira7_default_port "$id")}}"
   VIRA7_MTU="${VIRA7_MTU:-${mtu:-$VIRA7_DEFAULT_MTU}}"
+  VIRA7_KEEPALIVE="${VIRA7_KEEPALIVE:-${keepalive:-$VIRA7_DEFAULT_KEEPALIVE}}"
+  VIRA7_BUFFER_SIZE="${VIRA7_BUFFER_SIZE:-${buffer_size:-$VIRA7_DEFAULT_BUFFER_SIZE}}"
+  VIRA7_QUEUE_LEN="${VIRA7_QUEUE_LEN:-${queue_len:-$VIRA7_DEFAULT_QUEUE_LEN}}"
   VIRA7_CHECKSUM="${VIRA7_CHECKSUM:-${checksum:-$VIRA7_DEFAULT_CHECKSUM}}"
   VIRA7_VERIFY_CHECKSUM="${VIRA7_VERIFY_CHECKSUM:-${verify_checksum:-$VIRA7_DEFAULT_VERIFY_CHECKSUM}}"
   VIRA7_BATCH="${VIRA7_BATCH:-${batch:-$VIRA7_DEFAULT_BATCH}}"
+  VIRA7_PEER_LOCK="${VIRA7_PEER_LOCK:-${peer_lock:-$VIRA7_DEFAULT_PEER_LOCK}}"
+  VIRA7_PEER_TIMEOUT="${VIRA7_PEER_TIMEOUT:-${peer_timeout:-$VIRA7_DEFAULT_PEER_TIMEOUT}}"
+  VIRA7_RECONNECT_TIMEOUT="${VIRA7_RECONNECT_TIMEOUT:-${reconnect_timeout:-$VIRA7_DEFAULT_RECONNECT_TIMEOUT}}"
+
   if [ -z "${ROLE:-}" ]; then
     if [ "${LOCAL_VIRA7_IP:-}" = "10.71.$id.1" ]; then ROLE="1"; else ROLE="2"; fi
   fi
+  VIRA7_MODE="${VIRA7_MODE:-${mode:-$(vira7_mode_for_role "$ROLE" recommended)}}"
+  VIRA7_DIRECTION="${VIRA7_DIRECTION:-$(vira7_infer_direction "$ROLE" "$VIRA7_MODE")}"
+  SERVER_ROLE="${SERVER_ROLE:-$([ "$ROLE" = "1" ] && echo IRAN || echo KHAREJ)}"
 }
 
-vira7_write_engine_config() {
-  local id="$1"
-  local file
-  file="$(vira7_config_file "$id")"
-  mkdir -p "$VIRA7_CONFIG_DIR"
-  cat > "$file" <<EOF_CONF
-iface=$VIRA7_IFACE
-mode=$VIRA7_MODE
-bind_ip=$LOCAL_PUBLIC_IP
-remote_ip=$REMOTE_PUBLIC_IP
-local_priv=$LOCAL_VIRA7_IP
-remote_priv=$REMOTE_VIRA7_IP
-port=$VIRA7_PORT
-mtu=$VIRA7_MTU
-keepalive=$VIRA7_DEFAULT_KEEPALIVE
-buffer_size=$VIRA7_DEFAULT_BUFFER_SIZE
-queue_len=$VIRA7_DEFAULT_QUEUE_LEN
-checksum=${VIRA7_CHECKSUM:-$VIRA7_DEFAULT_CHECKSUM}
-verify_checksum=${VIRA7_VERIFY_CHECKSUM:-$VIRA7_DEFAULT_VERIFY_CHECKSUM}
-batch=${VIRA7_BATCH:-$VIRA7_DEFAULT_BATCH}
-EOF_CONF
-  chmod 600 "$file"
+vira7_validate_port_for_tunnel() {
+  local port="$1" id="$2" existing_port="${3:-}"
+  validate_port "$port" || { err_msg "Invalid UDP port: $port"; return 1; }
+  if udp_port_in_saved_configs "$port" "vira7" "$id"; then
+    err_msg "UDP port $port is already assigned to another saved tunnel."
+    return 1
+  fi
+  if udp_port_is_listening "$port"; then
+    if [ "$existing_port" = "$port" ] && systemctl is-active --quiet "$(vira7_service_name "$id")" 2>/dev/null; then
+      info_msg "UDP port $port is currently owned by this Vira7 service and will be reused safely."
+    else
+      err_msg "UDP port $port is already listening on this server. Choose another port."
+      ss -H -lunp 2>/dev/null | grep -E "(^|[:.])${port}([[:space:]]|$)" || true
+      return 1
+    fi
+  fi
 }
 
 vira7_apply_firewall_rules() {
   local id="$1"
   if ! vira7_load_config "$id"; then return 1; fi
+  vira7_tune_kernel "$id"
   firewall_allow_udp_port_and_ip "Vira7 tunnel $id" "$VIRA7_PORT" "$REMOTE_PUBLIC_IP" "$VIRA7_PORT" "$VIRA7_IFACE"
-  firewall_allow_ip_peer "Vira7 tunnel $id remote inner" "${REMOTE_VIRA7_IP:-${remote_priv:-}}" "$VIRA7_IFACE"
+  firewall_allow_ip_peer "Vira7 tunnel $id remote inner" "$REMOTE_VIRA7_IP" "$VIRA7_IFACE"
   firewall_allow_ip_peer "Vira7 tunnel $id remote public" "$REMOTE_PUBLIC_IP" "$VIRA7_IFACE"
 }
 
@@ -2513,107 +2734,171 @@ vira7_install_service() {
   cp -f "$0" "$INSTALL_BIN" 2>/dev/null || true
   chmod 755 "$INSTALL_BIN" 2>/dev/null || true
   vira7_write_service_template
-  systemctl enable "$(vira7_service_name "$id")" || return 1
+  systemctl enable "$(vira7_service_name "$id")" >/dev/null || return 1
   if systemctl restart "$(vira7_service_name "$id")"; then
-    echo "Vira7 service enabled and started ($(vira7_service_name "$id"))"
-    return 0
+    sleep 1
+    if systemctl is-active --quiet "$(vira7_service_name "$id")" && ip link show "$(vira7_iface_name "$id")" >/dev/null 2>&1; then
+      ok_msg "Vira7 Stable service enabled and started ($(vira7_service_name "$id"))"
+      return 0
+    fi
   fi
   systemctl status "$(vira7_service_name "$id")" --no-pager -l 2>/dev/null || true
-  journalctl -u "$(vira7_service_name "$id")" -n 30 --no-pager 2>/dev/null || true
+  journalctl -u "$(vira7_service_name "$id")" -n 50 --no-pager 2>/dev/null || true
   return 1
 }
 
 vira7_create_tunnel() {
-  local interactive=${1:-0}
+  local interactive="${1:-0}"
+  local file backup
+  : "$interactive"
   validate_tunnel_id "${TUNNEL_ID:-}" || { echo "Invalid tunnel number." >&2; return 1; }
   VIRA7_IFACE="$(vira7_iface_name "$TUNNEL_ID")"
   LOCAL_PUBLIC_IP="${LOCAL_PUBLIC_IP:-$(detect_local_public_ip)}"
-  [ -n "${LOCAL_PUBLIC_IP:-}" ] || { echo "Failed to detect local public IPv4" >&2; return 1; }
-  if ! local_ipv4_is_assigned "$LOCAL_PUBLIC_IP"; then
+  [ -n "${LOCAL_PUBLIC_IP:-}" ] || { echo "Failed to detect local bind IPv4" >&2; return 1; }
+  if [ "$LOCAL_PUBLIC_IP" != "0.0.0.0" ] && ! local_ipv4_is_assigned "$LOCAL_PUBLIC_IP"; then
     echo "Selected Vira7 bind IP is not assigned on this server: $LOCAL_PUBLIC_IP" >&2
+    echo "Use an address shown below, or 0.0.0.0 to bind on all local IPv4 addresses." >&2
     list_local_ipv4s >&2
     return 1
   fi
-  if [ "$ROLE" = "1" ]; then
-    SERVER_ROLE="IRAN"
-    VIRA7_MODE="server"
-    LOCAL_VIRA7_IP="10.71.$TUNNEL_ID.1"
-    REMOTE_VIRA7_IP="10.71.$TUNNEL_ID.2"
-  else
-    SERVER_ROLE="KHAREJ"
-    VIRA7_MODE="client"
-    LOCAL_VIRA7_IP="10.71.$TUNNEL_ID.2"
-    REMOTE_VIRA7_IP="10.71.$TUNNEL_ID.1"
-  fi
+
+  SERVER_ROLE="$([ "$ROLE" = "1" ] && echo IRAN || echo KHAREJ)"
+  VIRA7_DIRECTION="${VIRA7_DIRECTION:-recommended}"
+  VIRA7_MODE="$(vira7_mode_for_role "$ROLE" "$VIRA7_DIRECTION")"
+  LOCAL_VIRA7_IP="$(vira7_inner_ip_for_role "$TUNNEL_ID" "$ROLE")"
+  REMOTE_VIRA7_IP="$(vira7_remote_inner_ip_for_role "$TUNNEL_ID" "$ROLE")"
   VIRA7_PORT="${VIRA7_PORT:-$(vira7_default_port "$TUNNEL_ID")}" 
   VIRA7_MTU="${VIRA7_MTU:-$VIRA7_DEFAULT_MTU}"
+  VIRA7_KEEPALIVE="${VIRA7_KEEPALIVE:-$VIRA7_DEFAULT_KEEPALIVE}"
+  VIRA7_BUFFER_SIZE="${VIRA7_BUFFER_SIZE:-$VIRA7_DEFAULT_BUFFER_SIZE}"
+  VIRA7_QUEUE_LEN="${VIRA7_QUEUE_LEN:-$VIRA7_DEFAULT_QUEUE_LEN}"
   VIRA7_CHECKSUM="${VIRA7_CHECKSUM:-$VIRA7_DEFAULT_CHECKSUM}"
   VIRA7_VERIFY_CHECKSUM="${VIRA7_VERIFY_CHECKSUM:-$VIRA7_DEFAULT_VERIFY_CHECKSUM}"
   VIRA7_BATCH="${VIRA7_BATCH:-$VIRA7_DEFAULT_BATCH}"
+  VIRA7_PEER_LOCK="${VIRA7_PEER_LOCK:-$VIRA7_DEFAULT_PEER_LOCK}"
+  VIRA7_PEER_TIMEOUT="${VIRA7_PEER_TIMEOUT:-$VIRA7_DEFAULT_PEER_TIMEOUT}"
+  VIRA7_RECONNECT_TIMEOUT="${VIRA7_RECONNECT_TIMEOUT:-$VIRA7_DEFAULT_RECONNECT_TIMEOUT}"
 
-  echo "[*] Local server public IP: $LOCAL_PUBLIC_IP"
-  echo "[*] Tunnel type: Vira7 UDP-TUN"
+  echo "[*] Vira7 Stable version: $SCRIPT_VERSION"
+  echo "[*] Local bind IP: $LOCAL_PUBLIC_IP"
   echo "[*] Tunnel number: $TUNNEL_ID"
   echo "[*] Interface: $VIRA7_IFACE"
   echo "[*] Server role: $SERVER_ROLE"
-  echo "[*] Remote server public IP: $REMOTE_PUBLIC_IP"
-  echo "[*] Local Vira7 IP: $LOCAL_VIRA7_IP"
-  echo "[*] Remote Vira7 IP: $REMOTE_VIRA7_IP"
-  echo "[*] UDP Port: $VIRA7_PORT"
-  echo "[*] CPU mode: checksum=$VIRA7_CHECKSUM verify_checksum=$VIRA7_VERIFY_CHECKSUM batch=$VIRA7_BATCH"
+  echo "[*] Connection mode: $VIRA7_MODE ($VIRA7_DIRECTION direction)"
+  echo "[*] Remote public IP: $REMOTE_PUBLIC_IP"
+  echo "[*] Local/remote tunnel IP: $LOCAL_VIRA7_IP -> $REMOTE_VIRA7_IP"
+  echo "[*] UDP Port (must match both sides): $VIRA7_PORT"
+  echo "[*] MTU: $VIRA7_MTU | keepalive: ${VIRA7_KEEPALIVE}s | reconnect: ${VIRA7_RECONNECT_TIMEOUT}s"
 
   enable_ip_forward
+  vira7_tune_kernel "$TUNNEL_ID"
   modprobe tun || true
   vira7_compile_engine || return 1
+
+  file="$(vira7_config_file "$TUNNEL_ID")"
+  backup="${file}.last-good"
   vira7_save_config
   vira7_apply_firewall_rules "$TUNNEL_ID" || true
-  vira7_install_service "$TUNNEL_ID"
+  if vira7_install_service "$TUNNEL_ID"; then
+    return 0
+  fi
+
+  err_msg "New Vira7 configuration failed to start."
+  if [ -f "$backup" ]; then
+    warn_msg "Restoring the previous working Vira7 config..."
+    cp -f "$backup" "$file"
+    systemctl restart "$(vira7_service_name "$TUNNEL_ID")" 2>/dev/null || true
+  fi
+  return 1
 }
 
 vira7_menu_config_tunnel() {
-  show_header "Configure Vira7 UDP-TUN Tunnel"
+  show_header "Configure Vira7 Stable UDP-TUN"
   prompt_role || return
   local selected_role existing_local_ip existing_remote_ip existing_port existing_mtu
+  local existing_direction existing_keepalive existing_peer_lock existing_config_version direction_default direction_choice
   selected_role="$ROLE"
   echo
-  prompt_tunnel_id "Enter Vira7 tunnel number before IP [1-254]: " || return
-  existing_local_ip=""
-  existing_remote_ip=""
-  existing_port=""
-  existing_mtu=""
+  prompt_tunnel_id "Enter Vira7 tunnel number [1-254]: " || return
+
+  existing_local_ip=""; existing_remote_ip=""; existing_port=""; existing_mtu=""
+  existing_direction=""; existing_keepalive=""; existing_peer_lock=""; existing_config_version="1"
   if vira7_load_config "$TUNNEL_ID"; then
     existing_local_ip="${LOCAL_PUBLIC_IP:-}"
     existing_remote_ip="${REMOTE_PUBLIC_IP:-}"
     existing_port="${VIRA7_PORT:-}"
     existing_mtu="${VIRA7_MTU:-}"
+    existing_direction="${VIRA7_DIRECTION:-}"
+    existing_keepalive="${VIRA7_KEEPALIVE:-}"
+    existing_peer_lock="${VIRA7_PEER_LOCK:-}"
+    existing_config_version="${VIRA7_CONFIG_VERSION:-1}"
   fi
   ROLE="$selected_role"
+  if ! [[ "$existing_config_version" =~ ^[0-9]+$ ]] || [ "$existing_config_version" -lt 2 ]; then
+    # Old configs should migrate to the new stable defaults instead of silently keeping MTU 1400/keepalive 5.
+    existing_mtu=""
+    existing_keepalive=""
+    existing_peer_lock=""
+  fi
+
   echo
-  echo "Vira7 UDP-TUN tunnel $TUNNEL_ID plan:"
+  echo "Vira7 Stable tunnel $TUNNEL_ID plan:"
   echo "  Interface       : $(vira7_iface_name "$TUNNEL_ID")"
   echo "  Config file     : $(vira7_config_file "$TUNNEL_ID")"
   echo "  Service         : $(vira7_service_name "$TUNNEL_ID")"
-  echo "  Iran role IP    : 10.71.$TUNNEL_ID.1"
-  echo "  Kharej role IP  : 10.71.$TUNNEL_ID.2"
+  echo "  Iran tunnel IP  : 10.71.$TUNNEL_ID.1"
+  echo "  Kharej tunnel IP: 10.71.$TUNNEL_ID.2"
   echo
-  prompt_local_tunnel_ip "${existing_local_ip:-$(detect_local_public_ip || true)}" "Enter LOCAL server Public IPv4 for Vira7 UDP bind" || return
+  echo "Connection direction:"
+  echo "  1) Recommended: Iran=Client -> Kharej=Server (best for filtered/inbound-blocked Iran servers)"
+  echo "  2) Legacy: Iran=Server <- Kharej=Client (old behavior)"
+  direction_default=1
+  if [ "$existing_direction" = "legacy" ]; then
+    warn_msg "Existing tunnel uses legacy direction. For the connectivity fix, choose option 1 on BOTH servers."
+  fi
+  read -rp "Choose direction [1-2, default $direction_default] (00=menu): " direction_choice
+  if is_main_menu_token "$direction_choice"; then return_main_msg; return 99; fi
+  direction_choice="${direction_choice:-$direction_default}"
+  case "$direction_choice" in
+    1) VIRA7_DIRECTION="recommended" ;;
+    2) VIRA7_DIRECTION="legacy" ;;
+    *) err_msg "Invalid direction."; return 1 ;;
+  esac
+
+  echo
+  prompt_local_tunnel_ip "${existing_local_ip:-$(detect_local_public_ip || true)}" "Enter LOCAL bind IPv4 (use 0.0.0.0 for all local addresses)" || return
   echo
   prompt_remote_public_ip "$existing_remote_ip" || return
+
   echo
-  VIRA7_PORT="$(auto_select_udp_port "$(vira7_default_port "$TUNNEL_ID")" "$existing_port" "vira7" "$TUNNEL_ID")" || return
-  echo "Auto-selected Vira7 UDP port: $VIRA7_PORT"
+  echo "The UDP port MUST be exactly the same on both servers."
+  echo "If the default port is filtered, common alternatives to test are 443, 53, 8443 or 2087 UDP."
+  local port_default port_input
+  port_default="${existing_port:-$(vira7_default_port "$TUNNEL_ID")}"
+  read -rp "Enter Vira7 UDP port [$port_default] (00=menu): " port_input
+  if is_main_menu_token "$port_input"; then return_main_msg; return 99; fi
+  VIRA7_PORT="${port_input:-$port_default}"
+  vira7_validate_port_for_tunnel "$VIRA7_PORT" "$TUNNEL_ID" "$existing_port" || return
+
   read -rp "Enter Vira7 MTU [${existing_mtu:-$VIRA7_DEFAULT_MTU}] (00=menu): " VIRA7_MTU_INPUT
   if is_main_menu_token "$VIRA7_MTU_INPUT"; then return_main_msg; return 99; fi
   VIRA7_MTU="${VIRA7_MTU_INPUT:-${existing_mtu:-$VIRA7_DEFAULT_MTU}}"
   if ! [[ "$VIRA7_MTU" =~ ^[0-9]+$ ]] || [ "$VIRA7_MTU" -lt 576 ] || [ "$VIRA7_MTU" -gt 1600 ]; then
-    echo "Invalid MTU."
+    echo "Invalid MTU. Recommended value: 1280."
     return
   fi
-  # Safe CPU optimization: keep checksum generation for compatibility, skip expensive receive-side verification, use packet batching.
-  VIRA7_CHECKSUM="${VIRA7_CHECKSUM:-$VIRA7_DEFAULT_CHECKSUM}"
-  VIRA7_VERIFY_CHECKSUM="${VIRA7_VERIFY_CHECKSUM:-$VIRA7_DEFAULT_VERIFY_CHECKSUM}"
-  VIRA7_BATCH="${VIRA7_BATCH:-$VIRA7_DEFAULT_BATCH}"
-  vira7_create_tunnel 1 || echo "Vira7 tunnel creation failed"
+
+  VIRA7_KEEPALIVE="${existing_keepalive:-$VIRA7_DEFAULT_KEEPALIVE}"
+  VIRA7_BUFFER_SIZE="$VIRA7_DEFAULT_BUFFER_SIZE"
+  VIRA7_QUEUE_LEN="$VIRA7_DEFAULT_QUEUE_LEN"
+  VIRA7_CHECKSUM="$VIRA7_DEFAULT_CHECKSUM"
+  VIRA7_VERIFY_CHECKSUM="$VIRA7_DEFAULT_VERIFY_CHECKSUM"
+  VIRA7_BATCH="$VIRA7_DEFAULT_BATCH"
+  VIRA7_PEER_LOCK="${existing_peer_lock:-$VIRA7_DEFAULT_PEER_LOCK}"
+  VIRA7_PEER_TIMEOUT="$VIRA7_DEFAULT_PEER_TIMEOUT"
+  VIRA7_RECONNECT_TIMEOUT="$VIRA7_DEFAULT_RECONNECT_TIMEOUT"
+
+  vira7_create_tunnel 1 || echo "Vira7 tunnel creation/update failed"
 }
 
 vira7_collect_ids() {
@@ -2632,16 +2917,20 @@ vira7_collect_ids() {
 }
 
 vira7_list_tunnels() {
-  echo "Vira7 UDP-TUN tunnels:"
-  local ids id ifc state
+  echo "Vira7 Stable UDP-TUN tunnels:"
+  local ids id ifc state svc_state mode direction port mtu
   ids="$(vira7_collect_ids || true)"
   if [ -z "$ids" ]; then echo "  none"; return 0; fi
   while IFS= read -r id; do
     [ -n "$id" ] || continue
     ifc="$(vira7_iface_name "$id")"
-    state="inactive"
-    ip link show "$ifc" >/dev/null 2>&1 && state="active"
-    echo "  - tunnel $id | iface $ifc | $state | config: $(vira7_config_file "$id") | service: $(systemctl is-enabled "$(vira7_service_name "$id")" 2>/dev/null || true)"
+    state="inactive"; ip link show "$ifc" >/dev/null 2>&1 && state="active"
+    svc_state="$(systemctl is-active "$(vira7_service_name "$id")" 2>/dev/null || true)"
+    mode="?"; direction="?"; port="?"; mtu="?"
+    if vira7_load_config "$id"; then
+      mode="$VIRA7_MODE"; direction="$VIRA7_DIRECTION"; port="$VIRA7_PORT"; mtu="$VIRA7_MTU"
+    fi
+    echo "  - tunnel $id | $ifc | iface=$state service=$svc_state | mode=$mode/$direction | UDP=$port MTU=$mtu"
   done <<< "$ids"
 }
 
@@ -2660,19 +2949,19 @@ vira7_remove_one_tunnel() {
     while iptables -C FORWARD -i "$ifc" -j ACCEPT 2>/dev/null; do iptables -D FORWARD -i "$ifc" -j ACCEPT || break; done
     while iptables -C FORWARD -o "$ifc" -j ACCEPT 2>/dev/null; do iptables -D FORWARD -o "$ifc" -j ACCEPT || break; done
   fi
-  rm -f "$file" "/var/run/$ifc.pid"
+  rm -f "$file" "${file}.last-good" "/run/$ifc.pid" "$(vira7_stats_file "$id")"
   systemctl daemon-reload 2>/dev/null || true
   echo "[OK] Vira7 tunnel $id removed."
 }
 
 vira7_remove_menu() {
-  show_header "Remove Vira7 UDP-TUN Tunnel"
+  show_header "Remove Vira7 Stable UDP-TUN"
   vira7_list_tunnels
   echo
   local ids selected_id
   ids="$(vira7_collect_ids || true)"
   if [ -z "$ids" ]; then echo "No Vira7 tunnels found."; return; fi
-  read -rp "Enter Vira7 tunnel number to remove, for example 1, or 00=menu: " selected_id
+  read -rp "Enter Vira7 tunnel number to remove, or 00=menu: " selected_id
   if is_main_menu_token "$selected_id"; then return_main_msg; return 99; fi
   validate_tunnel_id "$selected_id" || { echo "Invalid tunnel number."; return; }
   if ! echo "$ids" | grep -qx "$selected_id"; then
@@ -2693,14 +2982,12 @@ vira7_restart_one_tunnel() {
     echo "No saved Vira7 configuration found for tunnel $id." >&2
     return 1
   fi
-  VIRA7_MODE="client"
-  if [ "${ROLE:-}" = "1" ]; then VIRA7_MODE="server"; fi
   [ -x "$VIRA7_BINARY" ] || vira7_compile_engine || return 1
   enable_ip_forward
+  vira7_tune_kernel "$id"
   vira7_apply_firewall_rules "$id" || true
   vira7_install_service "$id"
 }
-
 
 set_config_kv() {
   local file="$1" key="$2" value="$3"
@@ -2719,31 +3006,32 @@ vira7_optimize_cpu_one() {
   svc="$(vira7_service_name "$id")"
   [ -f "$file" ] || { echo "No Vira7 config found: $file" >&2; return 1; }
 
-  # Always safe: skip userspace receive checksum verification and batch packets.
-  # Fast mode additionally disables checksum generation; use it only when BOTH sides run this optimized engine.
   set_config_kv "$file" verify_checksum 0
+  set_config_kv "$file" VIRA7_VERIFY_CHECKSUM 0
   set_config_kv "$file" batch 128
+  set_config_kv "$file" VIRA7_BATCH 128
   if [ "$mode" = "fast" ]; then
     set_config_kv "$file" checksum 0
+    set_config_kv "$file" VIRA7_CHECKSUM 0
   else
     set_config_kv "$file" checksum 1
+    set_config_kv "$file" VIRA7_CHECKSUM 1
   fi
 
   echo "Recompiling optimized Vira7 engine..."
   vira7_compile_engine || return 1
-  enable_ip_forward
+  vira7_tune_kernel "$id"
   vira7_apply_firewall_rules "$id" || true
   systemctl daemon-reload 2>/dev/null || true
   systemctl enable "$svc" >/dev/null 2>&1 || true
   if systemctl restart "$svc"; then
     echo "[OK] Vira7 tunnel $id optimized and restarted. mode=$mode"
-    echo "Current CPU settings:"
     grep -E '^(checksum|verify_checksum|batch|mtu|port)=' "$file" || true
     return 0
   fi
   echo "[WARN] Restart failed. Last logs:" >&2
   systemctl status "$svc" --no-pager -l 2>/dev/null || true
-  journalctl -u "$svc" -n 40 --no-pager 2>/dev/null || true
+  journalctl -u "$svc" -n 50 --no-pager 2>/dev/null || true
   return 1
 }
 
@@ -2755,8 +3043,8 @@ vira7_optimize_cpu_menu() {
   read -rp "Enter Vira7 tunnel number to optimize, 0=all, 00=menu: " id
   if is_main_menu_token "$id"; then return_main_msg; return 99; fi
   echo
-  echo "1) Safe low CPU mode (compatible, recommended first)"
-  echo "2) Fast low CPU mode (must be applied on BOTH servers for this Vira7 tunnel)"
+  echo "1) Safe low CPU mode (compatible, recommended)"
+  echo "2) Fast low CPU mode (apply on BOTH servers)"
   echo "00) Back to main menu"
   read -rp "Choose CPU mode [1-2/00]: " mode_choice
   if is_main_menu_token "$mode_choice"; then return_main_msg; return 99; fi
@@ -2776,6 +3064,61 @@ vira7_optimize_cpu_menu() {
     vira7_optimize_cpu_one "$id" "$mode"
   fi
 }
+
+vira7_diagnostics_one() {
+  local id="$1" svc ifc stats now last age
+  validate_tunnel_id "$id" || return 1
+  svc="$(vira7_service_name "$id")"
+  ifc="$(vira7_iface_name "$id")"
+  stats="$(vira7_stats_file "$id")"
+  echo "============================================================"
+  echo "Vira7 tunnel $id diagnostics"
+  echo "Service: $svc"
+  if vira7_load_config "$id"; then
+    echo "Role/direction : $SERVER_ROLE / $VIRA7_MODE / $VIRA7_DIRECTION"
+    echo "Public path    : $LOCAL_PUBLIC_IP:$VIRA7_PORT -> $REMOTE_PUBLIC_IP:$VIRA7_PORT/UDP"
+    echo "Tunnel path    : $LOCAL_VIRA7_IP -> $REMOTE_VIRA7_IP"
+    echo "MTU/keepalive  : $VIRA7_MTU / ${VIRA7_KEEPALIVE}s"
+  else
+    echo "Config: missing"
+  fi
+  echo "Service state  : $(systemctl is-active "$svc" 2>/dev/null || true)"
+  echo "Enabled        : $(systemctl is-enabled "$svc" 2>/dev/null || true)"
+  ip -br addr show "$ifc" 2>/dev/null || echo "Interface: missing"
+  echo "UDP listener:"
+  ss -H -lunp 2>/dev/null | grep -E "(^|[:.])${VIRA7_PORT:-0}([[:space:]]|$)" || echo "  no matching UDP listener"
+  if [ -f "$stats" ]; then
+    echo "Engine stats:"
+    sed 's/^/  /' "$stats"
+    last="$(awk -F= '$1=="last_rx_epoch"{print $2}' "$stats" 2>/dev/null || true)"
+    if [[ "$last" =~ ^[0-9]+$ ]] && [ "$last" -gt 0 ]; then
+      now="$(date +%s)"; age=$((now - last)); echo "  last_rx_age_seconds=$age"
+    fi
+  else
+    echo "Engine stats: not created yet"
+  fi
+  echo "Ping remote tunnel IP:"
+  ping -c 4 -W 2 "${REMOTE_VIRA7_IP:-0.0.0.0}" || true
+  echo "Last service logs:"
+  journalctl -u "$svc" -n 30 --no-pager 2>/dev/null || true
+}
+
+vira7_diagnostics_menu() {
+  show_header "Vira7 Diagnostics"
+  vira7_list_tunnels
+  echo
+  local id ids one
+  read -rp "Enter Vira7 tunnel number, 0=all, 00=menu: " id
+  if is_main_menu_token "$id"; then return_main_msg; return 99; fi
+  if [ "$id" = "0" ]; then
+    ids="$(vira7_collect_ids || true)"
+    [ -n "$ids" ] || { echo "No Vira7 tunnels found."; return 0; }
+    while IFS= read -r one; do [ -n "$one" ] && vira7_diagnostics_one "$one"; done <<< "$ids"
+  else
+    vira7_diagnostics_one "$id"
+  fi
+}
+
 
 # -----------------------------
 # Shared helpers/menus
@@ -2840,7 +3183,7 @@ build_tunnel_inventory() {
   while IFS= read -r id; do
     [ -n "$id" ] || continue
     ifc="$(vira7_iface_name "$id")"
-    local_ip=""; target=""; local_pub=""; remote_pub=""; desc="Vira7 UDP-TUN"
+    local_ip=""; target=""; local_pub=""; remote_pub=""; desc="Vira7 Stable"
     if vira7_load_config "$id"; then
       local_ip="${LOCAL_VIRA7_IP:-${local_priv:-}}"
       target="${REMOTE_VIRA7_IP:-${remote_priv:-}}"
@@ -3057,6 +3400,7 @@ status_check() {
   case "$SELECTED_TUNNEL_TYPE" in
     gre) gre_status_check ;;
     wireguard) wg_status_check ;;
+    vira7) vira7_diagnostics_menu ;;
   esac
 }
 
@@ -3362,6 +3706,7 @@ reset_all_tunnels() {
 
   echo
   echo "Starting Vira7 tunnels..."
+  vira7_compile_engine || warn_msg "Could not rebuild the Vira7 engine before reset; existing binary will be used if available."
   ids="$(vira7_collect_ids || true)"
   while IFS= read -r id; do
     [ -n "$id" ] || continue
@@ -3872,7 +4217,7 @@ haproxy_menu() {
 }
 
 show_menu() {
-  show_header "GRE + WireGuard + Vira7 Tunnel Management"
+  show_header "GRE + WireGuard + Vira7 Stable Management"
   echo -e "${C_BOLD}${C_WHITE}Main Menu${C_RESET}"
   echo -e "  ${C_GREEN}1)${C_RESET} create/update tunnel"
   echo -e "  ${C_RED}2)${C_RESET} remove tunnel"
@@ -3880,10 +4225,11 @@ show_menu() {
   echo -e "  ${C_CYAN}4)${C_RESET} ping test tunnels"
   echo -e "  ${C_MAGENTA}5)${C_RESET} haproxy port manager"
   echo -e "  ${C_BLUE}6)${C_RESET} optimize Vira7 CPU"
+  echo -e "  ${C_CYAN}7)${C_RESET} Vira7 diagnostics / logs"
   echo -e "  ${C_DIM}00) Main menu / back${C_RESET}"
   echo -e "  ${C_DIM}0) Exit${C_RESET}"
   echo
-  read -rp "Choose an option [0-6]: " CHOICE
+  read -rp "Choose an option [0-7]: " CHOICE
   case "$CHOICE" in
     1) if menu_config_tunnel; then pause; fi ;;
     2) if remove_tun; then pause; fi ;;
@@ -3891,6 +4237,7 @@ show_menu() {
     4) if test_tunnels_menu; then pause; fi ;;
     5) haproxy_menu || true ;;
     6) if vira7_optimize_cpu_menu; then pause; fi ;;
+    7) if vira7_diagnostics_menu; then pause; fi ;;
     00) return_main_msg ;;
     0) echo "Bye"; exit 0 ;;
     *) err_msg "Invalid option"; sleep 1 ;;
@@ -3927,7 +4274,7 @@ if [[ "${1:-}" == "--service" ]]; then
       exit $?
       ;;
     *)
-      echo "Unknown service command. Use --service start-gre <id>." >&2
+      echo "Unknown service command. Supported: start-gre, firewall-wg, firewall-vira7, start-vira7." >&2
       exit 1
       ;;
   esac
