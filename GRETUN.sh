@@ -1,14 +1,12 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + WireGuard + Vira Hybrid + HAProxy multi-tunnel manager v10.0.0
+# GRE + WireGuard + Vira7 + HAProxy multi-tunnel manager v8.5-gre-key-fix
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
 # - Local tunnel/bind IPv4 can be selected manually for servers with multiple IPs
-# - v10 rewrites Vira from scratch with authenticated framing, ephemeral UDP client ports, and automatic TCP fallback
-
-SCRIPT_VERSION="10.0.0-vira-hybrid"
+# - v8.5-safe-remove-heal prevents removing active transports used by WireGuard and re-heals remaining tunnels after deletion
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -26,25 +24,18 @@ VIRA7_BINARY="/usr/local/bin/vira7-engine"
 VIRA7_SOURCE="$VIRA7_CONFIG_DIR/vira7_engine.c"
 VIRA7_SERVICE_TEMPLATE="/etc/systemd/system/vira7-tunnel@.service"
 VIRA7_IFACE_PREFIX="vira7"
-VIRA7_DEFAULT_MTU=1280
+VIRA7_DEFAULT_MTU=1400
 VIRA7_DEFAULT_PORT_BASE=5571
-VIRA7_DEFAULT_KEEPALIVE=3
-VIRA7_DEFAULT_BUFFER_SIZE=8388608
-VIRA7_DEFAULT_QUEUE_LEN=4000
-VIRA7_DEFAULT_TRANSPORT="auto"
-VIRA7_DEFAULT_LOCAL_PORT=0
-VIRA7_DEFAULT_HANDSHAKE_TIMEOUT=4
-VIRA7_DEFAULT_PEER_TIMEOUT=20
-VIRA7_DEFAULT_RECONNECT_INTERVAL=5
-# Backward-compatible variables retained for old configs/menu code.
+VIRA7_DEFAULT_KEEPALIVE=5
+VIRA7_DEFAULT_BUFFER_SIZE=2097152
+VIRA7_DEFAULT_QUEUE_LEN=1000
+# Vira7 CPU optimization defaults:
 # checksum=1 keeps packet format compatible with older engines.
 # verify_checksum=0 trusts UDP checksum and skips expensive userspace checksum validation on receive.
 # batch=128 drains packet bursts per select() wakeup and reduces syscall/loop overhead.
 VIRA7_DEFAULT_CHECKSUM=1
 VIRA7_DEFAULT_VERIFY_CHECKSUM=0
 VIRA7_DEFAULT_BATCH=128
-VIRA7_DEFAULT_PEER_LOCK=1
-VIRA7_DEFAULT_RECONNECT_TIMEOUT=$VIRA7_DEFAULT_RECONNECT_INTERVAL
 
 HAPROXY_CONFIG="/etc/haproxy/haproxy.cfg"
 HAPROXY_BACKUP_DIR="/etc/haproxy/gretun-backups"
@@ -217,7 +208,7 @@ ask_tunnel_type() {
   echo "Select tunnel type:"
   echo "1) Normal GRE tunnel"
   echo "2) WireGuard tunnel"
-  echo "3) Vira Hybrid auto UDP/TCP tunnel"
+  echo "3) Vira7 UDP-TUN tunnel"
   echo
   read -rp "Choose [1-3] (00=menu): " TUNNEL_TYPE_CHOICE
   if is_main_menu_token "$TUNNEL_TYPE_CHOICE"; then return_main_msg; return 99; fi
@@ -2006,7 +1997,7 @@ wg_remove_menu() {
 }
 
 # -----------------------------
-# Vira Hybrid Auto UDP/TCP helpers
+# Vira7 UDP-TUN helpers (type only, no Vira7 menu/status/log UI)
 # -----------------------------
 vira7_iface_name() {
   echo "${VIRA7_IFACE_PREFIX}$1"
@@ -2020,20 +2011,9 @@ vira7_service_name() {
   echo "vira7-tunnel@$1.service"
 }
 
-vira7_stats_file() {
-  echo "/run/vira7-$(vira7_iface_name "$1").stats"
-}
-
 vira7_default_port() {
   local id="$1"
   echo $((VIRA7_DEFAULT_PORT_BASE + id))
-}
-
-
-vira7_default_auth_key() {
-  local id="$1" port="$2"
-  # Matching identifier, not encryption. It is deterministic so both servers derive the same value.
-  printf 'gretun-vira-hybrid-v2-%s-%s' "$id" "$port"
 }
 
 vira7_inner_ip_for_role() {
@@ -2056,27 +2036,6 @@ vira7_remote_inner_ip_for_role() {
   fi
 }
 
-vira7_mode_for_role() {
-  local role="$1"
-  local direction="${2:-recommended}"
-  if [ "$direction" = "legacy" ]; then
-    if [ "$role" = "1" ]; then echo "server"; else echo "client"; fi
-  else
-    # Recommended for filtered networks: Iran initiates outbound UDP to Kharej.
-    if [ "$role" = "1" ]; then echo "client"; else echo "server"; fi
-  fi
-}
-
-vira7_infer_direction() {
-  local role="${1:-}"
-  local mode="${2:-}"
-  if { [ "$role" = "1" ] && [ "$mode" = "server" ]; } || { [ "$role" = "2" ] && [ "$mode" = "client" ]; }; then
-    echo "legacy"
-  else
-    echo "recommended"
-  fi
-}
-
 vira7_ensure_deps() {
   if command -v gcc >/dev/null 2>&1 && command -v ip >/dev/null 2>&1; then
     return 0
@@ -2084,35 +2043,14 @@ vira7_ensure_deps() {
   echo "Installing Vira7 build/runtime dependencies..."
   if command -v apt-get >/dev/null 2>&1; then
     apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential gcc iproute2 iptables kmod procps
+    DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential gcc iproute2 iptables kmod
   elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y gcc make iproute iptables kmod procps-ng
+    dnf install -y gcc make iproute iptables kmod
   elif command -v yum >/dev/null 2>&1; then
-    yum install -y gcc make iproute iptables kmod procps-ng
+    yum install -y gcc make iproute iptables kmod
   else
-    echo "No supported package manager found. Install gcc, iproute2, iptables, kmod and procps manually." >&2
+    echo "No supported package manager found. Install gcc, iproute2, iptables and kmod manually." >&2
     return 1
-  fi
-}
-
-vira7_tune_kernel() {
-  local id="${1:-}"
-  mkdir -p /etc/sysctl.d
-  cat > /etc/sysctl.d/99-vira7-stable.conf <<EOF_SYSCTL
-net.ipv4.ip_forward = 1
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-net.core.rmem_default = 4194304
-net.core.wmem_default = 4194304
-net.core.netdev_max_backlog = 16384
-net.ipv4.udp_rmem_min = 131072
-net.ipv4.udp_wmem_min = 131072
-net.ipv4.conf.all.rp_filter = 0
-net.ipv4.conf.default.rp_filter = 0
-EOF_SYSCTL
-  sysctl -p /etc/sysctl.d/99-vira7-stable.conf >/dev/null 2>&1 || true
-  if validate_tunnel_id "$id"; then
-    sysctl -w "net.ipv4.conf.$(vira7_iface_name "$id").rp_filter=0" >/dev/null 2>&1 || true
   fi
 }
 
@@ -2120,267 +2058,93 @@ vira7_compile_engine() {
   vira7_ensure_deps || return 1
   mkdir -p "$VIRA7_CONFIG_DIR"
   cat > "$VIRA7_SOURCE" <<'ENGINEEOF'
-#define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/if_tun.h>
 #include <net/if.h>
 #include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <poll.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
 
-#define ENGINE_NAME "Vira Hybrid"
-#define ENGINE_VERSION "10.0.0"
 #define TUN_DEVICE "/dev/net/tun"
-#define PROTO_MAGIC 0x56485232U /* VHR2 */
-#define PROTO_VERSION 2U
-#define HEADER_SIZE 40U
-#define MAX_PAYLOAD 9000U
-#define MAX_PACKET (HEADER_SIZE + MAX_PAYLOAD)
-#define TCP_RX_CAP (MAX_PACKET * 4U + 16U)
+#define MAX_PKT_SIZE 2000
+#define VIRA7_MAGIC 0x5637
+#define PKT_DATA 1
+#define PKT_KEEPALIVE 2
+#define PKT_ACK 3
 
-#define TYPE_HELLO 1U
-#define TYPE_HELLO_ACK 2U
-#define TYPE_DATA 3U
-#define TYPE_PING 4U
-#define TYPE_PONG 5U
-
-typedef enum {
-    ACTIVE_NONE = 0,
-    ACTIVE_UDP = 1,
-    ACTIVE_TCP = 2
-} active_transport_t;
+typedef struct __attribute__((packed)) {
+    uint16_t magic;
+    uint16_t type;
+    uint32_t seq;
+    uint16_t length;
+    uint16_t checksum;
+} v7_hdr_t;
 
 typedef struct {
     char iface[IFNAMSIZ];
     char mode[16];
-    char transport[16];
     char bind_ip[64];
     char remote_ip[64];
     char local_priv[64];
     char remote_priv[64];
-    char auth_key[160];
-    int tunnel_id;
     int port;
-    int local_port;
     int mtu;
     int keepalive;
-    int handshake_timeout;
-    int peer_timeout;
-    int reconnect_interval;
     int buffer_size;
     int queue_len;
-    int peer_lock;
-    int stats_interval;
-} config_t;
+    int checksum;
+    int verify_checksum;
+    int batch;
+} v7_config_t;
 
-typedef struct {
-    uint8_t data[TCP_RX_CAP];
-    size_t used;
-} tcp_rx_buffer_t;
+static volatile sig_atomic_t running = 1;
+static uint32_t seqno = 1;
+static int g_send_checksum = 1;
+static int g_verify_checksum = 0;
 
-typedef struct {
-    config_t cfg;
-    int tun_fd;
-    int udp_fd;
-    int tcp_listen_fd;
-    int tcp_fd;
-    tcp_rx_buffer_t tcp_rx;
-    struct sockaddr_in configured_remote;
-    struct sockaddr_in udp_peer;
-    struct sockaddr_in tcp_peer;
-    int udp_peer_known;
-    int tcp_peer_known;
-    int tcp_authenticated;
-    active_transport_t active;
-    uint64_t cookie;
-    uint64_t session_nonce;
-    uint32_t seq;
-    int64_t started_ms;
-    int64_t last_rx_ms;
-    int64_t last_tx_ms;
-    int64_t last_hello_udp_ms;
-    int64_t last_tcp_attempt_ms;
-    int64_t tcp_connected_ms;
-    int64_t last_stats_ms;
-    unsigned long long tx_packets;
-    unsigned long long rx_packets;
-    unsigned long long tx_bytes;
-    unsigned long long rx_bytes;
-    unsigned long long drops;
-    unsigned long long reconnects;
-    unsigned long long fallback_count;
-    unsigned long long udp_handshakes;
-    unsigned long long tcp_handshakes;
-} app_t;
-
-static volatile sig_atomic_t g_running = 1;
-
-static void signal_handler(int sig) {
-    (void)sig;
-    g_running = 0;
-}
-
-static int64_t monotonic_ms(void) {
-    struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
-    return (int64_t)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
-}
-
-static uint64_t random_u64(void) {
-    uint64_t v = 0;
-    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
-    if (fd >= 0) {
-        ssize_t n = read(fd, &v, sizeof(v));
-        close(fd);
-        if (n == (ssize_t)sizeof(v) && v != 0) return v;
-    }
-    v = ((uint64_t)time(NULL) << 32) ^ (uint64_t)getpid() ^ (uint64_t)monotonic_ms();
-    return v ? v : 1ULL;
-}
+static void on_signal(int sig) { (void)sig; running = 0; }
 
 static void trim(char *s) {
     char *p = s;
     while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
-    if (p != s) memmove(s, p, strlen(p) + 1U);
+    if (p != s) memmove(s, p, strlen(p) + 1);
     size_t n = strlen(s);
-    while (n > 0U && (s[n - 1U] == ' ' || s[n - 1U] == '\t' || s[n - 1U] == '\r' || s[n - 1U] == '\n')) {
-        s[--n] = '\0';
-    }
+    while (n && (s[n-1] == ' ' || s[n-1] == '\t' || s[n-1] == '\r' || s[n-1] == '\n')) s[--n] = 0;
 }
 
-static uint64_t fnv1a64(const char *s) {
-    uint64_t h = 1469598103934665603ULL;
-    while (*s) {
-        h ^= (uint8_t)*s++;
-        h *= 1099511628211ULL;
-    }
-    return h;
-}
-
-static uint32_t crc32_bytes(const uint8_t *data, size_t len) {
-    uint32_t crc = 0xffffffffU;
+static uint16_t csum16(const uint8_t *buf, size_t len) {
+    uint32_t sum = 0;
     for (size_t i = 0; i < len; i++) {
-        crc ^= data[i];
-        for (int bit = 0; bit < 8; bit++) {
-            uint32_t mask = (uint32_t)-(int32_t)(crc & 1U);
-            crc = (crc >> 1U) ^ (0xedb88320U & mask);
-        }
+        sum += buf[i];
+        sum = (sum & 0xffffU) + (sum >> 16);
     }
-    return ~crc;
+    return (uint16_t)(~sum & 0xffffU);
 }
 
-static void put_u16(uint8_t *p, uint16_t v) {
-    v = htons(v);
-    memcpy(p, &v, sizeof(v));
-}
-
-static void put_u32(uint8_t *p, uint32_t v) {
-    v = htonl(v);
-    memcpy(p, &v, sizeof(v));
-}
-
-static void put_u64(uint8_t *p, uint64_t v) {
-    uint32_t hi = htonl((uint32_t)(v >> 32));
-    uint32_t lo = htonl((uint32_t)(v & 0xffffffffULL));
-    memcpy(p, &hi, sizeof(hi));
-    memcpy(p + 4, &lo, sizeof(lo));
-}
-
-static uint16_t get_u16(const uint8_t *p) {
-    uint16_t v;
-    memcpy(&v, p, sizeof(v));
-    return ntohs(v);
-}
-
-static uint32_t get_u32(const uint8_t *p) {
-    uint32_t v;
-    memcpy(&v, p, sizeof(v));
-    return ntohl(v);
-}
-
-static uint64_t get_u64(const uint8_t *p) {
-    uint32_t hi, lo;
-    memcpy(&hi, p, sizeof(hi));
-    memcpy(&lo, p + 4, sizeof(lo));
-    return ((uint64_t)ntohl(hi) << 32) | ntohl(lo);
-}
-
-static int build_packet(uint8_t *out, size_t out_cap, uint8_t type, uint32_t tunnel_id,
-                        uint64_t cookie, uint64_t nonce, uint32_t seq,
-                        const uint8_t *payload, uint16_t payload_len) {
-    size_t total = HEADER_SIZE + payload_len;
-    if (!out || total > out_cap || payload_len > MAX_PAYLOAD) return -1;
-    memset(out, 0, HEADER_SIZE);
-    put_u32(out + 0, PROTO_MAGIC);
-    out[4] = PROTO_VERSION;
-    out[5] = type;
-    put_u16(out + 6, 0U);
-    put_u32(out + 8, tunnel_id);
-    put_u64(out + 12, cookie);
-    put_u64(out + 20, nonce);
-    put_u32(out + 28, seq);
-    put_u16(out + 32, payload_len);
-    put_u16(out + 34, 0U);
-    put_u32(out + 36, 0U);
-    if (payload_len > 0U && payload) memcpy(out + HEADER_SIZE, payload, payload_len);
-    put_u32(out + 36, crc32_bytes(out, total));
-    return (int)total;
-}
-
-static int parse_packet(const uint8_t *buf, size_t len, uint32_t expected_tunnel,
-                        uint64_t expected_cookie, uint8_t *type, uint64_t *nonce,
-                        uint32_t *seq, const uint8_t **payload, uint16_t *payload_len) {
-    if (!buf || len < HEADER_SIZE || len > MAX_PACKET) return -1;
-    if (get_u32(buf + 0) != PROTO_MAGIC || buf[4] != PROTO_VERSION) return -1;
-    if (get_u32(buf + 8) != expected_tunnel || get_u64(buf + 12) != expected_cookie) return -1;
-    uint16_t plen = get_u16(buf + 32);
-    if (HEADER_SIZE + (size_t)plen != len || plen > MAX_PAYLOAD) return -1;
-    uint8_t temp[MAX_PACKET];
-    memcpy(temp, buf, len);
-    uint32_t got_crc = get_u32(temp + 36);
-    put_u32(temp + 36, 0U);
-    if (got_crc != crc32_bytes(temp, len)) return -1;
-    uint8_t t = buf[5];
-    if (t < TYPE_HELLO || t > TYPE_PONG) return -1;
-    *type = t;
-    *nonce = get_u64(buf + 20);
-    *seq = get_u32(buf + 28);
-    *payload_len = plen;
-    *payload = buf + HEADER_SIZE;
-    return 0;
-}
-
-static int load_config(const char *path, config_t *c) {
+static int load_config(const char *path, v7_config_t *c) {
     memset(c, 0, sizeof(*c));
     snprintf(c->iface, sizeof(c->iface), "vira7");
     snprintf(c->mode, sizeof(c->mode), "client");
-    snprintf(c->transport, sizeof(c->transport), "auto");
-    snprintf(c->bind_ip, sizeof(c->bind_ip), "0.0.0.0");
-    c->tunnel_id = 1;
-    c->port = 5572;
-    c->local_port = 0;
-    c->mtu = 1280;
-    c->keepalive = 3;
-    c->handshake_timeout = 4;
-    c->peer_timeout = 20;
-    c->reconnect_interval = 5;
-    c->buffer_size = 8388608;
-    c->queue_len = 4000;
-    c->peer_lock = 1;
-    c->stats_interval = 3;
+    c->port = 5571;
+    c->mtu = 1400;
+    c->keepalive = 5;
+    c->buffer_size = 2097152;
+    c->queue_len = 1000;
+    c->checksum = 1;
+    c->verify_checksum = 0;
+    c->batch = 128;
 
     FILE *f = fopen(path, "r");
     if (!f) return -1;
@@ -2390,903 +2154,238 @@ static int load_config(const char *path, config_t *c) {
         if (!line[0] || line[0] == '#') continue;
         char *eq = strchr(line, '=');
         if (!eq) continue;
-        *eq = '\0';
+        *eq = 0;
         char *key = line;
         char *val = eq + 1;
         trim(key);
         trim(val);
         if (!strcmp(key, "iface")) snprintf(c->iface, sizeof(c->iface), "%s", val);
         else if (!strcmp(key, "mode")) snprintf(c->mode, sizeof(c->mode), "%s", val);
-        else if (!strcmp(key, "transport")) snprintf(c->transport, sizeof(c->transport), "%s", val);
         else if (!strcmp(key, "bind_ip")) snprintf(c->bind_ip, sizeof(c->bind_ip), "%s", val);
         else if (!strcmp(key, "remote_ip")) snprintf(c->remote_ip, sizeof(c->remote_ip), "%s", val);
         else if (!strcmp(key, "local_priv")) snprintf(c->local_priv, sizeof(c->local_priv), "%s", val);
         else if (!strcmp(key, "remote_priv")) snprintf(c->remote_priv, sizeof(c->remote_priv), "%s", val);
-        else if (!strcmp(key, "auth_key")) snprintf(c->auth_key, sizeof(c->auth_key), "%s", val);
-        else if (!strcmp(key, "tunnel_id")) c->tunnel_id = atoi(val);
         else if (!strcmp(key, "port")) c->port = atoi(val);
-        else if (!strcmp(key, "local_port")) c->local_port = atoi(val);
         else if (!strcmp(key, "mtu")) c->mtu = atoi(val);
         else if (!strcmp(key, "keepalive")) c->keepalive = atoi(val);
-        else if (!strcmp(key, "handshake_timeout")) c->handshake_timeout = atoi(val);
-        else if (!strcmp(key, "peer_timeout")) c->peer_timeout = atoi(val);
-        else if (!strcmp(key, "reconnect_interval")) c->reconnect_interval = atoi(val);
         else if (!strcmp(key, "buffer_size")) c->buffer_size = atoi(val);
         else if (!strcmp(key, "queue_len")) c->queue_len = atoi(val);
-        else if (!strcmp(key, "peer_lock")) c->peer_lock = atoi(val);
-        else if (!strcmp(key, "stats_interval")) c->stats_interval = atoi(val);
+        else if (!strcmp(key, "checksum")) c->checksum = atoi(val);
+        else if (!strcmp(key, "verify_checksum")) c->verify_checksum = atoi(val);
+        else if (!strcmp(key, "batch")) c->batch = atoi(val);
     }
     fclose(f);
-
-    if (strcmp(c->mode, "client") && strcmp(c->mode, "server")) return -1;
-    if (strcmp(c->transport, "auto") && strcmp(c->transport, "udp") && strcmp(c->transport, "tcp")) return -1;
-    if (!c->remote_ip[0] || !c->local_priv[0] || !c->remote_priv[0] || !c->auth_key[0]) return -1;
-    if (c->tunnel_id < 1 || c->tunnel_id > 65535) return -1;
-    if (c->port < 1 || c->port > 65535) return -1;
-    if (c->local_port < 0 || c->local_port > 65535) return -1;
-    if (c->mtu < 576 || c->mtu > (int)MAX_PAYLOAD) c->mtu = 1280;
-    if (c->keepalive < 1 || c->keepalive > 60) c->keepalive = 3;
-    if (c->handshake_timeout < 2 || c->handshake_timeout > 60) c->handshake_timeout = 4;
-    if (c->peer_timeout < 8 || c->peer_timeout > 300) c->peer_timeout = 20;
-    if (c->reconnect_interval < 2 || c->reconnect_interval > 60) c->reconnect_interval = 5;
-    if (c->buffer_size < 262144) c->buffer_size = 8388608;
-    if (c->queue_len < 100) c->queue_len = 4000;
-    c->peer_lock = c->peer_lock ? 1 : 0;
-    if (c->stats_interval < 1 || c->stats_interval > 60) c->stats_interval = 3;
+    if (!c->local_priv[0] || !c->remote_priv[0] || c->port <= 0 || c->port > 65535) return -1;
+    if (!strcmp(c->mode, "client") && !c->remote_ip[0]) return -1;
+    if (c->mtu < 576 || c->mtu > 1600) c->mtu = 1400;
+    if (c->keepalive < 1 || c->keepalive > 60) c->keepalive = 5;
+    if (c->queue_len < 100) c->queue_len = 1000;
+    if (c->buffer_size < 65536) c->buffer_size = 2097152;
+    c->checksum = c->checksum ? 1 : 0;
+    c->verify_checksum = c->verify_checksum ? 1 : 0;
+    if (c->batch < 1) c->batch = 1;
+    if (c->batch > 512) c->batch = 512;
     return 0;
 }
 
-static int ipv4_matches(const config_t *c, const struct sockaddr_in *peer) {
-    if (!c->peer_lock) return 1;
-    struct in_addr expected;
-    if (inet_pton(AF_INET, c->remote_ip, &expected) != 1) return 0;
-    return expected.s_addr == peer->sin_addr.s_addr;
-}
-
-static void endpoint_to_string(const struct sockaddr_in *addr, int known, char *out, size_t out_len) {
-    if (!known || !addr) {
-        snprintf(out, out_len, "unknown");
-        return;
-    }
-    char ip[INET_ADDRSTRLEN] = "unknown";
-    (void)inet_ntop(AF_INET, &addr->sin_addr, ip, sizeof(ip));
-    snprintf(out, out_len, "%s:%u", ip, (unsigned)ntohs(addr->sin_port));
-}
-
-static int set_nonblocking(int fd, int enabled) {
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags < 0) return -1;
-    if (enabled) flags |= O_NONBLOCK;
-    else flags &= ~O_NONBLOCK;
-    return fcntl(fd, F_SETFL, flags);
-}
-
-static void set_socket_buffers(int fd, int size) {
-    (void)setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size));
-    (void)setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &size, sizeof(size));
-}
-
-static void set_tcp_options(int fd, int buffer_size) {
-    int yes = 1;
-    int idle = 10, intvl = 3, count = 3;
-    (void)setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
-    (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
-#ifdef TCP_KEEPIDLE
-    (void)setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
-#endif
-#ifdef TCP_KEEPINTVL
-    (void)setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
-#endif
-#ifdef TCP_KEEPCNT
-    (void)setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(count));
-#endif
-    set_socket_buffers(fd, buffer_size);
-    struct timeval tv = {2, 0};
-    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-}
-
-static int bind_ipv4_socket(int fd, const char *bind_ip, int port) {
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons((uint16_t)port);
-    if (bind_ip[0] && strcmp(bind_ip, "0.0.0.0")) {
-        if (inet_pton(AF_INET, bind_ip, &addr.sin_addr) != 1) return -1;
-    } else {
-        addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    }
-    return bind(fd, (struct sockaddr *)&addr, sizeof(addr));
-}
-
-static int create_udp_socket(const config_t *c) {
-    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-    if (fd < 0) return -1;
-    int yes = 1;
-    (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-    set_socket_buffers(fd, c->buffer_size);
-#ifdef IP_MTU_DISCOVER
-    int pmtu = IP_PMTUDISC_DONT;
-    (void)setsockopt(fd, IPPROTO_IP, IP_MTU_DISCOVER, &pmtu, sizeof(pmtu));
-#endif
-    int bind_port = !strcmp(c->mode, "server") ? c->port : c->local_port;
-    if (bind_ipv4_socket(fd, c->bind_ip, bind_port) != 0) {
-        close(fd);
-        return -1;
-    }
-    if (set_nonblocking(fd, 1) != 0) {
-        close(fd);
-        return -1;
-    }
-    return fd;
-}
-
-static int create_tcp_listener(const config_t *c) {
-    int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (fd < 0) return -1;
-    int yes = 1;
-    (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-    set_socket_buffers(fd, c->buffer_size);
-    if (bind_ipv4_socket(fd, c->bind_ip, c->port) != 0 || listen(fd, 16) != 0 || set_nonblocking(fd, 1) != 0) {
-        close(fd);
-        return -1;
-    }
-    return fd;
-}
-
-static int connect_tcp_client(const config_t *c, const struct sockaddr_in *remote, struct sockaddr_in *peer_out) {
-    int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (fd < 0) return -1;
-    set_tcp_options(fd, c->buffer_size);
-    if (bind_ipv4_socket(fd, c->bind_ip, 0) != 0) {
-        close(fd);
-        return -1;
-    }
-    if (set_nonblocking(fd, 1) != 0) {
-        close(fd);
-        return -1;
-    }
-    int rc = connect(fd, (const struct sockaddr *)remote, sizeof(*remote));
-    if (rc != 0 && errno != EINPROGRESS) {
-        close(fd);
-        return -1;
-    }
-    if (rc != 0) {
-        struct pollfd pfd = {.fd = fd, .events = POLLOUT};
-        rc = poll(&pfd, 1, 3000);
-        if (rc <= 0) {
-            close(fd);
-            return -1;
-        }
-        int so_error = 0;
-        socklen_t slen = sizeof(so_error);
-        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &slen) != 0 || so_error != 0) {
-            close(fd);
-            return -1;
-        }
-    }
-    if (set_nonblocking(fd, 0) != 0) {
-        close(fd);
-        return -1;
-    }
-    if (peer_out) *peer_out = *remote;
-    return fd;
-}
-
 static int tun_alloc_named(const char *dev) {
-    int fd = open(TUN_DEVICE, O_RDWR | O_CLOEXEC);
-    if (fd < 0) return -1;
     struct ifreq ifr;
+    int fd = open(TUN_DEVICE, O_RDWR);
+    if (fd < 0) return -1;
     memset(&ifr, 0, sizeof(ifr));
     ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
     snprintf(ifr.ifr_name, IFNAMSIZ, "%s", dev);
-    if (ioctl(fd, TUNSETIFF, &ifr) < 0) {
-        close(fd);
-        return -1;
-    }
-    if (set_nonblocking(fd, 1) != 0) {
-        close(fd);
-        return -1;
-    }
+    if (ioctl(fd, TUNSETIFF, &ifr) < 0) { close(fd); return -1; }
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
     return fd;
 }
 
 static void cleanup_iface(const char *iface) {
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "ip link del dev %s >/dev/null 2>&1 || true", iface);
-    (void)system(cmd);
+    snprintf(cmd, sizeof(cmd), "ip link del %s 2>/dev/null", iface);
+    system(cmd);
 }
 
-static int configure_tun(const config_t *c) {
+static int configure_tun(const v7_config_t *c) {
     char cmd[512];
     snprintf(cmd, sizeof(cmd), "ip link set dev %s up mtu %d txqueuelen %d", c->iface, c->mtu, c->queue_len);
     if (system(cmd) != 0) return -1;
-    snprintf(cmd, sizeof(cmd), "ip addr replace %s/32 peer %s dev %s", c->local_priv, c->remote_priv, c->iface);
-    if (system(cmd) != 0) return -1;
-    snprintf(cmd, sizeof(cmd), "sysctl -w net.ipv4.conf.%s.rp_filter=0 >/dev/null 2>&1 || true", c->iface);
-    (void)system(cmd);
-    return 0;
+    snprintf(cmd, sizeof(cmd), "ip addr add %s/32 peer %s dev %s 2>/dev/null || true", c->local_priv, c->remote_priv, c->iface);
+    return system(cmd) == 0 ? 0 : -1;
 }
 
-static int send_all(int fd, const uint8_t *buf, size_t len) {
-    size_t off = 0;
-    while (off < len) {
-        ssize_t n = send(fd, buf + off, len - off, MSG_NOSIGNAL);
-        if (n > 0) {
-            off += (size_t)n;
-            continue;
-        }
-        if (n < 0 && errno == EINTR) continue;
-        return -1;
-    }
-    return 0;
-}
-
-static int tcp_send_frame(int fd, const uint8_t *packet, size_t packet_len) {
-    if (fd < 0 || packet_len < HEADER_SIZE || packet_len > MAX_PACKET) return -1;
-    uint8_t prefix[4];
-    put_u32(prefix, (uint32_t)packet_len);
-    if (send_all(fd, prefix, sizeof(prefix)) != 0) return -1;
-    return send_all(fd, packet, packet_len);
-}
-
-static int udp_send_packet(int fd, const struct sockaddr_in *dst, const uint8_t *packet, size_t packet_len) {
-    if (fd < 0 || !dst) return -1;
-    ssize_t n = sendto(fd, packet, packet_len, MSG_NOSIGNAL,
-                       (const struct sockaddr *)dst, sizeof(*dst));
-    return n == (ssize_t)packet_len ? 0 : -1;
-}
-
-static const char *active_name(active_transport_t active) {
-    if (active == ACTIVE_UDP) return "udp";
-    if (active == ACTIVE_TCP) return "tcp";
-    return "none";
-}
-
-static int transport_enabled(const config_t *c, const char *name) {
-    return !strcmp(c->transport, "auto") || !strcmp(c->transport, name);
-}
-
-static void close_tcp(app_t *a) {
-    if (a->tcp_fd >= 0) close(a->tcp_fd);
-    a->tcp_fd = -1;
-    a->tcp_rx.used = 0;
-    a->tcp_peer_known = 0;
-    a->tcp_authenticated = 0;
-    if (a->active == ACTIVE_TCP) a->active = ACTIVE_NONE;
-}
-
-static int send_control_or_data(app_t *a, active_transport_t via, uint8_t type,
-                                const uint8_t *payload, uint16_t payload_len) {
-    uint8_t packet[MAX_PACKET];
-    int packet_len = build_packet(packet, sizeof(packet), type, (uint32_t)a->cfg.tunnel_id,
-                                  a->cookie, a->session_nonce, a->seq++, payload, payload_len);
-    if (packet_len < 0) return -1;
-    int rc = -1;
-    if (via == ACTIVE_UDP && a->udp_peer_known) {
-        rc = udp_send_packet(a->udp_fd, &a->udp_peer, packet, (size_t)packet_len);
-    } else if (via == ACTIVE_TCP && a->tcp_fd >= 0) {
-        rc = tcp_send_frame(a->tcp_fd, packet, (size_t)packet_len);
-    }
-    if (rc == 0) {
-        a->tx_packets++;
-        a->tx_bytes += (unsigned long long)payload_len;
-        a->last_tx_ms = monotonic_ms();
-    } else {
-        a->drops++;
-        if (via == ACTIVE_TCP) close_tcp(a);
-    }
-    return rc;
-}
-
-static int write_tun_packet(app_t *a, const uint8_t *payload, uint16_t payload_len) {
-    if (payload_len == 0U) return 0;
-    uint8_t version = payload[0] >> 4U;
-    if (version != 4U && version != 6U) return -1;
-    ssize_t n;
-    do {
-        n = write(a->tun_fd, payload, payload_len);
-    } while (n < 0 && errno == EINTR);
-    return n == (ssize_t)payload_len ? 0 : -1;
-}
-
-static int send_hello(app_t *a, active_transport_t via) {
-    return send_control_or_data(a, via, TYPE_HELLO, NULL, 0U);
-}
-
-static int send_ack(app_t *a, active_transport_t via) {
-    return send_control_or_data(a, via, TYPE_HELLO_ACK, NULL, 0U);
-}
-
-static void activate_transport(app_t *a, active_transport_t via, int64_t now) {
-    if (a->active == via) {
-        a->last_rx_ms = now;
-        return;
-    }
-    if (a->active == ACTIVE_TCP && via == ACTIVE_UDP) return;
-    a->active = via;
-    a->last_rx_ms = now;
-    if (via == ACTIVE_UDP) a->udp_handshakes++;
-    if (via == ACTIVE_TCP) a->tcp_handshakes++;
-    fprintf(stderr, "%s: tunnel connected using %s\n", ENGINE_NAME, active_name(via));
-}
-
-static int process_packet(app_t *a, active_transport_t via,
-                          const struct sockaddr_in *sender, const uint8_t *buf, size_t len) {
-    uint8_t type;
-    uint64_t nonce;
-    uint32_t seq;
-    const uint8_t *payload;
-    uint16_t payload_len;
-    if (parse_packet(buf, len, (uint32_t)a->cfg.tunnel_id, a->cookie,
-                     &type, &nonce, &seq, &payload, &payload_len) != 0) {
-        a->drops++;
-        return -1;
-    }
-    (void)seq;
-    if (sender && !ipv4_matches(&a->cfg, sender)) {
-        a->drops++;
-        return -1;
-    }
-    int64_t now = monotonic_ms();
-
-    if (!strcmp(a->cfg.mode, "server")) {
-        if (type == TYPE_HELLO) {
-            if (via == ACTIVE_UDP) {
-                if (a->active == ACTIVE_TCP) return 0;
-                if (sender) {
-                    a->udp_peer = *sender;
-                    a->udp_peer_known = 1;
-                }
-            } else if (via == ACTIVE_TCP) {
-                /* TCP fallback is allowed to replace a half-open UDP session. */
-                a->tcp_authenticated = 1;
-            }
-            a->session_nonce = nonce;
-            activate_transport(a, via, now);
-            return send_ack(a, via);
-        }
-        if (nonce != a->session_nonce || a->active != via) {
-            a->drops++;
-            return -1;
-        }
-    } else {
-        if (nonce != a->session_nonce) {
-            a->drops++;
-            return -1;
-        }
-        if (type == TYPE_HELLO_ACK) {
-            if (via == ACTIVE_TCP) a->tcp_authenticated = 1;
-            activate_transport(a, via, now);
-            return 0;
-        }
-        if (a->active != via) {
-            a->drops++;
-            return -1;
-        }
-    }
-
-    a->last_rx_ms = now;
-    a->rx_packets++;
-    a->rx_bytes += payload_len;
-
-    if (type == TYPE_DATA) {
-        if (write_tun_packet(a, payload, payload_len) != 0) {
-            a->drops++;
-            return -1;
-        }
-    } else if (type == TYPE_PING) {
-        return send_control_or_data(a, via, TYPE_PONG, NULL, 0U);
-    }
-    return 0;
-}
-
-static int tcp_read_and_process(app_t *a) {
-    uint8_t chunk[16384];
-    for (;;) {
-        ssize_t n = recv(a->tcp_fd, chunk, sizeof(chunk), MSG_DONTWAIT);
-        if (n > 0) {
-            if (a->tcp_rx.used + (size_t)n > sizeof(a->tcp_rx.data)) return -1;
-            memcpy(a->tcp_rx.data + a->tcp_rx.used, chunk, (size_t)n);
-            a->tcp_rx.used += (size_t)n;
-            continue;
-        }
-        if (n == 0) return -1;
-        if (errno == EINTR) continue;
-        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-        return -1;
-    }
-
-    size_t offset = 0;
-    while (a->tcp_rx.used - offset >= 4U) {
-        uint32_t frame_len = get_u32(a->tcp_rx.data + offset);
-        if (frame_len < HEADER_SIZE || frame_len > MAX_PACKET) return -1;
-        if (a->tcp_rx.used - offset < 4U + frame_len) break;
-        if (process_packet(a, ACTIVE_TCP, a->tcp_peer_known ? &a->tcp_peer : NULL,
-                           a->tcp_rx.data + offset + 4U, frame_len) != 0) {
-            /* malformed frames are dropped; valid control errors do not tear down the stream */
-        }
-        offset += 4U + frame_len;
-    }
-    if (offset > 0U) {
-        memmove(a->tcp_rx.data, a->tcp_rx.data + offset, a->tcp_rx.used - offset);
-        a->tcp_rx.used -= offset;
-    }
-    return 0;
-}
-
-static void accept_tcp_client(app_t *a) {
-    for (;;) {
-        struct sockaddr_in peer;
-        socklen_t plen = sizeof(peer);
-        int fd = accept4(a->tcp_listen_fd, (struct sockaddr *)&peer, &plen, SOCK_CLOEXEC);
-        if (fd < 0) {
-            if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) return;
-            return;
-        }
-        if (!ipv4_matches(&a->cfg, &peer)) {
-            close(fd);
-            continue;
-        }
-        close_tcp(a);
-        set_tcp_options(fd, a->cfg.buffer_size);
-        a->tcp_fd = fd;
-        a->tcp_peer = peer;
-        a->tcp_peer_known = 1;
-        a->tcp_connected_ms = monotonic_ms();
-        a->tcp_rx.used = 0;
-        fprintf(stderr, "%s: accepted TCP fallback connection\n", ENGINE_NAME);
-        return;
-    }
-}
-
-static void receive_udp(app_t *a) {
-    uint8_t packet[MAX_PACKET];
-    for (;;) {
-        struct sockaddr_in sender;
-        socklen_t slen = sizeof(sender);
-        ssize_t n = recvfrom(a->udp_fd, packet, sizeof(packet), 0,
-                             (struct sockaddr *)&sender, &slen);
-        if (n > 0) {
-            if (!strcmp(a->cfg.mode, "client")) {
-                if (!ipv4_matches(&a->cfg, &sender)) {
-                    a->drops++;
-                    continue;
-                }
-                a->udp_peer = sender;
-                a->udp_peer_known = 1;
-            }
-            (void)process_packet(a, ACTIVE_UDP, &sender, packet, (size_t)n);
-            continue;
-        }
-        if (n < 0 && errno == EINTR) continue;
-        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
-        if (n < 0) a->drops++;
-        break;
-    }
-}
-
-static int connect_tcp_fallback(app_t *a) {
-    struct sockaddr_in peer;
-    int fd = connect_tcp_client(&a->cfg, &a->configured_remote, &peer);
-    a->last_tcp_attempt_ms = monotonic_ms();
+static int udp_socket_create(const v7_config_t *c) {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) return -1;
-    close_tcp(a);
-    a->tcp_fd = fd;
-    a->tcp_peer = peer;
-    a->tcp_peer_known = 1;
-    a->tcp_connected_ms = monotonic_ms();
-    a->tcp_rx.used = 0;
-    a->fallback_count++;
-    fprintf(stderr, "%s: UDP handshake unavailable; trying TCP fallback\n", ENGINE_NAME);
-    if (send_hello(a, ACTIVE_TCP) != 0) {
-        close_tcp(a);
-        return -1;
+    int yes = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &c->buffer_size, sizeof(c->buffer_size));
+    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &c->buffer_size, sizeof(c->buffer_size));
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)c->port);
+    if (c->bind_ip[0]) {
+        if (inet_pton(AF_INET, c->bind_ip, &addr.sin_addr) != 1) { close(fd); return -1; }
+    } else {
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
     }
-    return 0;
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) { close(fd); return -1; }
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    return fd;
 }
 
-static void reset_client_session(app_t *a) {
-    close_tcp(a);
-    a->active = ACTIVE_NONE;
-    a->session_nonce = random_u64();
-    a->last_rx_ms = monotonic_ms();
-    a->last_hello_udp_ms = 0;
-    a->started_ms = monotonic_ms();
-    a->reconnects++;
-    a->udp_peer = a->configured_remote;
-    a->udp_peer_known = 1;
-}
-
-static void write_stats(const app_t *a) {
-    char path[192], tmp[208], peer[96];
-    snprintf(path, sizeof(path), "/run/vira7-%s.stats", a->cfg.iface);
-    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
-    if (a->active == ACTIVE_UDP) endpoint_to_string(&a->udp_peer, a->udp_peer_known, peer, sizeof(peer));
-    else if (a->active == ACTIVE_TCP) endpoint_to_string(&a->tcp_peer, a->tcp_peer_known, peer, sizeof(peer));
-    else snprintf(peer, sizeof(peer), "unknown");
-    FILE *f = fopen(tmp, "w");
-    if (!f) return;
-    fprintf(f, "engine=%s\n", ENGINE_VERSION);
-    fprintf(f, "mode=%s\n", a->cfg.mode);
-    fprintf(f, "transport_mode=%s\n", a->cfg.transport);
-    fprintf(f, "active_transport=%s\n", active_name(a->active));
-    fprintf(f, "connected=%d\n", a->active != ACTIVE_NONE ? 1 : 0);
-    fprintf(f, "peer=%s\n", peer);
-    fprintf(f, "last_rx_epoch=%lld\n", (long long)time(NULL) - (long long)((monotonic_ms() - a->last_rx_ms) / 1000LL));
-    fprintf(f, "tx_packets=%llu\n", a->tx_packets);
-    fprintf(f, "rx_packets=%llu\n", a->rx_packets);
-    fprintf(f, "tx_bytes=%llu\n", a->tx_bytes);
-    fprintf(f, "rx_bytes=%llu\n", a->rx_bytes);
-    fprintf(f, "drops=%llu\n", a->drops);
-    fprintf(f, "reconnects=%llu\n", a->reconnects);
-    fprintf(f, "fallback_count=%llu\n", a->fallback_count);
-    fprintf(f, "udp_handshakes=%llu\n", a->udp_handshakes);
-    fprintf(f, "tcp_handshakes=%llu\n", a->tcp_handshakes);
-    fclose(f);
-    (void)rename(tmp, path);
-}
-
-static int initialize_app(app_t *a, const config_t *cfg) {
-    memset(a, 0, sizeof(*a));
-    a->cfg = *cfg;
-    a->tun_fd = -1;
-    a->udp_fd = -1;
-    a->tcp_listen_fd = -1;
-    a->tcp_fd = -1;
-    a->cookie = fnv1a64(cfg->auth_key) ^ ((uint64_t)(uint32_t)cfg->tunnel_id << 32);
-    a->session_nonce = random_u64();
-    a->seq = (uint32_t)random_u64();
-    a->started_ms = monotonic_ms();
-    a->last_rx_ms = a->started_ms;
-    a->last_tx_ms = a->started_ms;
-    a->last_hello_udp_ms = 0;
-    a->last_tcp_attempt_ms = 0;
-    a->last_stats_ms = 0;
-
-    memset(&a->configured_remote, 0, sizeof(a->configured_remote));
-    a->configured_remote.sin_family = AF_INET;
-    a->configured_remote.sin_port = htons((uint16_t)cfg->port);
-    if (inet_pton(AF_INET, cfg->remote_ip, &a->configured_remote.sin_addr) != 1) return -1;
-    a->udp_peer = a->configured_remote;
-    a->udp_peer_known = !strcmp(cfg->mode, "client") ? 1 : 0;
-    return 0;
-}
-
-static int recv_exact_test(int fd, uint8_t *buf, size_t len) {
-    size_t off = 0;
-    while (off < len) {
-        ssize_t n = recv(fd, buf + off, len - off, 0);
-        if (n > 0) { off += (size_t)n; continue; }
-        if (n < 0 && errno == EINTR) continue;
-        return -1;
+static int send_v7(int fd, const struct sockaddr_in *dst, uint16_t type, const uint8_t *payload, uint16_t len) {
+    uint8_t buf[sizeof(v7_hdr_t) + MAX_PKT_SIZE];
+    if (len > MAX_PKT_SIZE) return -1;
+    v7_hdr_t *h = (v7_hdr_t *)buf;
+    h->magic = htons(VIRA7_MAGIC);
+    h->type = htons(type);
+    h->seq = htonl(seqno++);
+    h->length = htons(len);
+    h->checksum = 0;
+    if (payload && len) memcpy(buf + sizeof(v7_hdr_t), payload, len);
+    if (g_send_checksum) {
+        h->checksum = htons(csum16(buf, sizeof(v7_hdr_t) + len));
+    } else {
+        h->checksum = 0;
     }
-    return 0;
+    ssize_t n = sendto(fd, buf, sizeof(v7_hdr_t) + len, 0, (const struct sockaddr *)dst, sizeof(*dst));
+    return n == (ssize_t)(sizeof(v7_hdr_t) + len) ? 0 : -1;
 }
 
-static int self_test(void) {
-    const char *key = "self-test-key";
-    uint64_t cookie = fnv1a64(key) ^ (42ULL << 32);
-    uint8_t packet[MAX_PACKET];
-    uint8_t payload_in[5] = {0x45, 1, 2, 3, 4};
-    int n = build_packet(packet, sizeof(packet), TYPE_DATA, 42U, cookie, 123456789ULL,
-                         77U, payload_in, sizeof(payload_in));
-    if (n <= 0) return 1;
-    uint8_t type;
-    uint64_t nonce;
-    uint32_t seq;
-    const uint8_t *payload;
-    uint16_t payload_len;
-    if (parse_packet(packet, (size_t)n, 42U, cookie, &type, &nonce, &seq,
-                     &payload, &payload_len) != 0) return 1;
-    if (type != TYPE_DATA || nonce != 123456789ULL || seq != 77U ||
-        payload_len != sizeof(payload_in) || memcmp(payload, payload_in, sizeof(payload_in)) != 0) return 1;
-    packet[n - 1] ^= 0x01U;
-    if (parse_packet(packet, (size_t)n, 42U, cookie, &type, &nonce, &seq,
-                     &payload, &payload_len) == 0) return 1;
-    packet[n - 1] ^= 0x01U;
-
-    /* UDP loopback handshake test. */
-    int ua = socket(AF_INET, SOCK_DGRAM, 0);
-    int ub = socket(AF_INET, SOCK_DGRAM, 0);
-    if (ua < 0 || ub < 0) return 1;
-    struct sockaddr_in aa, ab, sender;
-    socklen_t alen = sizeof(ab), slen = sizeof(sender);
-    memset(&aa, 0, sizeof(aa));
-    aa.sin_family = AF_INET; aa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    memset(&ab, 0, sizeof(ab));
-    ab.sin_family = AF_INET; ab.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (bind(ua, (struct sockaddr *)&aa, sizeof(aa)) != 0 ||
-        bind(ub, (struct sockaddr *)&ab, sizeof(ab)) != 0 ||
-        getsockname(ub, (struct sockaddr *)&ab, &alen) != 0) return 1;
-    int hello_len = build_packet(packet, sizeof(packet), TYPE_HELLO, 42U, cookie, 999ULL, 1U, NULL, 0U);
-    if (hello_len < 0 || udp_send_packet(ua, &ab, packet, (size_t)hello_len) != 0) return 1;
-    uint8_t recvbuf[MAX_PACKET];
-    ssize_t rn = recvfrom(ub, recvbuf, sizeof(recvbuf), 0, (struct sockaddr *)&sender, &slen);
-    if (rn <= 0 || parse_packet(recvbuf, (size_t)rn, 42U, cookie, &type, &nonce, &seq,
-                                &payload, &payload_len) != 0 || type != TYPE_HELLO || nonce != 999ULL) return 1;
-    int ack_len = build_packet(packet, sizeof(packet), TYPE_HELLO_ACK, 42U, cookie, 999ULL, 2U, NULL, 0U);
-    if (ack_len < 0 || udp_send_packet(ub, &sender, packet, (size_t)ack_len) != 0) return 1;
-    rn = recv(ua, recvbuf, sizeof(recvbuf), 0);
-    if (rn <= 0 || parse_packet(recvbuf, (size_t)rn, 42U, cookie, &type, &nonce, &seq,
-                                &payload, &payload_len) != 0 || type != TYPE_HELLO_ACK) return 1;
-    close(ua); close(ub);
-
-    /* TCP framing test. */
-    int sv[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return 1;
-    if (tcp_send_frame(sv[0], packet, (size_t)ack_len) != 0) return 1;
-    uint8_t prefix[4];
-    if (recv_exact_test(sv[1], prefix, sizeof(prefix)) != 0) return 1;
-    uint32_t framed_len = get_u32(prefix);
-    if (framed_len != (uint32_t)ack_len || recv_exact_test(sv[1], recvbuf, framed_len) != 0) return 1;
-    if (parse_packet(recvbuf, framed_len, 42U, cookie, &type, &nonce, &seq,
-                     &payload, &payload_len) != 0 || type != TYPE_HELLO_ACK) return 1;
-    close(sv[0]); close(sv[1]);
-
-    /* A valid TCP fallback must replace a half-open server UDP session. */
-    app_t a;
-    memset(&a, 0, sizeof(a));
-    snprintf(a.cfg.mode, sizeof(a.cfg.mode), "server");
-    a.active = ACTIVE_UDP;
-    activate_transport(&a, ACTIVE_TCP, monotonic_ms());
-    if (a.active != ACTIVE_TCP) return 1;
-
-    fprintf(stdout, "%s %s self-test: OK\n", ENGINE_NAME, ENGINE_VERSION);
+static int verify_packet(uint8_t *buf, ssize_t n, uint16_t *type, uint8_t **payload, uint16_t *len) {
+    if (n < (ssize_t)sizeof(v7_hdr_t)) return -1;
+    v7_hdr_t *h = (v7_hdr_t *)buf;
+    if (ntohs(h->magic) != VIRA7_MAGIC) return -1;
+    *len = ntohs(h->length);
+    if ((ssize_t)(sizeof(v7_hdr_t) + *len) != n || *len > MAX_PKT_SIZE) return -1;
+    uint16_t got = ntohs(h->checksum);
+    if (got != 0 && g_verify_checksum) {
+        h->checksum = 0;
+        uint16_t calc = csum16(buf, (size_t)n);
+        if (got != calc) return -1;
+    }
+    *type = ntohs(h->type);
+    *payload = buf + sizeof(v7_hdr_t);
     return 0;
-}
-
-static void usage(const char *argv0) {
-    fprintf(stderr, "Usage: %s <config> | --check-config <config> | --self-test | --version\n", argv0);
 }
 
 int main(int argc, char **argv) {
-    if (argc == 2 && !strcmp(argv[1], "--self-test")) return self_test();
-    if (argc == 2 && !strcmp(argv[1], "--version")) {
-        printf("%s %s\n", ENGINE_NAME, ENGINE_VERSION);
-        return 0;
-    }
-    if (argc == 3 && !strcmp(argv[1], "--check-config")) {
-        config_t cfg;
-        if (load_config(argv[2], &cfg) != 0) {
-            fprintf(stderr, "invalid config: %s\n", argv[2]);
-            return 1;
-        }
-        printf("config OK: mode=%s transport=%s port=%d iface=%s\n",
-               cfg.mode, cfg.transport, cfg.port, cfg.iface);
-        return 0;
-    }
-    if (argc != 2 || getuid() != 0) {
-        usage(argv[0]);
-        return 1;
-    }
-
-    config_t cfg;
-    if (load_config(argv[1], &cfg) != 0) {
-        fprintf(stderr, "%s: failed to load config %s\n", ENGINE_NAME, argv[1]);
-        return 1;
-    }
-
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
+    if (argc < 2 || getuid() != 0) return 1;
+    v7_config_t cfg;
+    if (load_config(argv[1], &cfg) != 0) return 1;
+    g_send_checksum = cfg.checksum ? 1 : 0;
+    g_verify_checksum = cfg.verify_checksum ? 1 : 0;
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
     signal(SIGPIPE, SIG_IGN);
-
-    (void)mkdir("/dev/net", 0755);
-    if (access(TUN_DEVICE, F_OK) != 0) (void)system("mknod /dev/net/tun c 10 200 >/dev/null 2>&1 || true");
-    (void)system("modprobe tun >/dev/null 2>&1 || true");
+    mkdir("/dev/net", 0755);
+    if (access(TUN_DEVICE, F_OK) != 0) system("mknod /dev/net/tun c 10 200 2>/dev/null || true");
+    system("modprobe tun 2>/dev/null || true");
     cleanup_iface(cfg.iface);
+    int tun_fd = tun_alloc_named(cfg.iface);
+    if (tun_fd < 0) return 1;
+    if (configure_tun(&cfg) != 0) { cleanup_iface(cfg.iface); close(tun_fd); return 1; }
+    int udp_fd = udp_socket_create(&cfg);
+    if (udp_fd < 0) { cleanup_iface(cfg.iface); close(tun_fd); return 1; }
 
-    app_t app;
-    if (initialize_app(&app, &cfg) != 0) {
-        fprintf(stderr, "%s: invalid remote IPv4 %s\n", ENGINE_NAME, cfg.remote_ip);
-        return 1;
-    }
-
-    app.tun_fd = tun_alloc_named(cfg.iface);
-    if (app.tun_fd < 0) {
-        perror("open TUN");
-        return 1;
-    }
-    if (configure_tun(&cfg) != 0) {
-        fprintf(stderr, "%s: failed to configure TUN interface %s\n", ENGINE_NAME, cfg.iface);
-        close(app.tun_fd);
-        cleanup_iface(cfg.iface);
-        return 1;
-    }
-
-    if (transport_enabled(&cfg, "udp")) {
-        app.udp_fd = create_udp_socket(&cfg);
-        if (app.udp_fd < 0 && !strcmp(cfg.transport, "udp")) {
-            perror("create UDP socket");
-            close(app.tun_fd);
-            cleanup_iface(cfg.iface);
-            return 1;
-        }
-        if (app.udp_fd < 0) fprintf(stderr, "%s: UDP unavailable; TCP fallback remains enabled\n", ENGINE_NAME);
-    }
-
-    if (!strcmp(cfg.mode, "server") && transport_enabled(&cfg, "tcp")) {
-        app.tcp_listen_fd = create_tcp_listener(&cfg);
-        if (app.tcp_listen_fd < 0 && !strcmp(cfg.transport, "tcp")) {
-            perror("create TCP listener");
-            if (app.udp_fd >= 0) close(app.udp_fd);
-            close(app.tun_fd);
-            cleanup_iface(cfg.iface);
-            return 1;
-        }
-        if (app.tcp_listen_fd < 0) fprintf(stderr, "%s: TCP fallback listener unavailable; UDP remains enabled\n", ENGINE_NAME);
-    }
-
-    if (app.udp_fd < 0 && app.tcp_listen_fd < 0 && !strcmp(cfg.mode, "server")) {
-        fprintf(stderr, "%s: no transport could be started\n", ENGINE_NAME);
-        close(app.tun_fd);
-        cleanup_iface(cfg.iface);
-        return 1;
-    }
-
-    char pidfile[160];
-    snprintf(pidfile, sizeof(pidfile), "/run/%s.pid", cfg.iface);
-    FILE *pf = fopen(pidfile, "w");
-    if (pf) {
-        fprintf(pf, "%d\n", getpid());
-        fclose(pf);
-    }
-
-    fprintf(stderr, "%s %s started: iface=%s mode=%s transport=%s bind=%s port=%d remote=%s mtu=%d\n",
-            ENGINE_NAME, ENGINE_VERSION, cfg.iface, cfg.mode, cfg.transport,
-            cfg.bind_ip, cfg.port, cfg.remote_ip, cfg.mtu);
+    struct sockaddr_in remote;
+    memset(&remote, 0, sizeof(remote));
+    remote.sin_family = AF_INET;
+    remote.sin_port = htons((uint16_t)cfg.port);
+    int remote_known = 0;
     if (!strcmp(cfg.mode, "client")) {
-        fprintf(stderr, "%s: client uses ephemeral source ports; UDP is preferred and TCP is automatic fallback\n", ENGINE_NAME);
+        if (inet_pton(AF_INET, cfg.remote_ip, &remote.sin_addr) != 1) {
+            close(udp_fd); close(tun_fd); cleanup_iface(cfg.iface); return 1;
+        }
+        remote_known = 1;
     }
 
-    uint8_t tun_buf[MAX_PAYLOAD];
-    while (g_running) {
-        struct pollfd pfds[4];
-        int nfds = 0;
-        int tun_idx = -1, udp_idx = -1, listen_idx = -1, tcp_idx = -1;
-        tun_idx = nfds;
-        pfds[nfds++] = (struct pollfd){.fd = app.tun_fd, .events = POLLIN};
-        if (app.udp_fd >= 0) {
-            udp_idx = nfds;
-            pfds[nfds++] = (struct pollfd){.fd = app.udp_fd, .events = POLLIN};
-        }
-        if (app.tcp_listen_fd >= 0) {
-            listen_idx = nfds;
-            pfds[nfds++] = (struct pollfd){.fd = app.tcp_listen_fd, .events = POLLIN};
-        }
-        if (app.tcp_fd >= 0) {
-            tcp_idx = nfds;
-            pfds[nfds++] = (struct pollfd){.fd = app.tcp_fd, .events = POLLIN | POLLERR | POLLHUP};
-        }
+    char pidfile[128];
+    snprintf(pidfile, sizeof(pidfile), "/var/run/%s.pid", cfg.iface);
+    FILE *pf = fopen(pidfile, "w");
+    if (pf) { fprintf(pf, "%d\n", getpid()); fclose(pf); }
 
-        int rc = poll(pfds, (nfds_t)nfds, 250);
-        if (rc < 0) {
-            if (errno == EINTR) continue;
-            perror("poll");
-            break;
-        }
-        int64_t now = monotonic_ms();
+    uint8_t tun_buf[MAX_PKT_SIZE];
+    uint8_t udp_buf[sizeof(v7_hdr_t) + MAX_PKT_SIZE];
+    time_t last_keepalive = 0;
 
-        if (listen_idx >= 0 && (pfds[listen_idx].revents & POLLIN)) accept_tcp_client(&app);
-        if (udp_idx >= 0 && (pfds[udp_idx].revents & POLLIN)) receive_udp(&app);
-        if (tcp_idx >= 0 && pfds[tcp_idx].revents) {
-            if (pfds[tcp_idx].revents & (POLLERR | POLLHUP | POLLNVAL)) {
-                close_tcp(&app);
-            } else if ((pfds[tcp_idx].revents & POLLIN) && tcp_read_and_process(&app) != 0) {
-                close_tcp(&app);
-            }
+    while (running) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(tun_fd, &rfds);
+        FD_SET(udp_fd, &rfds);
+        int maxfd = tun_fd > udp_fd ? tun_fd : udp_fd;
+        struct timeval tv = {1, 0};
+        int rc = select(maxfd + 1, &rfds, NULL, NULL, &tv);
+        if (rc < 0) { if (errno == EINTR) continue; break; }
+        time_t now = time(NULL);
+        if (remote_known && now - last_keepalive >= cfg.keepalive) {
+            send_v7(udp_fd, &remote, PKT_KEEPALIVE, NULL, 0);
+            last_keepalive = now;
         }
-
-        if (tun_idx >= 0 && (pfds[tun_idx].revents & POLLIN)) {
-            for (int i = 0; i < 128; i++) {
-                ssize_t n = read(app.tun_fd, tun_buf, sizeof(tun_buf));
+        if (FD_ISSET(tun_fd, &rfds)) {
+            for (int i = 0; i < cfg.batch; i++) {
+                ssize_t n = read(tun_fd, tun_buf, sizeof(tun_buf));
                 if (n > 0) {
-                    if (app.active == ACTIVE_NONE || send_control_or_data(&app, app.active, TYPE_DATA,
-                                                                          tun_buf, (uint16_t)n) != 0) {
-                        app.drops++;
-                    }
+                    if (remote_known) send_v7(udp_fd, &remote, PKT_DATA, tun_buf, (uint16_t)n);
                     continue;
                 }
-                if (n < 0 && errno == EINTR) continue;
                 if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
                 break;
             }
         }
-
-        now = monotonic_ms();
-        if (!strcmp(cfg.mode, "client") && app.active == ACTIVE_NONE) {
-            if (app.udp_fd >= 0 && transport_enabled(&cfg, "udp") &&
-                now - app.last_hello_udp_ms >= 1000LL) {
-                (void)send_hello(&app, ACTIVE_UDP);
-                app.last_hello_udp_ms = now;
+        if (FD_ISSET(udp_fd, &rfds)) {
+            for (int i = 0; i < cfg.batch; i++) {
+                struct sockaddr_in sender;
+                socklen_t slen = sizeof(sender);
+                ssize_t n = recvfrom(udp_fd, udp_buf, sizeof(udp_buf), 0, (struct sockaddr *)&sender, &slen);
+                if (n < 0) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                    break;
+                }
+                if (n == 0) break;
+                uint16_t type, len;
+                uint8_t *payload;
+                if (verify_packet(udp_buf, n, &type, &payload, &len) != 0) continue;
+                if (strcmp(cfg.mode, "server") == 0) {
+                    memcpy(&remote, &sender, sizeof(remote));
+                    remote_known = 1;
+                }
+                if (type == PKT_DATA && len > 0) write(tun_fd, payload, len);
+                else if (type == PKT_KEEPALIVE && remote_known) send_v7(udp_fd, &remote, PKT_ACK, NULL, 0);
             }
-            int may_try_tcp = transport_enabled(&cfg, "tcp") && app.tcp_fd < 0;
-            if (!strcmp(cfg.transport, "auto") && now - app.started_ms < (int64_t)cfg.handshake_timeout * 1000LL) {
-                may_try_tcp = 0;
-            }
-            if (may_try_tcp && now - app.last_tcp_attempt_ms >= (int64_t)cfg.reconnect_interval * 1000LL) {
-                (void)connect_tcp_fallback(&app);
-            }
-        }
-
-        if (app.active != ACTIVE_NONE && now - app.last_tx_ms >= (int64_t)cfg.keepalive * 1000LL) {
-            (void)send_control_or_data(&app, app.active, TYPE_PING, NULL, 0U);
-        }
-
-        if (app.active != ACTIVE_NONE && now - app.last_rx_ms >= (int64_t)cfg.peer_timeout * 1000LL) {
-            fprintf(stderr, "%s: peer timeout on %s; reconnecting\n", ENGINE_NAME, active_name(app.active));
-            if (!strcmp(cfg.mode, "client")) {
-                reset_client_session(&app);
-            } else {
-                close_tcp(&app);
-                app.active = ACTIVE_NONE;
-                app.udp_peer_known = 0;
-                app.session_nonce = 0;
-                app.reconnects++;
-                app.last_rx_ms = now;
-            }
-        }
-
-        if (app.tcp_fd >= 0 && !app.tcp_authenticated &&
-            now - app.tcp_connected_ms >= (int64_t)cfg.handshake_timeout * 1000LL) {
-            close_tcp(&app);
-            if (!strcmp(cfg.mode, "client")) app.last_tcp_attempt_ms = now;
-        }
-
-        if (now - app.last_stats_ms >= (int64_t)cfg.stats_interval * 1000LL) {
-            write_stats(&app);
-            app.last_stats_ms = now;
         }
     }
-
-    write_stats(&app);
-    close_tcp(&app);
-    if (app.tcp_listen_fd >= 0) close(app.tcp_listen_fd);
-    if (app.udp_fd >= 0) close(app.udp_fd);
-    if (app.tun_fd >= 0) close(app.tun_fd);
+    close(udp_fd);
+    close(tun_fd);
     unlink(pidfile);
     cleanup_iface(cfg.iface);
-    fprintf(stderr, "%s stopped\n", ENGINE_NAME);
     return 0;
 }
 ENGINEEOF
-
-  if gcc -std=c11 -O3 -flto -Wall -Wextra -Werror -o "$VIRA7_BINARY.tmp" "$VIRA7_SOURCE"; then
-    :
-  elif gcc -std=c11 -O3 -Wall -Wextra -o "$VIRA7_BINARY.tmp" "$VIRA7_SOURCE"; then
-    warn_msg "Vira7 engine compiled without LTO/Werror fallback."
-  else
-    rm -f "$VIRA7_BINARY.tmp"
-    return 1
-  fi
-  if ! "$VIRA7_BINARY.tmp" --self-test >/dev/null 2>&1; then
-    rm -f "$VIRA7_BINARY.tmp"
-    err_msg "Vira Hybrid engine self-test failed."
-    return 1
-  fi
-  install -m 755 "$VIRA7_BINARY.tmp" "$VIRA7_BINARY"
-  rm -f "$VIRA7_BINARY.tmp"
+  gcc -O3 -flto -Wall -Wextra -o "$VIRA7_BINARY" "$VIRA7_SOURCE" 2>/dev/null || \
+    gcc -O3 -Wall -Wextra -o "$VIRA7_BINARY" "$VIRA7_SOURCE"
+  chmod 755 "$VIRA7_BINARY"
 }
 
 vira7_write_service_template() {
   cat > "$VIRA7_SERVICE_TEMPLATE" <<EOF_SERVICE
 [Unit]
-Description=Vira Hybrid Auto UDP/TCP Tunnel %i
+Description=Vira7 UDP-TUN Tunnel %i Service
 After=network-online.target
 Wants=network-online.target
-StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-ExecStartPre=/sbin/modprobe tun
 ExecStartPre=/bin/bash $INSTALL_BIN --service firewall-vira7 %i
 ExecStart=$VIRA7_BINARY $VIRA7_CONFIG_DIR/tunnel-%i.conf
 Restart=always
-RestartSec=2
-TimeoutStopSec=8
-KillSignal=SIGTERM
-LimitNOFILE=131072
-Nice=-5
+RestartSec=3
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
@@ -3296,62 +2395,57 @@ EOF_SERVICE
 
 vira7_save_config() {
   mkdir -p "$VIRA7_CONFIG_DIR"
-  local file tmp backup
+  local file
   file="$(vira7_config_file "$TUNNEL_ID")"
-  tmp="${file}.tmp.$$"
-  backup="${file}.last-good"
-  [ -f "$file" ] && cp -f "$file" "$backup"
-
   {
+    # Shell metadata used by this manager.
     write_var TUNNEL_TYPE "vira7"
     write_var TUNNEL_ID "$TUNNEL_ID"
-    write_var VIRA7_CONFIG_VERSION "3"
     write_var VIRA7_IFACE "$VIRA7_IFACE"
     write_var ROLE "$ROLE"
     write_var SERVER_ROLE "$SERVER_ROLE"
-    write_var VIRA7_DIRECTION "$VIRA7_DIRECTION"
-    write_var VIRA7_MODE "$VIRA7_MODE"
-    write_var VIRA7_TRANSPORT "$VIRA7_TRANSPORT"
-    write_var VIRA7_AUTH_KEY "$VIRA7_AUTH_KEY"
     write_var LOCAL_PUBLIC_IP "$LOCAL_PUBLIC_IP"
     write_var REMOTE_PUBLIC_IP "$REMOTE_PUBLIC_IP"
     write_var LOCAL_VIRA7_IP "$LOCAL_VIRA7_IP"
     write_var REMOTE_VIRA7_IP "$REMOTE_VIRA7_IP"
     write_var VIRA7_PORT "$VIRA7_PORT"
-    write_var VIRA7_LOCAL_PORT "$VIRA7_LOCAL_PORT"
     write_var VIRA7_MTU "$VIRA7_MTU"
-    write_var VIRA7_KEEPALIVE "$VIRA7_KEEPALIVE"
-    write_var VIRA7_HANDSHAKE_TIMEOUT "$VIRA7_HANDSHAKE_TIMEOUT"
-    write_var VIRA7_PEER_TIMEOUT "$VIRA7_PEER_TIMEOUT"
-    write_var VIRA7_RECONNECT_INTERVAL "$VIRA7_RECONNECT_INTERVAL"
-    write_var VIRA7_BUFFER_SIZE "$VIRA7_BUFFER_SIZE"
-    write_var VIRA7_QUEUE_LEN "$VIRA7_QUEUE_LEN"
-    write_var VIRA7_PEER_LOCK "$VIRA7_PEER_LOCK"
+    write_var VIRA7_CHECKSUM "${VIRA7_CHECKSUM:-$VIRA7_DEFAULT_CHECKSUM}"
+    write_var VIRA7_VERIFY_CHECKSUM "${VIRA7_VERIFY_CHECKSUM:-$VIRA7_DEFAULT_VERIFY_CHECKSUM}"
+    write_var VIRA7_BATCH "${VIRA7_BATCH:-$VIRA7_DEFAULT_BATCH}"
     echo
-    printf 'iface=%s\n' "$VIRA7_IFACE"
-    printf 'mode=%s\n' "$VIRA7_MODE"
-    printf 'transport=%s\n' "$VIRA7_TRANSPORT"
-    printf 'bind_ip=%s\n' "$LOCAL_PUBLIC_IP"
-    printf 'remote_ip=%s\n' "$REMOTE_PUBLIC_IP"
-    printf 'local_priv=%s\n' "$LOCAL_VIRA7_IP"
-    printf 'remote_priv=%s\n' "$REMOTE_VIRA7_IP"
-    printf 'auth_key=%s\n' "$VIRA7_AUTH_KEY"
-    printf 'tunnel_id=%s\n' "$TUNNEL_ID"
-    printf 'port=%s\n' "$VIRA7_PORT"
-    printf 'local_port=%s\n' "$VIRA7_LOCAL_PORT"
-    printf 'mtu=%s\n' "$VIRA7_MTU"
-    printf 'keepalive=%s\n' "$VIRA7_KEEPALIVE"
-    printf 'handshake_timeout=%s\n' "$VIRA7_HANDSHAKE_TIMEOUT"
-    printf 'peer_timeout=%s\n' "$VIRA7_PEER_TIMEOUT"
-    printf 'reconnect_interval=%s\n' "$VIRA7_RECONNECT_INTERVAL"
-    printf 'buffer_size=%s\n' "$VIRA7_BUFFER_SIZE"
-    printf 'queue_len=%s\n' "$VIRA7_QUEUE_LEN"
-    printf 'peer_lock=%s\n' "$VIRA7_PEER_LOCK"
-    printf 'stats_interval=3\n'
-  } > "$tmp"
-  chmod 600 "$tmp"
-  mv -f "$tmp" "$file"
-  echo "Saved Vira Hybrid tunnel $TUNNEL_ID configuration to $file"
+    # Engine config used directly by vira7-engine systemd service.
+    printf 'iface=%s
+' "$VIRA7_IFACE"
+    printf 'mode=%s
+' "$VIRA7_MODE"
+    printf 'bind_ip=%s
+' "$LOCAL_PUBLIC_IP"
+    printf 'remote_ip=%s
+' "$REMOTE_PUBLIC_IP"
+    printf 'local_priv=%s
+' "$LOCAL_VIRA7_IP"
+    printf 'remote_priv=%s
+' "$REMOTE_VIRA7_IP"
+    printf 'port=%s
+' "$VIRA7_PORT"
+    printf 'mtu=%s
+' "$VIRA7_MTU"
+    printf 'keepalive=%s
+' "$VIRA7_DEFAULT_KEEPALIVE"
+    printf 'buffer_size=%s
+' "$VIRA7_DEFAULT_BUFFER_SIZE"
+    printf 'queue_len=%s
+' "$VIRA7_DEFAULT_QUEUE_LEN"
+    printf 'checksum=%s
+' "${VIRA7_CHECKSUM:-$VIRA7_DEFAULT_CHECKSUM}"
+    printf 'verify_checksum=%s
+' "${VIRA7_VERIFY_CHECKSUM:-$VIRA7_DEFAULT_VERIFY_CHECKSUM}"
+    printf 'batch=%s
+' "${VIRA7_BATCH:-$VIRA7_DEFAULT_BATCH}"
+  } > "$file"
+  chmod 600 "$file"
+  echo "Saved Vira7 tunnel $TUNNEL_ID configuration to $file"
 }
 
 vira7_load_config() {
@@ -3360,104 +2454,54 @@ vira7_load_config() {
   local file
   file="$(vira7_config_file "$id")"
   [ -f "$file" ] || return 1
-
-  unset TUNNEL_TYPE TUNNEL_ID VIRA7_CONFIG_VERSION VIRA7_IFACE ROLE SERVER_ROLE VIRA7_DIRECTION VIRA7_MODE
-  unset VIRA7_TRANSPORT VIRA7_AUTH_KEY VIRA7_LOCAL_PORT VIRA7_HANDSHAKE_TIMEOUT VIRA7_RECONNECT_INTERVAL
-  unset LOCAL_PUBLIC_IP REMOTE_PUBLIC_IP LOCAL_VIRA7_IP REMOTE_VIRA7_IP VIRA7_PORT VIRA7_MTU
-  unset VIRA7_KEEPALIVE VIRA7_BUFFER_SIZE VIRA7_QUEUE_LEN VIRA7_PEER_LOCK VIRA7_PEER_TIMEOUT
-  unset iface mode transport bind_ip remote_ip local_priv remote_priv auth_key tunnel_id port local_port mtu
-  unset keepalive handshake_timeout peer_timeout reconnect_interval buffer_size queue_len peer_lock stats_interval
-
   # shellcheck disable=SC1090
   source "$file"
   TUNNEL_ID="$id"
-  VIRA7_CONFIG_VERSION="${VIRA7_CONFIG_VERSION:-1}"
   VIRA7_IFACE="${VIRA7_IFACE:-${iface:-$(vira7_iface_name "$id")}}"
   LOCAL_PUBLIC_IP="${LOCAL_PUBLIC_IP:-${bind_ip:-}}"
   REMOTE_PUBLIC_IP="${REMOTE_PUBLIC_IP:-${remote_ip:-}}"
   LOCAL_VIRA7_IP="${LOCAL_VIRA7_IP:-${local_priv:-}}"
   REMOTE_VIRA7_IP="${REMOTE_VIRA7_IP:-${remote_priv:-}}"
   VIRA7_PORT="${VIRA7_PORT:-${port:-$(vira7_default_port "$id")}}"
-  VIRA7_LOCAL_PORT="${VIRA7_LOCAL_PORT:-${local_port:-$VIRA7_DEFAULT_LOCAL_PORT}}"
   VIRA7_MTU="${VIRA7_MTU:-${mtu:-$VIRA7_DEFAULT_MTU}}"
-  VIRA7_KEEPALIVE="${VIRA7_KEEPALIVE:-${keepalive:-$VIRA7_DEFAULT_KEEPALIVE}}"
-  VIRA7_TRANSPORT="${VIRA7_TRANSPORT:-${transport:-$VIRA7_DEFAULT_TRANSPORT}}"
-  VIRA7_AUTH_KEY="${VIRA7_AUTH_KEY:-${auth_key:-$(vira7_default_auth_key "$id" "$VIRA7_PORT")}}"
-  VIRA7_HANDSHAKE_TIMEOUT="${VIRA7_HANDSHAKE_TIMEOUT:-${handshake_timeout:-$VIRA7_DEFAULT_HANDSHAKE_TIMEOUT}}"
-  VIRA7_PEER_TIMEOUT="${VIRA7_PEER_TIMEOUT:-${peer_timeout:-$VIRA7_DEFAULT_PEER_TIMEOUT}}"
-  VIRA7_RECONNECT_INTERVAL="${VIRA7_RECONNECT_INTERVAL:-${reconnect_interval:-$VIRA7_DEFAULT_RECONNECT_INTERVAL}}"
-  VIRA7_BUFFER_SIZE="${VIRA7_BUFFER_SIZE:-${buffer_size:-$VIRA7_DEFAULT_BUFFER_SIZE}}"
-  VIRA7_QUEUE_LEN="${VIRA7_QUEUE_LEN:-${queue_len:-$VIRA7_DEFAULT_QUEUE_LEN}}"
-  VIRA7_PEER_LOCK="${VIRA7_PEER_LOCK:-${peer_lock:-$VIRA7_DEFAULT_PEER_LOCK}}"
-
+  VIRA7_CHECKSUM="${VIRA7_CHECKSUM:-${checksum:-$VIRA7_DEFAULT_CHECKSUM}}"
+  VIRA7_VERIFY_CHECKSUM="${VIRA7_VERIFY_CHECKSUM:-${verify_checksum:-$VIRA7_DEFAULT_VERIFY_CHECKSUM}}"
+  VIRA7_BATCH="${VIRA7_BATCH:-${batch:-$VIRA7_DEFAULT_BATCH}}"
   if [ -z "${ROLE:-}" ]; then
     if [ "${LOCAL_VIRA7_IP:-}" = "10.71.$id.1" ]; then ROLE="1"; else ROLE="2"; fi
   fi
-  VIRA7_MODE="${VIRA7_MODE:-${mode:-$(vira7_mode_for_role "$ROLE" recommended)}}"
-  VIRA7_DIRECTION="${VIRA7_DIRECTION:-$(vira7_infer_direction "$ROLE" "$VIRA7_MODE")}"
-  SERVER_ROLE="${SERVER_ROLE:-$([ "$ROLE" = "1" ] && echo IRAN || echo KHAREJ)}"
 }
 
-vira7_validate_port_for_tunnel() {
-  local port="$1" id="$2" existing_port="${3:-}" mode
-  validate_port "$port" || { err_msg "Invalid port: $port"; return 1; }
-  if udp_port_in_saved_configs "$port" "vira7" "$id"; then
-    err_msg "Port $port is already assigned to another saved Vira tunnel."
-    return 1
-  fi
-  mode="$(vira7_mode_for_role "$ROLE" "${VIRA7_DIRECTION:-recommended}")"
-  # Client uses an ephemeral local UDP/TCP source port, so local listeners do not conflict.
-  [ "$mode" = "client" ] && return 0
-
-  local own_service=0
-  if [ "$existing_port" = "$port" ] && systemctl is-active --quiet "$(vira7_service_name "$id")" 2>/dev/null; then
-    own_service=1
-  fi
-  if udp_port_is_listening "$port" && [ "$own_service" -ne 1 ]; then
-    err_msg "UDP port $port is already listening on this server."
-    ss -H -lunp 2>/dev/null | grep -E "(^|[:.])${port}([[:space:]]|$)" || true
-    return 1
-  fi
-  if ss -H -ltn 2>/dev/null | grep -Eq "(^|[:.])${port}([[:space:]]|$)"; then
-    if [ "$own_service" -eq 1 ] && ss -H -ltnp 2>/dev/null | grep -E "(^|[:.])${port}([[:space:]]|$)" | grep -q 'vira7-engine'; then
-      info_msg "TCP port $port is currently owned by this Vira service and will be reused."
-    else
-      err_msg "TCP port $port is already listening on this server. Auto fallback needs this TCP port too."
-      ss -H -ltnp 2>/dev/null | grep -E "(^|[:.])${port}([[:space:]]|$)" || true
-      return 1
-    fi
-  fi
+vira7_write_engine_config() {
+  local id="$1"
+  local file
+  file="$(vira7_config_file "$id")"
+  mkdir -p "$VIRA7_CONFIG_DIR"
+  cat > "$file" <<EOF_CONF
+iface=$VIRA7_IFACE
+mode=$VIRA7_MODE
+bind_ip=$LOCAL_PUBLIC_IP
+remote_ip=$REMOTE_PUBLIC_IP
+local_priv=$LOCAL_VIRA7_IP
+remote_priv=$REMOTE_VIRA7_IP
+port=$VIRA7_PORT
+mtu=$VIRA7_MTU
+keepalive=$VIRA7_DEFAULT_KEEPALIVE
+buffer_size=$VIRA7_DEFAULT_BUFFER_SIZE
+queue_len=$VIRA7_DEFAULT_QUEUE_LEN
+checksum=${VIRA7_CHECKSUM:-$VIRA7_DEFAULT_CHECKSUM}
+verify_checksum=${VIRA7_VERIFY_CHECKSUM:-$VIRA7_DEFAULT_VERIFY_CHECKSUM}
+batch=${VIRA7_BATCH:-$VIRA7_DEFAULT_BATCH}
+EOF_CONF
+  chmod 600 "$file"
 }
 
 vira7_apply_firewall_rules() {
   local id="$1"
   if ! vira7_load_config "$id"; then return 1; fi
-  vira7_tune_kernel "$id"
-
-  # Insert rules at the top so an earlier DROP rule cannot shadow them.
-  if command -v iptables >/dev/null 2>&1; then
-    iptables -C INPUT -p udp --dport "$VIRA7_PORT" -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -p udp --dport "$VIRA7_PORT" -j ACCEPT || true
-    iptables -C INPUT -p tcp --dport "$VIRA7_PORT" -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -p tcp --dport "$VIRA7_PORT" -j ACCEPT || true
-    iptables -C OUTPUT -p udp -d "$REMOTE_PUBLIC_IP" --dport "$VIRA7_PORT" -j ACCEPT 2>/dev/null || iptables -I OUTPUT 1 -p udp -d "$REMOTE_PUBLIC_IP" --dport "$VIRA7_PORT" -j ACCEPT || true
-    iptables -C OUTPUT -p tcp -d "$REMOTE_PUBLIC_IP" --dport "$VIRA7_PORT" -j ACCEPT 2>/dev/null || iptables -I OUTPUT 1 -p tcp -d "$REMOTE_PUBLIC_IP" --dport "$VIRA7_PORT" -j ACCEPT || true
-    iptables -C INPUT -i "$VIRA7_IFACE" -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -i "$VIRA7_IFACE" -j ACCEPT || true
-    iptables -C OUTPUT -o "$VIRA7_IFACE" -j ACCEPT 2>/dev/null || iptables -I OUTPUT 1 -o "$VIRA7_IFACE" -j ACCEPT || true
-    iptables -C FORWARD -i "$VIRA7_IFACE" -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -i "$VIRA7_IFACE" -j ACCEPT || true
-    iptables -C FORWARD -o "$VIRA7_IFACE" -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -o "$VIRA7_IFACE" -j ACCEPT || true
-  fi
-  if command -v ufw >/dev/null 2>&1; then
-    ufw allow "$VIRA7_PORT/udp" comment "vira7-$id-udp" >/dev/null 2>&1 || true
-    ufw allow "$VIRA7_PORT/tcp" comment "vira7-$id-tcp" >/dev/null 2>&1 || true
-    ufw allow in on "$VIRA7_IFACE" >/dev/null 2>&1 || true
-  fi
-  if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-    firewall-cmd --permanent --add-port="$VIRA7_PORT/udp" >/dev/null 2>&1 || true
-    firewall-cmd --permanent --add-port="$VIRA7_PORT/tcp" >/dev/null 2>&1 || true
-    firewall-cmd --permanent --add-interface="$VIRA7_IFACE" >/dev/null 2>&1 || true
-    firewall-cmd --reload >/dev/null 2>&1 || true
-  fi
-  firewall_allow_ip_peer "Vira Hybrid tunnel $id remote inner" "$REMOTE_VIRA7_IP" "$VIRA7_IFACE" >/dev/null 2>&1 || true
-  echo "Firewall opened for Vira Hybrid $id: UDP/TCP $VIRA7_PORT, peer $REMOTE_PUBLIC_IP"
+  firewall_allow_udp_port_and_ip "Vira7 tunnel $id" "$VIRA7_PORT" "$REMOTE_PUBLIC_IP" "$VIRA7_PORT" "$VIRA7_IFACE"
+  firewall_allow_ip_peer "Vira7 tunnel $id remote inner" "${REMOTE_VIRA7_IP:-${remote_priv:-}}" "$VIRA7_IFACE"
+  firewall_allow_ip_peer "Vira7 tunnel $id remote public" "$REMOTE_PUBLIC_IP" "$VIRA7_IFACE"
 }
 
 vira7_install_service() {
@@ -3469,189 +2513,107 @@ vira7_install_service() {
   cp -f "$0" "$INSTALL_BIN" 2>/dev/null || true
   chmod 755 "$INSTALL_BIN" 2>/dev/null || true
   vira7_write_service_template
-  systemctl enable "$(vira7_service_name "$id")" >/dev/null || return 1
+  systemctl enable "$(vira7_service_name "$id")" || return 1
   if systemctl restart "$(vira7_service_name "$id")"; then
-    sleep 1
-    if systemctl is-active --quiet "$(vira7_service_name "$id")" && ip link show "$(vira7_iface_name "$id")" >/dev/null 2>&1; then
-      ok_msg "Vira Hybrid service enabled and started ($(vira7_service_name "$id"))"
-      return 0
-    fi
+    echo "Vira7 service enabled and started ($(vira7_service_name "$id"))"
+    return 0
   fi
   systemctl status "$(vira7_service_name "$id")" --no-pager -l 2>/dev/null || true
-  journalctl -u "$(vira7_service_name "$id")" -n 50 --no-pager 2>/dev/null || true
+  journalctl -u "$(vira7_service_name "$id")" -n 30 --no-pager 2>/dev/null || true
   return 1
 }
 
 vira7_create_tunnel() {
-  local interactive="${1:-0}"
-  local file backup
-  : "$interactive"
+  local interactive=${1:-0}
   validate_tunnel_id "${TUNNEL_ID:-}" || { echo "Invalid tunnel number." >&2; return 1; }
   VIRA7_IFACE="$(vira7_iface_name "$TUNNEL_ID")"
   LOCAL_PUBLIC_IP="${LOCAL_PUBLIC_IP:-$(detect_local_public_ip)}"
-  [ -n "${LOCAL_PUBLIC_IP:-}" ] || { echo "Failed to detect local bind IPv4" >&2; return 1; }
-  if [ "$LOCAL_PUBLIC_IP" != "0.0.0.0" ] && ! local_ipv4_is_assigned "$LOCAL_PUBLIC_IP"; then
-    echo "Selected Vira bind IP is not assigned on this server: $LOCAL_PUBLIC_IP" >&2
+  [ -n "${LOCAL_PUBLIC_IP:-}" ] || { echo "Failed to detect local public IPv4" >&2; return 1; }
+  if ! local_ipv4_is_assigned "$LOCAL_PUBLIC_IP"; then
+    echo "Selected Vira7 bind IP is not assigned on this server: $LOCAL_PUBLIC_IP" >&2
     list_local_ipv4s >&2
     return 1
   fi
-
-  SERVER_ROLE="$([ "$ROLE" = "1" ] && echo IRAN || echo KHAREJ)"
-  VIRA7_DIRECTION="${VIRA7_DIRECTION:-recommended}"
-  VIRA7_MODE="$(vira7_mode_for_role "$ROLE" "$VIRA7_DIRECTION")"
-  LOCAL_VIRA7_IP="$(vira7_inner_ip_for_role "$TUNNEL_ID" "$ROLE")"
-  REMOTE_VIRA7_IP="$(vira7_remote_inner_ip_for_role "$TUNNEL_ID" "$ROLE")"
+  if [ "$ROLE" = "1" ]; then
+    SERVER_ROLE="IRAN"
+    VIRA7_MODE="server"
+    LOCAL_VIRA7_IP="10.71.$TUNNEL_ID.1"
+    REMOTE_VIRA7_IP="10.71.$TUNNEL_ID.2"
+  else
+    SERVER_ROLE="KHAREJ"
+    VIRA7_MODE="client"
+    LOCAL_VIRA7_IP="10.71.$TUNNEL_ID.2"
+    REMOTE_VIRA7_IP="10.71.$TUNNEL_ID.1"
+  fi
   VIRA7_PORT="${VIRA7_PORT:-$(vira7_default_port "$TUNNEL_ID")}" 
-  VIRA7_LOCAL_PORT="${VIRA7_LOCAL_PORT:-$VIRA7_DEFAULT_LOCAL_PORT}"
   VIRA7_MTU="${VIRA7_MTU:-$VIRA7_DEFAULT_MTU}"
-  VIRA7_KEEPALIVE="${VIRA7_KEEPALIVE:-$VIRA7_DEFAULT_KEEPALIVE}"
-  VIRA7_TRANSPORT="${VIRA7_TRANSPORT:-$VIRA7_DEFAULT_TRANSPORT}"
-  VIRA7_AUTH_KEY="${VIRA7_AUTH_KEY:-$(vira7_default_auth_key "$TUNNEL_ID" "$VIRA7_PORT")}"
-  VIRA7_HANDSHAKE_TIMEOUT="${VIRA7_HANDSHAKE_TIMEOUT:-$VIRA7_DEFAULT_HANDSHAKE_TIMEOUT}"
-  VIRA7_PEER_TIMEOUT="${VIRA7_PEER_TIMEOUT:-$VIRA7_DEFAULT_PEER_TIMEOUT}"
-  VIRA7_RECONNECT_INTERVAL="${VIRA7_RECONNECT_INTERVAL:-$VIRA7_DEFAULT_RECONNECT_INTERVAL}"
-  VIRA7_BUFFER_SIZE="${VIRA7_BUFFER_SIZE:-$VIRA7_DEFAULT_BUFFER_SIZE}"
-  VIRA7_QUEUE_LEN="${VIRA7_QUEUE_LEN:-$VIRA7_DEFAULT_QUEUE_LEN}"
-  VIRA7_PEER_LOCK="${VIRA7_PEER_LOCK:-$VIRA7_DEFAULT_PEER_LOCK}"
+  VIRA7_CHECKSUM="${VIRA7_CHECKSUM:-$VIRA7_DEFAULT_CHECKSUM}"
+  VIRA7_VERIFY_CHECKSUM="${VIRA7_VERIFY_CHECKSUM:-$VIRA7_DEFAULT_VERIFY_CHECKSUM}"
+  VIRA7_BATCH="${VIRA7_BATCH:-$VIRA7_DEFAULT_BATCH}"
 
-  echo "[*] Vira Hybrid version: $SCRIPT_VERSION"
-  echo "[*] Interface: $VIRA7_IFACE | role: $SERVER_ROLE | mode: $VIRA7_MODE"
-  echo "[*] Transport: $VIRA7_TRANSPORT (UDP preferred, TCP fallback in auto mode)"
-  echo "[*] Public path: $LOCAL_PUBLIC_IP -> $REMOTE_PUBLIC_IP:$VIRA7_PORT"
-  echo "[*] Tunnel path: $LOCAL_VIRA7_IP -> $REMOTE_VIRA7_IP"
-  echo "[*] Client source port: ephemeral | MTU: $VIRA7_MTU"
+  echo "[*] Local server public IP: $LOCAL_PUBLIC_IP"
+  echo "[*] Tunnel type: Vira7 UDP-TUN"
+  echo "[*] Tunnel number: $TUNNEL_ID"
+  echo "[*] Interface: $VIRA7_IFACE"
+  echo "[*] Server role: $SERVER_ROLE"
+  echo "[*] Remote server public IP: $REMOTE_PUBLIC_IP"
+  echo "[*] Local Vira7 IP: $LOCAL_VIRA7_IP"
+  echo "[*] Remote Vira7 IP: $REMOTE_VIRA7_IP"
+  echo "[*] UDP Port: $VIRA7_PORT"
+  echo "[*] CPU mode: checksum=$VIRA7_CHECKSUM verify_checksum=$VIRA7_VERIFY_CHECKSUM batch=$VIRA7_BATCH"
 
   enable_ip_forward
-  vira7_tune_kernel "$TUNNEL_ID"
   modprobe tun || true
   vira7_compile_engine || return 1
-
-  file="$(vira7_config_file "$TUNNEL_ID")"
-  backup="${file}.last-good"
   vira7_save_config
-  if ! "$VIRA7_BINARY" --check-config "$file"; then
-    err_msg "Generated Vira config did not pass engine validation."
-    [ -f "$backup" ] && cp -f "$backup" "$file"
-    return 1
-  fi
   vira7_apply_firewall_rules "$TUNNEL_ID" || true
-  if vira7_install_service "$TUNNEL_ID"; then
-    sleep 1
-    local stats active
-    stats="$(vira7_stats_file "$TUNNEL_ID")"
-    active="$(awk -F= '$1=="active_transport"{print $2}' "$stats" 2>/dev/null || true)"
-    if [ -n "$active" ] && [ "$active" != "none" ]; then
-      ok_msg "Vira Hybrid tunnel connected through $active."
-    else
-      warn_msg "Engine is running but the peer is not connected yet. Configure/restart the other server, then use diagnostics."
-    fi
-    return 0
-  fi
-
-  err_msg "New Vira Hybrid service failed to start."
-  if [ -f "$backup" ]; then
-    warn_msg "Restoring the previous Vira config..."
-    cp -f "$backup" "$file"
-    systemctl restart "$(vira7_service_name "$TUNNEL_ID")" 2>/dev/null || true
-  fi
-  return 1
+  vira7_install_service "$TUNNEL_ID"
 }
 
 vira7_menu_config_tunnel() {
-  show_header "Configure Vira Hybrid Auto UDP/TCP"
+  show_header "Configure Vira7 UDP-TUN Tunnel"
   prompt_role || return
   local selected_role existing_local_ip existing_remote_ip existing_port existing_mtu
-  local existing_direction existing_transport existing_config_version direction_choice transport_choice
   selected_role="$ROLE"
   echo
-  prompt_tunnel_id "Enter Vira tunnel number [1-254]: " || return
-
-  existing_local_ip=""; existing_remote_ip=""; existing_port=""; existing_mtu=""
-  existing_direction=""; existing_transport=""; existing_config_version="1"
+  prompt_tunnel_id "Enter Vira7 tunnel number before IP [1-254]: " || return
+  existing_local_ip=""
+  existing_remote_ip=""
+  existing_port=""
+  existing_mtu=""
   if vira7_load_config "$TUNNEL_ID"; then
     existing_local_ip="${LOCAL_PUBLIC_IP:-}"
     existing_remote_ip="${REMOTE_PUBLIC_IP:-}"
     existing_port="${VIRA7_PORT:-}"
     existing_mtu="${VIRA7_MTU:-}"
-    existing_direction="${VIRA7_DIRECTION:-}"
-    existing_transport="${VIRA7_TRANSPORT:-}"
-    existing_config_version="${VIRA7_CONFIG_VERSION:-1}"
   fi
   ROLE="$selected_role"
-  if ! [[ "$existing_config_version" =~ ^[0-9]+$ ]] || [ "$existing_config_version" -lt 3 ]; then
-    existing_mtu=""
-    existing_transport=""
-  fi
-
   echo
-  echo "Vira Hybrid tunnel $TUNNEL_ID plan:"
+  echo "Vira7 UDP-TUN tunnel $TUNNEL_ID plan:"
   echo "  Interface       : $(vira7_iface_name "$TUNNEL_ID")"
-  echo "  Iran tunnel IP  : 10.71.$TUNNEL_ID.1"
-  echo "  Kharej tunnel IP: 10.71.$TUNNEL_ID.2"
+  echo "  Config file     : $(vira7_config_file "$TUNNEL_ID")"
+  echo "  Service         : $(vira7_service_name "$TUNNEL_ID")"
+  echo "  Iran role IP    : 10.71.$TUNNEL_ID.1"
+  echo "  Kharej role IP  : 10.71.$TUNNEL_ID.2"
   echo
-  echo "Connection direction:"
-  echo "  1) Recommended: Iran=Client -> Kharej=Server"
-  echo "  2) Legacy: Iran=Server <- Kharej=Client"
-  read -rp "Choose direction [1-2, default 1] (00=menu): " direction_choice
-  if is_main_menu_token "$direction_choice"; then return_main_msg; return 99; fi
-  case "${direction_choice:-1}" in
-    1) VIRA7_DIRECTION="recommended" ;;
-    2) VIRA7_DIRECTION="legacy" ;;
-    *) err_msg "Invalid direction."; return 1 ;;
-  esac
-
-  echo
-  echo "Transport mode:"
-  echo "  1) Auto Hybrid: prefer UDP, automatically fallback to TCP (recommended)"
-  echo "  2) UDP only"
-  echo "  3) TCP only"
-  local transport_default=1
-  [ "$existing_transport" = "udp" ] && transport_default=2
-  [ "$existing_transport" = "tcp" ] && transport_default=3
-  read -rp "Choose transport [1-3, default $transport_default] (00=menu): " transport_choice
-  if is_main_menu_token "$transport_choice"; then return_main_msg; return 99; fi
-  transport_choice="${transport_choice:-$transport_default}"
-  case "$transport_choice" in
-    1) VIRA7_TRANSPORT="auto" ;;
-    2) VIRA7_TRANSPORT="udp" ;;
-    3) VIRA7_TRANSPORT="tcp" ;;
-    *) err_msg "Invalid transport."; return 1 ;;
-  esac
-
-  echo
-  prompt_local_tunnel_ip "${existing_local_ip:-$(detect_local_public_ip || true)}" "Enter LOCAL bind IPv4 (0.0.0.0 = all local IPv4 addresses)" || return
+  prompt_local_tunnel_ip "${existing_local_ip:-$(detect_local_public_ip || true)}" "Enter LOCAL server Public IPv4 for Vira7 UDP bind" || return
   echo
   prompt_remote_public_ip "$existing_remote_ip" || return
-
   echo
-  echo "The same numeric port is used for UDP and TCP on the Server side."
-  echo "Both protocols can share one number, but no other TCP/UDP service may already own it."
-  local port_default port_input
-  port_default="${existing_port:-$(vira7_default_port "$TUNNEL_ID")}"
-  read -rp "Enter Vira Hybrid port [$port_default] (00=menu): " port_input
-  if is_main_menu_token "$port_input"; then return_main_msg; return 99; fi
-  VIRA7_PORT="${port_input:-$port_default}"
-  vira7_validate_port_for_tunnel "$VIRA7_PORT" "$TUNNEL_ID" "$existing_port" || return
-
-  read -rp "Enter MTU [${existing_mtu:-$VIRA7_DEFAULT_MTU}] (00=menu): " VIRA7_MTU_INPUT
+  VIRA7_PORT="$(auto_select_udp_port "$(vira7_default_port "$TUNNEL_ID")" "$existing_port" "vira7" "$TUNNEL_ID")" || return
+  echo "Auto-selected Vira7 UDP port: $VIRA7_PORT"
+  read -rp "Enter Vira7 MTU [${existing_mtu:-$VIRA7_DEFAULT_MTU}] (00=menu): " VIRA7_MTU_INPUT
   if is_main_menu_token "$VIRA7_MTU_INPUT"; then return_main_msg; return 99; fi
   VIRA7_MTU="${VIRA7_MTU_INPUT:-${existing_mtu:-$VIRA7_DEFAULT_MTU}}"
-  if ! [[ "$VIRA7_MTU" =~ ^[0-9]+$ ]] || [ "$VIRA7_MTU" -lt 576 ] || [ "$VIRA7_MTU" -gt 9000 ]; then
-    err_msg "Invalid MTU. Recommended: 1280."
-    return 1
+  if ! [[ "$VIRA7_MTU" =~ ^[0-9]+$ ]] || [ "$VIRA7_MTU" -lt 576 ] || [ "$VIRA7_MTU" -gt 1600 ]; then
+    echo "Invalid MTU."
+    return
   fi
-
-  VIRA7_LOCAL_PORT="$VIRA7_DEFAULT_LOCAL_PORT"
-  VIRA7_KEEPALIVE="$VIRA7_DEFAULT_KEEPALIVE"
-  VIRA7_HANDSHAKE_TIMEOUT="$VIRA7_DEFAULT_HANDSHAKE_TIMEOUT"
-  VIRA7_PEER_TIMEOUT="$VIRA7_DEFAULT_PEER_TIMEOUT"
-  VIRA7_RECONNECT_INTERVAL="$VIRA7_DEFAULT_RECONNECT_INTERVAL"
-  VIRA7_BUFFER_SIZE="$VIRA7_DEFAULT_BUFFER_SIZE"
-  VIRA7_QUEUE_LEN="$VIRA7_DEFAULT_QUEUE_LEN"
-  VIRA7_PEER_LOCK="$VIRA7_DEFAULT_PEER_LOCK"
-  VIRA7_AUTH_KEY="$(vira7_default_auth_key "$TUNNEL_ID" "$VIRA7_PORT")"
-
-  vira7_create_tunnel 1 || echo "Vira Hybrid tunnel creation/update failed"
+  # Safe CPU optimization: keep checksum generation for compatibility, skip expensive receive-side verification, use packet batching.
+  VIRA7_CHECKSUM="${VIRA7_CHECKSUM:-$VIRA7_DEFAULT_CHECKSUM}"
+  VIRA7_VERIFY_CHECKSUM="${VIRA7_VERIFY_CHECKSUM:-$VIRA7_DEFAULT_VERIFY_CHECKSUM}"
+  VIRA7_BATCH="${VIRA7_BATCH:-$VIRA7_DEFAULT_BATCH}"
+  vira7_create_tunnel 1 || echo "Vira7 tunnel creation failed"
 }
 
 vira7_collect_ids() {
@@ -3670,22 +2632,16 @@ vira7_collect_ids() {
 }
 
 vira7_list_tunnels() {
-  echo "Vira Hybrid tunnels:"
-  local ids id ifc state svc_state mode direction port mtu transport active stats
+  echo "Vira7 UDP-TUN tunnels:"
+  local ids id ifc state
   ids="$(vira7_collect_ids || true)"
   if [ -z "$ids" ]; then echo "  none"; return 0; fi
   while IFS= read -r id; do
     [ -n "$id" ] || continue
     ifc="$(vira7_iface_name "$id")"
-    state="inactive"; ip link show "$ifc" >/dev/null 2>&1 && state="active"
-    svc_state="$(systemctl is-active "$(vira7_service_name "$id")" 2>/dev/null || true)"
-    mode="?"; direction="?"; port="?"; mtu="?"; transport="?"; active="none"
-    if vira7_load_config "$id"; then
-      mode="$VIRA7_MODE"; direction="$VIRA7_DIRECTION"; port="$VIRA7_PORT"; mtu="$VIRA7_MTU"; transport="$VIRA7_TRANSPORT"
-    fi
-    stats="$(vira7_stats_file "$id")"
-    [ -f "$stats" ] && active="$(awk -F= '$1=="active_transport"{print $2}' "$stats" 2>/dev/null || echo none)"
-    echo "  - tunnel $id | $ifc | iface=$state service=$svc_state | $mode/$direction | mode=$transport active=$active | port=$port MTU=$mtu"
+    state="inactive"
+    ip link show "$ifc" >/dev/null 2>&1 && state="active"
+    echo "  - tunnel $id | iface $ifc | $state | config: $(vira7_config_file "$id") | service: $(systemctl is-enabled "$(vira7_service_name "$id")" 2>/dev/null || true)"
   done <<< "$ids"
 }
 
@@ -3696,33 +2652,27 @@ vira7_remove_one_tunnel() {
   file="$(vira7_config_file "$id")"
   port=""
   if vira7_load_config "$id"; then port="${VIRA7_PORT:-}"; fi
-  echo "Removing Vira Hybrid tunnel $id ($ifc)..."
+  echo "Removing Vira7 tunnel $id ($ifc)..."
   systemctl disable --now "$(vira7_service_name "$id")" 2>/dev/null || true
   ip link delete "$ifc" 2>/dev/null || true
   if [ -n "$port" ] && command -v iptables >/dev/null 2>&1; then
-    for proto in udp tcp; do
-      while iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; do iptables -D INPUT -p "$proto" --dport "$port" -j ACCEPT || break; done
-    done
+    while iptables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null; do iptables -D INPUT -p udp --dport "$port" -j ACCEPT || break; done
     while iptables -C FORWARD -i "$ifc" -j ACCEPT 2>/dev/null; do iptables -D FORWARD -i "$ifc" -j ACCEPT || break; done
     while iptables -C FORWARD -o "$ifc" -j ACCEPT 2>/dev/null; do iptables -D FORWARD -o "$ifc" -j ACCEPT || break; done
   fi
-  if [ -n "$port" ] && command -v ufw >/dev/null 2>&1; then
-    ufw delete allow "$port/udp" >/dev/null 2>&1 || true
-    ufw delete allow "$port/tcp" >/dev/null 2>&1 || true
-  fi
-  rm -f "$file" "${file}.last-good" "/run/$ifc.pid" "$(vira7_stats_file "$id")"
+  rm -f "$file" "/var/run/$ifc.pid"
   systemctl daemon-reload 2>/dev/null || true
-  echo "[OK] Vira Hybrid tunnel $id removed."
+  echo "[OK] Vira7 tunnel $id removed."
 }
 
 vira7_remove_menu() {
-  show_header "Remove Vira Hybrid Tunnel"
+  show_header "Remove Vira7 UDP-TUN Tunnel"
   vira7_list_tunnels
   echo
   local ids selected_id
   ids="$(vira7_collect_ids || true)"
   if [ -z "$ids" ]; then echo "No Vira7 tunnels found."; return; fi
-  read -rp "Enter Vira7 tunnel number to remove, or 00=menu: " selected_id
+  read -rp "Enter Vira7 tunnel number to remove, for example 1, or 00=menu: " selected_id
   if is_main_menu_token "$selected_id"; then return_main_msg; return 99; fi
   validate_tunnel_id "$selected_id" || { echo "Invalid tunnel number."; return; }
   if ! echo "$ids" | grep -qx "$selected_id"; then
@@ -3743,12 +2693,14 @@ vira7_restart_one_tunnel() {
     echo "No saved Vira7 configuration found for tunnel $id." >&2
     return 1
   fi
+  VIRA7_MODE="client"
+  if [ "${ROLE:-}" = "1" ]; then VIRA7_MODE="server"; fi
   [ -x "$VIRA7_BINARY" ] || vira7_compile_engine || return 1
   enable_ip_forward
-  vira7_tune_kernel "$id"
   vira7_apply_firewall_rules "$id" || true
   vira7_install_service "$id"
 }
+
 
 set_config_kv() {
   local file="$1" key="$2" value="$3"
@@ -3761,113 +2713,69 @@ set_config_kv() {
 }
 
 vira7_optimize_cpu_one() {
-  local id="$1" mode="${2:-auto}" file svc
-  validate_tunnel_id "$id" || { echo "Invalid Vira tunnel number." >&2; return 1; }
+  local id="$1" mode="${2:-safe}" file svc
+  validate_tunnel_id "$id" || { echo "Invalid Vira7 tunnel number." >&2; return 1; }
   file="$(vira7_config_file "$id")"
   svc="$(vira7_service_name "$id")"
-  [ -f "$file" ] || { echo "No Vira config found: $file" >&2; return 1; }
-  case "$mode" in auto|udp|tcp) ;; *) return 1 ;; esac
-  set_config_kv "$file" transport "$mode"
-  set_config_kv "$file" VIRA7_TRANSPORT "$mode"
+  [ -f "$file" ] || { echo "No Vira7 config found: $file" >&2; return 1; }
+
+  # Always safe: skip userspace receive checksum verification and batch packets.
+  # Fast mode additionally disables checksum generation; use it only when BOTH sides run this optimized engine.
+  set_config_kv "$file" verify_checksum 0
+  set_config_kv "$file" batch 128
+  if [ "$mode" = "fast" ]; then
+    set_config_kv "$file" checksum 0
+  else
+    set_config_kv "$file" checksum 1
+  fi
+
+  echo "Recompiling optimized Vira7 engine..."
   vira7_compile_engine || return 1
+  enable_ip_forward
   vira7_apply_firewall_rules "$id" || true
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl enable "$svc" >/dev/null 2>&1 || true
   if systemctl restart "$svc"; then
-    echo "[OK] Vira tunnel $id restarted with transport=$mode"
+    echo "[OK] Vira7 tunnel $id optimized and restarted. mode=$mode"
+    echo "Current CPU settings:"
+    grep -E '^(checksum|verify_checksum|batch|mtu|port)=' "$file" || true
     return 0
   fi
+  echo "[WARN] Restart failed. Last logs:" >&2
   systemctl status "$svc" --no-pager -l 2>/dev/null || true
-  journalctl -u "$svc" -n 50 --no-pager 2>/dev/null || true
+  journalctl -u "$svc" -n 40 --no-pager 2>/dev/null || true
   return 1
 }
 
 vira7_optimize_cpu_menu() {
-  show_header "Change Vira Transport Profile"
+  show_header "Optimize Vira7 CPU"
   vira7_list_tunnels
   echo
   local id mode_choice mode
-  read -rp "Enter Vira tunnel number, 0=all, 00=menu: " id
+  read -rp "Enter Vira7 tunnel number to optimize, 0=all, 00=menu: " id
   if is_main_menu_token "$id"; then return_main_msg; return 99; fi
-  echo "1) Auto Hybrid UDP -> TCP fallback (recommended)"
-  echo "2) UDP only"
-  echo "3) TCP only"
-  read -rp "Choose transport [1-3]: " mode_choice
+  echo
+  echo "1) Safe low CPU mode (compatible, recommended first)"
+  echo "2) Fast low CPU mode (must be applied on BOTH servers for this Vira7 tunnel)"
+  echo "00) Back to main menu"
+  read -rp "Choose CPU mode [1-2/00]: " mode_choice
+  if is_main_menu_token "$mode_choice"; then return_main_msg; return 99; fi
   case "$mode_choice" in
-    1) mode="auto" ;;
-    2) mode="udp" ;;
-    3) mode="tcp" ;;
+    1) mode="safe" ;;
+    2) mode="fast" ;;
     *) echo "Invalid mode."; return 1 ;;
   esac
   if [ "$id" = "0" ]; then
     local ids one
     ids="$(vira7_collect_ids || true)"
-    [ -n "$ids" ] || { echo "No Vira tunnels found."; return 0; }
-    while IFS= read -r one; do [ -n "$one" ] && vira7_optimize_cpu_one "$one" "$mode" || true; done <<< "$ids"
+    [ -n "$ids" ] || { echo "No Vira7 tunnels found."; return 0; }
+    while IFS= read -r one; do
+      [ -n "$one" ] && vira7_optimize_cpu_one "$one" "$mode" || true
+    done <<< "$ids"
   else
     vira7_optimize_cpu_one "$id" "$mode"
   fi
 }
-
-vira7_diagnostics_one() {
-  local id="$1" svc ifc stats now last age active
-  validate_tunnel_id "$id" || return 1
-  svc="$(vira7_service_name "$id")"
-  ifc="$(vira7_iface_name "$id")"
-  stats="$(vira7_stats_file "$id")"
-  echo "============================================================"
-  echo "Vira Hybrid tunnel $id diagnostics"
-  echo "Service: $svc"
-  if vira7_load_config "$id"; then
-    echo "Role/direction : $SERVER_ROLE / $VIRA7_MODE / $VIRA7_DIRECTION"
-    echo "Transport      : $VIRA7_TRANSPORT (UDP preferred; TCP fallback when auto)"
-    echo "Public path    : $LOCAL_PUBLIC_IP -> $REMOTE_PUBLIC_IP:$VIRA7_PORT"
-    echo "Tunnel path    : $LOCAL_VIRA7_IP -> $REMOTE_VIRA7_IP"
-    echo "MTU/keepalive  : $VIRA7_MTU / ${VIRA7_KEEPALIVE}s"
-  else
-    echo "Config: missing"
-  fi
-  echo "Engine version : $($VIRA7_BINARY --version 2>/dev/null || echo missing)"
-  echo "Service state  : $(systemctl is-active "$svc" 2>/dev/null || true)"
-  echo "Enabled        : $(systemctl is-enabled "$svc" 2>/dev/null || true)"
-  ip -br addr show "$ifc" 2>/dev/null || echo "Interface: missing"
-  echo "UDP listener/socket:"
-  ss -H -lunp 2>/dev/null | grep -E "(^|[:.])${VIRA7_PORT:-0}([[:space:]]|$)" || echo "  no server UDP listener (normal on Client because it uses an ephemeral port)"
-  echo "TCP listener/connection:"
-  ss -H -ltnp 2>/dev/null | grep -E "(^|[:.])${VIRA7_PORT:-0}([[:space:]]|$)" || echo "  no server TCP listener (normal on Client)"
-  ss -H -tnp 2>/dev/null | grep -E "(^|[:.])${VIRA7_PORT:-0}([[:space:]]|$)" || true
-  if [ -f "$stats" ]; then
-    echo "Engine stats:"
-    sed 's/^/  /' "$stats"
-    active="$(awk -F= '$1=="active_transport"{print $2}' "$stats" 2>/dev/null || true)"
-    last="$(awk -F= '$1=="last_rx_epoch"{print $2}' "$stats" 2>/dev/null || true)"
-    if [[ "$last" =~ ^[0-9]+$ ]] && [ "$last" -gt 0 ]; then
-      now="$(date +%s)"; age=$((now - last)); echo "  last_rx_age_seconds=$age"
-    fi
-    [ "$active" = "none" ] && warn_msg "No handshake yet. Check matching tunnel number, port, direction, remote IP, and the other service."
-  else
-    echo "Engine stats: not created yet"
-  fi
-  echo "Ping remote tunnel IP:"
-  ping -c 4 -W 2 "${REMOTE_VIRA7_IP:-0.0.0.0}" || true
-  echo "Last service logs:"
-  journalctl -u "$svc" -n 50 --no-pager 2>/dev/null || true
-}
-
-vira7_diagnostics_menu() {
-  show_header "Vira7 Diagnostics"
-  vira7_list_tunnels
-  echo
-  local id ids one
-  read -rp "Enter Vira7 tunnel number, 0=all, 00=menu: " id
-  if is_main_menu_token "$id"; then return_main_msg; return 99; fi
-  if [ "$id" = "0" ]; then
-    ids="$(vira7_collect_ids || true)"
-    [ -n "$ids" ] || { echo "No Vira7 tunnels found."; return 0; }
-    while IFS= read -r one; do [ -n "$one" ] && vira7_diagnostics_one "$one"; done <<< "$ids"
-  else
-    vira7_diagnostics_one "$id"
-  fi
-}
-
 
 # -----------------------------
 # Shared helpers/menus
@@ -3932,7 +2840,7 @@ build_tunnel_inventory() {
   while IFS= read -r id; do
     [ -n "$id" ] || continue
     ifc="$(vira7_iface_name "$id")"
-    local_ip=""; target=""; local_pub=""; remote_pub=""; desc="Vira Hybrid"
+    local_ip=""; target=""; local_pub=""; remote_pub=""; desc="Vira7 UDP-TUN"
     if vira7_load_config "$id"; then
       local_ip="${LOCAL_VIRA7_IP:-${local_priv:-}}"
       target="${REMOTE_VIRA7_IP:-${remote_priv:-}}"
@@ -4149,7 +3057,6 @@ status_check() {
   case "$SELECTED_TUNNEL_TYPE" in
     gre) gre_status_check ;;
     wireguard) wg_status_check ;;
-    vira7) vira7_diagnostics_menu ;;
   esac
 }
 
@@ -4455,7 +3362,6 @@ reset_all_tunnels() {
 
   echo
   echo "Starting Vira7 tunnels..."
-  vira7_compile_engine || warn_msg "Could not rebuild the Vira Hybrid engine before reset; existing binary will be used if available."
   ids="$(vira7_collect_ids || true)"
   while IFS= read -r id; do
     [ -n "$id" ] || continue
@@ -4966,19 +3872,18 @@ haproxy_menu() {
 }
 
 show_menu() {
-  show_header "GRE + WireGuard + Vira Hybrid Management"
+  show_header "GRE + WireGuard + Vira7 Tunnel Management"
   echo -e "${C_BOLD}${C_WHITE}Main Menu${C_RESET}"
   echo -e "  ${C_GREEN}1)${C_RESET} create/update tunnel"
   echo -e "  ${C_RED}2)${C_RESET} remove tunnel"
   echo -e "  ${C_YELLOW}3)${C_RESET} reset all tunnels"
   echo -e "  ${C_CYAN}4)${C_RESET} ping test tunnels"
   echo -e "  ${C_MAGENTA}5)${C_RESET} haproxy port manager"
-  echo -e "  ${C_BLUE}6)${C_RESET} change Vira transport profile"
-  echo -e "  ${C_CYAN}7)${C_RESET} Vira Hybrid diagnostics / logs"
+  echo -e "  ${C_BLUE}6)${C_RESET} optimize Vira7 CPU"
   echo -e "  ${C_DIM}00) Main menu / back${C_RESET}"
   echo -e "  ${C_DIM}0) Exit${C_RESET}"
   echo
-  read -rp "Choose an option [0-7]: " CHOICE
+  read -rp "Choose an option [0-6]: " CHOICE
   case "$CHOICE" in
     1) if menu_config_tunnel; then pause; fi ;;
     2) if remove_tun; then pause; fi ;;
@@ -4986,7 +3891,6 @@ show_menu() {
     4) if test_tunnels_menu; then pause; fi ;;
     5) haproxy_menu || true ;;
     6) if vira7_optimize_cpu_menu; then pause; fi ;;
-    7) if vira7_diagnostics_menu; then pause; fi ;;
     00) return_main_msg ;;
     0) echo "Bye"; exit 0 ;;
     *) err_msg "Invalid option"; sleep 1 ;;
@@ -5023,7 +3927,7 @@ if [[ "${1:-}" == "--service" ]]; then
       exit $?
       ;;
     *)
-      echo "Unknown service command. Supported: start-gre, firewall-wg, firewall-vira7, start-vira7." >&2
+      echo "Unknown service command. Use --service start-gre <id>." >&2
       exit 1
       ;;
   esac
