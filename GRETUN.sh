@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + WireGuard + Vira7 + HAProxy multi-tunnel manager v8.4-multi-remove
+# GRE + WireGuard + Vira7 + HAProxy multi-tunnel manager v8.5-gre-key-fix
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
@@ -485,14 +485,27 @@ gre_load_config() {
     return 1
   fi
 
+  # Do not let values loaded for a previous GRE tunnel leak into this one.
+  # This was especially dangerous for TUN_KEY: selecting gre3 after gre1
+  # could incorrectly reuse key 1 and make the kernel report "File exists".
+  TUN_IFACE=""
+  TUN_KEY=""
+  ROLE=""
+  LOCAL_PUBLIC_IP=""
+  REMOTE_PUBLIC_IP=""
+  LOCAL_GRE_IP=""
+  REMOTE_GRE_IP=""
+
   local file
   file="$(gre_config_file "$id")"
   if [ -f "$file" ]; then
     # shellcheck disable=SC1090
     source "$file"
     TUNNEL_ID="$id"
-    TUN_IFACE="${TUN_IFACE:-$(gre_iface "$id")}"
-    TUN_KEY="${TUN_KEY:-$id}"
+    TUN_IFACE="$(gre_iface "$id")"
+    # GRE keys are intentionally fixed to the tunnel number in this manager.
+    # Ignore stale/incorrect values from older config files.
+    TUN_KEY="$id"
     return 0
   fi
 
@@ -576,7 +589,9 @@ gre_create_tunnel() {
   fi
 
   TUN_IFACE="$(gre_iface "$TUNNEL_ID")"
-  TUN_KEY="${TUN_KEY:-$TUNNEL_ID}"
+  # Always use the tunnel number as the GRE key. Never inherit a key from
+  # another tunnel that was loaded earlier in the same manager session.
+  TUN_KEY="$TUNNEL_ID"
 
   LOCAL_PUBLIC_IP="${LOCAL_PUBLIC_IP:-$(detect_local_public_ip)}"
   if [ -z "${LOCAL_PUBLIC_IP:-}" ]; then
@@ -616,13 +631,29 @@ gre_create_tunnel() {
   ip link set "$TUN_IFACE" down 2>/dev/null || true
   ip tunnel del "$TUN_IFACE" 2>/dev/null || true
 
-  ip tunnel add "$TUN_IFACE" mode gre local "$LOCAL_PUBLIC_IP" remote "$REMOTE_PUBLIC_IP" key "$TUN_KEY" ttl 255
-  ip addr add "$LOCAL_GRE_IP" dev "$TUN_IFACE"
-  ip link set "$TUN_IFACE" mtu 1390
-  ip link set "$TUN_IFACE" up
+  if ! ip tunnel add "$TUN_IFACE" mode gre local "$LOCAL_PUBLIC_IP" remote "$REMOTE_PUBLIC_IP" key "$TUN_KEY" ttl 255; then
+    echo "Failed to create $TUN_IFACE (local=$LOCAL_PUBLIC_IP remote=$REMOTE_PUBLIC_IP key=$TUN_KEY)." >&2
+    echo "Another GRE interface may already use the same local/remote/key tuple." >&2
+    echo "Current GRE interfaces:" >&2
+    ip -d tunnel show 2>/dev/null >&2 || true
+    return 1
+  fi
+
+  if ! ip addr replace "$LOCAL_GRE_IP" dev "$TUN_IFACE"; then
+    echo "Failed to assign $LOCAL_GRE_IP to $TUN_IFACE" >&2
+    ip tunnel del "$TUN_IFACE" 2>/dev/null || true
+    return 1
+  fi
+
+  if ! ip link set "$TUN_IFACE" mtu 1390 || ! ip link set "$TUN_IFACE" up; then
+    echo "Failed to bring $TUN_IFACE up" >&2
+    ip tunnel del "$TUN_IFACE" 2>/dev/null || true
+    return 1
+  fi
 
   if ! ip link show "$TUN_IFACE" >/dev/null 2>&1; then
     echo "GRE interface creation failed" >&2
+    ip tunnel del "$TUN_IFACE" 2>/dev/null || true
     return 1
   fi
 
