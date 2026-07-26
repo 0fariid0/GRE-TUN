@@ -1,12 +1,13 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + WireGuard + Vira7 + HAProxy multi-tunnel manager v8.5-gre-key-fix
+# Tunnel Manager v9.0-safe-hybrid
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
 # - Local tunnel/bind IPv4 can be selected manually for servers with multiple IPs
-# - v8.5-safe-remove-heal prevents removing active transports used by WireGuard and re-heals remaining tunnels after deletion
+# - v9 adds isolated secure overlays, hybrid failover, optional low-CPU health checks, and WSS/TCP fallback
+# - Normal GRE implementation is preserved unchanged for backward compatibility
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -2722,11 +2723,15 @@ vira7_optimize_cpu_one() {
   # Always safe: skip userspace receive checksum verification and batch packets.
   # Fast mode additionally disables checksum generation; use it only when BOTH sides run this optimized engine.
   set_config_kv "$file" verify_checksum 0
+  set_config_kv "$file" VIRA7_VERIFY_CHECKSUM 0
   set_config_kv "$file" batch 128
+  set_config_kv "$file" VIRA7_BATCH 128
   if [ "$mode" = "fast" ]; then
     set_config_kv "$file" checksum 0
+    set_config_kv "$file" VIRA7_CHECKSUM 0
   else
     set_config_kv "$file" checksum 1
+    set_config_kv "$file" VIRA7_CHECKSUM 1
   fi
 
   echo "Recompiling optimized Vira7 engine..."
@@ -3897,7 +3902,1514 @@ show_menu() {
   esac
 }
 
+# ============================================================================
+# Tunnel Manager v9 additions
+# These functions are intentionally defined after the legacy implementation.
+# Bash uses the last function definition, allowing v9 to extend the manager
+# without changing the Normal GRE implementation or old configuration files.
+# ============================================================================
+
+TM9_VERSION="9.0.0"
+TM9_DIR="/etc/tunnel-manager-v9"
+TM9_HEALTH_DIR="$TM9_DIR/health"
+TM9_HEALTH_CONFIG="$TM9_DIR/health.conf"
+TM9_HEALTH_SERVICE="/etc/systemd/system/tm9-health.service"
+TM9_HEALTH_TIMER="/etc/systemd/system/tm9-health.timer"
+TM9_HYBRID_SERVICE_TEMPLATE="/etc/systemd/system/tm9-hybrid@.service"
+TM9_WSS_SERVICE_TEMPLATE="/etc/systemd/system/tm9-wss@.service"
+TM9_WSTUNNEL_BIN="/usr/local/bin/wstunnel"
+TM9_WSTUNNEL_VERSION="${TM9_WSTUNNEL_VERSION:-10.5.5}"
+TM9_WGGRE_PORT_BASE=54000
+TM9_WGVIRA_PORT_BASE=54400
+TM9_WSS_WG_PORT_BASE=54800
+TM9_WSS_CLIENT_LISTEN_BASE=55200
+TM9_WSS_TCP_PORT_BASE=24000
+TM9_HEALTH_DEFAULT_INTERVAL=30
+TM9_HEALTH_DEFAULT_FAIL_LIMIT=3
+TM9_HEALTH_DEFAULT_COOLDOWN=120
+
+# Preserve access to the legacy reset implementation before overriding it.
+if declare -F reset_all_tunnels >/dev/null 2>&1 && ! declare -F tm9_legacy_reset_all_tunnels >/dev/null 2>&1; then
+  eval "$(declare -f reset_all_tunnels | sed '1s/reset_all_tunnels/tm9_legacy_reset_all_tunnels/')"
+fi
+
+# -----------------------------
+# v9 shared helpers
+# -----------------------------
+tm9_prepare_dirs() {
+  mkdir -p "$TM9_DIR" "$TM9_HEALTH_DIR" "$TM9_DIR/wggre/keys" "$TM9_DIR/wgvira/keys" "$TM9_DIR/hybrid" "$TM9_DIR/wss/keys"
+  chmod 700 "$TM9_DIR" "$TM9_DIR/wggre/keys" "$TM9_DIR/wgvira/keys" "$TM9_DIR/wss/keys" 2>/dev/null || true
+}
+
+tm9_fixed_port() {
+  local kind="$1" id="$2"
+  case "$kind" in
+    wggre) echo $((TM9_WGGRE_PORT_BASE + id)) ;;
+    wgvira) echo $((TM9_WGVIRA_PORT_BASE + id)) ;;
+    wss-wg) echo $((TM9_WSS_WG_PORT_BASE + id)) ;;
+    wss-client) echo $((TM9_WSS_CLIENT_LISTEN_BASE + id)) ;;
+    wss-tcp) echo $((TM9_WSS_TCP_PORT_BASE + id)) ;;
+    *) return 1 ;;
+  esac
+}
+
+tm9_port_range_text() {
+  cat <<EOF
+Reserved v9 port ranges (no automatic increment):
+  WireGuard over GRE : $((TM9_WGGRE_PORT_BASE + 1))-$((TM9_WGGRE_PORT_BASE + 254))/udp
+  WireGuard over Vira: $((TM9_WGVIRA_PORT_BASE + 1))-$((TM9_WGVIRA_PORT_BASE + 254))/udp
+  WSS remote WG      : $((TM9_WSS_WG_PORT_BASE + 1))-$((TM9_WSS_WG_PORT_BASE + 254))/udp (loopback/server)
+  WSS client WG      : $((TM9_WSS_CLIENT_LISTEN_BASE + 1))-$((TM9_WSS_CLIENT_LISTEN_BASE + 254))/udp
+  WSS public TCP     : $((TM9_WSS_TCP_PORT_BASE + 1))-$((TM9_WSS_TCP_PORT_BASE + 254))/tcp
+EOF
+}
+
+tm9_port_busy() {
+  local proto="$1" port="$2"
+  case "$proto" in
+    udp)
+      ss -H -lun 2>/dev/null | awk '{print $5}' | grep -Eq "(^|[:.])${port}$"
+      ;;
+    tcp)
+      ss -H -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(^|[:.])${port}$"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+tm9_validate_free_port() {
+  local proto="$1" port="$2" label="$3"
+  validate_port "$port" || { err_msg "Invalid $label port: $port"; return 1; }
+  if tm9_port_busy "$proto" "$port"; then
+    err_msg "$label port $port/$proto is already in use."
+    echo "v9 will not silently select another port because both servers must use the same deterministic port."
+    echo "Free the port or select another tunnel number."
+    return 1
+  fi
+}
+
+tm9_ping_quiet() {
+  local target="$1" ifc="${2:-}"
+  [ -n "$target" ] || return 1
+  if [ -n "$ifc" ]; then
+    ping -I "$ifc" -c 1 -W 1 "$target" >/dev/null 2>&1
+  else
+    ping -c 1 -W 1 "$target" >/dev/null 2>&1
+  fi
+}
+
+tm9_generate_secret() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 18
+  else
+    tr -dc 'A-Za-z0-9' </dev/urandom | head -c 36
+  fi
+}
+
+tm9_install_self() {
+  mkdir -p "$(dirname "$INSTALL_BIN")"
+  cp -f "$0" "$INSTALL_BIN"
+  chmod 755 "$INSTALL_BIN"
+}
+
+tm9_disable_rp_filter() {
+  local ifc
+  for ifc in "$@"; do
+    [ -n "$ifc" ] || continue
+    [ -e "/proc/sys/net/ipv4/conf/$ifc/rp_filter" ] && echo 0 > "/proc/sys/net/ipv4/conf/$ifc/rp_filter" 2>/dev/null || true
+  done
+  [ -e /proc/sys/net/ipv4/conf/all/rp_filter ] && echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter 2>/dev/null || true
+}
+
+tm9_write_health_defaults() {
+  tm9_prepare_dirs
+  if [ ! -f "$TM9_HEALTH_CONFIG" ]; then
+    cat > "$TM9_HEALTH_CONFIG" <<EOF
+ENABLED=0
+INTERVAL=$TM9_HEALTH_DEFAULT_INTERVAL
+FAIL_LIMIT=$TM9_HEALTH_DEFAULT_FAIL_LIMIT
+COOLDOWN=$TM9_HEALTH_DEFAULT_COOLDOWN
+EOF
+    chmod 600 "$TM9_HEALTH_CONFIG"
+  fi
+}
+
+tm9_health_is_enabled() {
+  tm9_write_health_defaults
+  local ENABLED=0
+  # shellcheck disable=SC1090
+  source "$TM9_HEALTH_CONFIG"
+  [ "${ENABLED:-0}" = "1" ]
+}
+
+tm9_set_health_flag_in_file() {
+  local file="$1" value="$2"
+  [ -f "$file" ] || return 0
+  set_config_kv "$file" HEALTH_ENABLED "$value"
+}
+
+# -----------------------------
+# Isolated WireGuard overlays over GRE/Vira7
+# -----------------------------
+tm9_overlay_dir() { echo "$TM9_DIR/$1"; }
+tm9_overlay_meta() { echo "$(tm9_overlay_dir "$1")/tunnel-$2.conf"; }
+tm9_overlay_iface() {
+  case "$1" in
+    wggre) echo "wggre$2" ;;
+    wgvira) echo "wgvira$2" ;;
+    *) return 1 ;;
+  esac
+}
+tm9_overlay_key_private() { echo "$(tm9_overlay_dir "$1")/keys/tunnel-$2.private"; }
+tm9_overlay_key_public() { echo "$(tm9_overlay_dir "$1")/keys/tunnel-$2.public"; }
+tm9_overlay_wg_config() { echo "$WG_CONFIG_DIR/$(tm9_overlay_iface "$1" "$2").conf"; }
+tm9_overlay_service() { echo "wg-quick@$(tm9_overlay_iface "$1" "$2").service"; }
+
+tm9_overlay_base_octet() {
+  case "$1" in
+    wggre) echo 81 ;;
+    wgvira) echo 82 ;;
+    *) return 1 ;;
+  esac
+}
+
+tm9_overlay_local_ip() {
+  local octet role id
+  octet="$(tm9_overlay_base_octet "$1")"; id="$2"; role="$3"
+  if [ "$role" = "1" ]; then echo "10.${octet}.${id}.1"; else echo "10.${octet}.${id}.2"; fi
+}
+
+tm9_overlay_remote_ip() {
+  local octet role id
+  octet="$(tm9_overlay_base_octet "$1")"; id="$2"; role="$3"
+  if [ "$role" = "1" ]; then echo "10.${octet}.${id}.2"; else echo "10.${octet}.${id}.1"; fi
+}
+
+tm9_hybrid_local_ip_for_role() {
+  local id="$1" role="$2"
+  if [ "$role" = "1" ]; then echo "10.83.${id}.1"; else echo "10.83.${id}.2"; fi
+}
+
+tm9_hybrid_remote_ip_for_role() {
+  local id="$1" role="$2"
+  if [ "$role" = "1" ]; then echo "10.83.${id}.2"; else echo "10.83.${id}.1"; fi
+}
+
+tm9_overlay_transport_iface() {
+  case "$1" in
+    wggre) gre_iface "$2" ;;
+    wgvira) vira7_iface_name "$2" ;;
+    *) return 1 ;;
+  esac
+}
+
+tm9_overlay_transport_remote_ip() {
+  local kind="$1" id="$2" role="$3"
+  case "$kind" in
+    wggre) gre_remote_inner_ip_for_role "$id" "$role" ;;
+    wgvira) vira7_remote_inner_ip_for_role "$id" "$role" ;;
+    *) return 1 ;;
+  esac
+}
+
+tm9_overlay_default_port() {
+  case "$1" in
+    wggre) tm9_fixed_port wggre "$2" ;;
+    wgvira) tm9_fixed_port wgvira "$2" ;;
+    *) return 1 ;;
+  esac
+}
+
+tm9_overlay_reset_vars() {
+  unset TM9_KIND TM9_ID TM9_ROLE TM9_IFACE TM9_LOCAL_IP TM9_REMOTE_IP TM9_TRANSPORT_IFACE TM9_TRANSPORT_REMOTE_IP TM9_LISTEN_PORT TM9_REMOTE_PUBLIC_KEY TM9_MTU HEALTH_ENABLED 2>/dev/null || true
+}
+
+tm9_overlay_load() {
+  local kind="$1" id="$2" file
+  validate_tunnel_id "$id" || return 1
+  file="$(tm9_overlay_meta "$kind" "$id")"
+  [ -f "$file" ] || return 1
+  tm9_overlay_reset_vars
+  # shellcheck disable=SC1090
+  source "$file"
+  TM9_KIND="$kind"; TM9_ID="$id"
+  TM9_IFACE="${TM9_IFACE:-$(tm9_overlay_iface "$kind" "$id")}" 
+  TM9_LISTEN_PORT="${TM9_LISTEN_PORT:-$(tm9_overlay_default_port "$kind" "$id")}" 
+  HEALTH_ENABLED="${HEALTH_ENABLED:-0}"
+}
+
+tm9_overlay_generate_keys() {
+  local kind="$1" id="$2" private public
+  wg_ensure_tools || return 1
+  tm9_prepare_dirs
+  private="$(tm9_overlay_key_private "$kind" "$id")"
+  public="$(tm9_overlay_key_public "$kind" "$id")"
+  if [ ! -s "$private" ]; then
+    umask 077
+    wg genkey > "$private"
+    wg pubkey < "$private" > "$public"
+    chmod 600 "$private"; chmod 644 "$public"
+  elif [ ! -s "$public" ]; then
+    wg pubkey < "$private" > "$public"
+    chmod 644 "$public"
+  fi
+}
+
+tm9_overlay_save() {
+  local kind="$1" id="$2" file
+  tm9_prepare_dirs
+  file="$(tm9_overlay_meta "$kind" "$id")"
+  {
+    write_var TM9_KIND "$kind"
+    write_var TM9_ID "$id"
+    write_var TM9_ROLE "$TM9_ROLE"
+    write_var TM9_IFACE "$TM9_IFACE"
+    write_var TM9_LOCAL_IP "$TM9_LOCAL_IP"
+    write_var TM9_REMOTE_IP "$TM9_REMOTE_IP"
+    write_var TM9_TRANSPORT_IFACE "$TM9_TRANSPORT_IFACE"
+    write_var TM9_TRANSPORT_REMOTE_IP "$TM9_TRANSPORT_REMOTE_IP"
+    write_var TM9_LISTEN_PORT "$TM9_LISTEN_PORT"
+    write_var TM9_REMOTE_PUBLIC_KEY "${TM9_REMOTE_PUBLIC_KEY:-}"
+    write_var TM9_MTU "${TM9_MTU:-1280}"
+    write_var HEALTH_ENABLED "${HEALTH_ENABLED:-0}"
+  } > "$file"
+  chmod 600 "$file"
+}
+
+tm9_overlay_write_wg_config() {
+  local kind="$1" id="$2" private_key conf hybrid_remote
+  private_key="$(cat "$(tm9_overlay_key_private "$kind" "$id")")"
+  conf="$(tm9_overlay_wg_config "$kind" "$id")"
+  hybrid_remote="$(tm9_hybrid_remote_ip_for_role "$id" "$TM9_ROLE")"
+  mkdir -p "$WG_CONFIG_DIR"
+  chmod 700 "$WG_CONFIG_DIR" 2>/dev/null || true
+  cat > "$conf" <<EOF
+[Interface]
+PrivateKey = $private_key
+Address = $TM9_LOCAL_IP/30
+ListenPort = $TM9_LISTEN_PORT
+MTU = ${TM9_MTU:-1280}
+Table = off
+
+[Peer]
+PublicKey = $TM9_REMOTE_PUBLIC_KEY
+Endpoint = $TM9_TRANSPORT_REMOTE_IP:$TM9_LISTEN_PORT
+AllowedIPs = $TM9_REMOTE_IP/32, $hybrid_remote/32
+PersistentKeepalive = 15
+EOF
+  chmod 600 "$conf"
+}
+
+tm9_overlay_apply_firewall() {
+  local kind="$1" id="$2"
+  tm9_overlay_load "$kind" "$id" || return 1
+  enable_ip_forward
+  tm9_disable_rp_filter "$TM9_IFACE" "$TM9_TRANSPORT_IFACE"
+  if command -v iptables >/dev/null 2>&1; then
+    iptables -C INPUT -i "$TM9_TRANSPORT_IFACE" -p udp --dport "$TM9_LISTEN_PORT" -j ACCEPT 2>/dev/null || iptables -A INPUT -i "$TM9_TRANSPORT_IFACE" -p udp --dport "$TM9_LISTEN_PORT" -j ACCEPT || true
+    iptables -C OUTPUT -o "$TM9_TRANSPORT_IFACE" -p udp -d "$TM9_TRANSPORT_REMOTE_IP" --dport "$TM9_LISTEN_PORT" -j ACCEPT 2>/dev/null || iptables -A OUTPUT -o "$TM9_TRANSPORT_IFACE" -p udp -d "$TM9_TRANSPORT_REMOTE_IP" --dport "$TM9_LISTEN_PORT" -j ACCEPT || true
+    iptables -C INPUT -i "$TM9_IFACE" -j ACCEPT 2>/dev/null || iptables -A INPUT -i "$TM9_IFACE" -j ACCEPT || true
+    iptables -C OUTPUT -o "$TM9_IFACE" -j ACCEPT 2>/dev/null || iptables -A OUTPUT -o "$TM9_IFACE" -j ACCEPT || true
+    iptables -C FORWARD -i "$TM9_IFACE" -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$TM9_IFACE" -j ACCEPT || true
+    iptables -C FORWARD -o "$TM9_IFACE" -j ACCEPT 2>/dev/null || iptables -A FORWARD -o "$TM9_IFACE" -j ACCEPT || true
+  fi
+  if command -v ufw >/dev/null 2>&1; then
+    ufw allow in on "$TM9_TRANSPORT_IFACE" to any port "$TM9_LISTEN_PORT" proto udp >/dev/null 2>&1 || true
+    ufw allow in on "$TM9_IFACE" >/dev/null 2>&1 || true
+  fi
+}
+
+tm9_overlay_start() {
+  local kind="$1" id="$2" svc conf
+  tm9_overlay_load "$kind" "$id" || return 1
+  [ -n "${TM9_REMOTE_PUBLIC_KEY:-}" ] || { warn_msg "$kind tunnel $id is pending the peer key."; return 0; }
+  conf="$(tm9_overlay_wg_config "$kind" "$id")"
+  [ -f "$conf" ] || tm9_overlay_write_wg_config "$kind" "$id"
+  tm9_overlay_apply_firewall "$kind" "$id" || true
+  svc="$(tm9_overlay_service "$kind" "$id")"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable "$svc" >/dev/null 2>&1 || true
+  wg-quick down "$TM9_IFACE" >/dev/null 2>&1 || true
+  ip link delete "$TM9_IFACE" 2>/dev/null || true
+  if systemctl restart "$svc"; then
+    ok_msg "$kind tunnel $id started as $TM9_IFACE"
+  else
+    systemctl status "$svc" --no-pager -l 2>/dev/null || true
+    return 1
+  fi
+}
+
+tm9_overlay_configure() {
+  local kind="$1" existing_key="" existing_health=0 peer_input local_pub transport_label was_active=0 meta_bak="" conf_bak=""
+  show_header "$( [ "$kind" = wggre ] && echo 'WireGuard over GRE' || echo 'WireGuard over Vira7' )"
+  prompt_role || return
+  TM9_ROLE="$ROLE"
+  echo
+  prompt_tunnel_id "Enter secure overlay tunnel number [1-254]: " || return
+  TM9_ID="$TUNNEL_ID"
+  TM9_IFACE="$(tm9_overlay_iface "$kind" "$TM9_ID")"
+  TM9_TRANSPORT_IFACE="$(tm9_overlay_transport_iface "$kind" "$TM9_ID")"
+  TM9_TRANSPORT_REMOTE_IP="$(tm9_overlay_transport_remote_ip "$kind" "$TM9_ID" "$TM9_ROLE")"
+  TM9_LOCAL_IP="$(tm9_overlay_local_ip "$kind" "$TM9_ID" "$TM9_ROLE")"
+  TM9_REMOTE_IP="$(tm9_overlay_remote_ip "$kind" "$TM9_ID" "$TM9_ROLE")"
+  TM9_LISTEN_PORT="$(tm9_overlay_default_port "$kind" "$TM9_ID")"
+  TM9_MTU=1280
+  HEALTH_ENABLED=0
+
+  if tm9_overlay_load "$kind" "$TM9_ID"; then
+    existing_key="${TM9_REMOTE_PUBLIC_KEY:-}"
+    existing_health="${HEALTH_ENABLED:-0}"
+    TM9_ROLE="$ROLE"
+    TM9_IFACE="$(tm9_overlay_iface "$kind" "$TM9_ID")"
+    TM9_TRANSPORT_IFACE="$(tm9_overlay_transport_iface "$kind" "$TM9_ID")"
+    TM9_TRANSPORT_REMOTE_IP="$(tm9_overlay_transport_remote_ip "$kind" "$TM9_ID" "$TM9_ROLE")"
+    TM9_LOCAL_IP="$(tm9_overlay_local_ip "$kind" "$TM9_ID" "$TM9_ROLE")"
+    TM9_REMOTE_IP="$(tm9_overlay_remote_ip "$kind" "$TM9_ID" "$TM9_ROLE")"
+    TM9_LISTEN_PORT="$(tm9_overlay_default_port "$kind" "$TM9_ID")"
+    TM9_MTU="${TM9_MTU:-1280}"
+  fi
+  TM9_REMOTE_PUBLIC_KEY="$existing_key"
+  HEALTH_ENABLED="$existing_health"
+
+  if [ ! -f "/sys/class/net/$TM9_TRANSPORT_IFACE/ifindex" ]; then
+    err_msg "Required transport interface $TM9_TRANSPORT_IFACE does not exist."
+    if [ "$kind" = "wggre" ]; then
+      echo "Create Normal GRE tunnel $TM9_ID on both servers first."
+    else
+      echo "Create Improved Vira7 tunnel $TM9_ID on both servers first."
+    fi
+    return 1
+  fi
+
+  transport_label="GRE"
+  [ "$kind" = "wgvira" ] && transport_label="Vira7"
+  echo "$transport_label transport : $TM9_TRANSPORT_IFACE -> $TM9_TRANSPORT_REMOTE_IP"
+  echo "Secure interface   : $TM9_IFACE"
+  echo "Iran secure IP     : $(tm9_overlay_local_ip "$kind" "$TM9_ID" 1)"
+  echo "Kharej secure IP   : $(tm9_overlay_remote_ip "$kind" "$TM9_ID" 1)"
+  echo "Fixed UDP port     : $TM9_LISTEN_PORT (inside $transport_label only)"
+  echo "Hybrid stable range: 10.83.$TM9_ID.x (reserved; no route unless Hybrid is configured)"
+  echo
+
+  tm9_overlay_generate_keys "$kind" "$TM9_ID" || return 1
+  local_pub="$(cat "$(tm9_overlay_key_public "$kind" "$TM9_ID")")"
+  echo "LOCAL WireGuard public key:"
+  echo "$local_pub"
+  echo
+  if [ -n "$TM9_REMOTE_PUBLIC_KEY" ]; then
+    read -rp "REMOTE peer key [Enter=keep, CLEAR=remove, or paste new] (00=menu): " peer_input
+    if is_main_menu_token "$peer_input"; then return_main_msg; return 99; fi
+    case "$peer_input" in
+      "") ;;
+      CLEAR|clear) TM9_REMOTE_PUBLIC_KEY="" ;;
+      *) TM9_REMOTE_PUBLIC_KEY="$(normalize_wg_public_key "$peer_input")" ;;
+    esac
+  else
+    read -rp "Paste OTHER server WireGuard public key, or Enter to save pending (00=menu): " peer_input
+    if is_main_menu_token "$peer_input"; then return_main_msg; return 99; fi
+    TM9_REMOTE_PUBLIC_KEY="$(normalize_wg_public_key "$peer_input")"
+  fi
+
+  if [ -n "$TM9_REMOTE_PUBLIC_KEY" ] && ! validate_wg_public_key "$TM9_REMOTE_PUBLIC_KEY"; then
+    if [ -n "$existing_key" ]; then warn_msg "Invalid replacement key; keeping the previous working peer key."; TM9_REMOTE_PUBLIC_KEY="$existing_key"; else err_msg "Invalid remote WireGuard public key. Saving as pending."; TM9_REMOTE_PUBLIC_KEY=""; fi
+  fi
+  if [ "$TM9_REMOTE_PUBLIC_KEY" = "$local_pub" ]; then
+    if [ -n "$existing_key" ]; then warn_msg "Own key entered; keeping the previous working peer key."; TM9_REMOTE_PUBLIC_KEY="$existing_key"; else err_msg "You entered this server's own public key. Saving as pending."; TM9_REMOTE_PUBLIC_KEY=""; fi
+  fi
+
+  if confirm_yes "Enable optional low-CPU external health check for this secure overlay?"; then HEALTH_ENABLED=1; else HEALTH_ENABLED=0; fi
+
+  systemctl is-active --quiet "$(tm9_overlay_service "$kind" "$TM9_ID")" 2>/dev/null && was_active=1 || true
+  if [ -f "$(tm9_overlay_meta "$kind" "$TM9_ID")" ]; then meta_bak="$(mktemp)"; cp -f "$(tm9_overlay_meta "$kind" "$TM9_ID")" "$meta_bak"; fi
+  if [ -f "$(tm9_overlay_wg_config "$kind" "$TM9_ID")" ]; then conf_bak="$(mktemp)"; cp -f "$(tm9_overlay_wg_config "$kind" "$TM9_ID")" "$conf_bak"; fi
+  systemctl stop "$(tm9_overlay_service "$kind" "$TM9_ID")" >/dev/null 2>&1 || true
+  wg-quick down "$TM9_IFACE" >/dev/null 2>&1 || true
+  if ! tm9_validate_free_port udp "$TM9_LISTEN_PORT" "$kind"; then
+    [ "$was_active" = 1 ] && systemctl restart "$(tm9_overlay_service "$kind" "$TM9_ID")" >/dev/null 2>&1 || true
+    rm -f "$meta_bak" "$conf_bak"
+    return 1
+  fi
+
+  tm9_overlay_save "$kind" "$TM9_ID"
+  if [ -z "$TM9_REMOTE_PUBLIC_KEY" ]; then
+    rm -f "$(tm9_overlay_wg_config "$kind" "$TM9_ID")"
+    warn_msg "Saved as PENDING. Configure the same type/number on the other server and exchange public keys."
+    echo "Metadata: $(tm9_overlay_meta "$kind" "$TM9_ID")"
+    rm -f "$meta_bak" "$conf_bak"
+    return 0
+  fi
+
+  tm9_overlay_write_wg_config "$kind" "$TM9_ID"
+  if ! tm9_overlay_start "$kind" "$TM9_ID"; then
+    err_msg "New $kind configuration failed; restoring the previous saved configuration."
+    if [ -n "$meta_bak" ] && [ -s "$meta_bak" ]; then cp -f "$meta_bak" "$(tm9_overlay_meta "$kind" "$TM9_ID")"; fi
+    if [ -n "$conf_bak" ] && [ -s "$conf_bak" ]; then cp -f "$conf_bak" "$(tm9_overlay_wg_config "$kind" "$TM9_ID")"; fi
+    [ "$was_active" = 1 ] && systemctl restart "$(tm9_overlay_service "$kind" "$TM9_ID")" >/dev/null 2>&1 || true
+    rm -f "$meta_bak" "$conf_bak"
+    return 1
+  fi
+  rm -f "$meta_bak" "$conf_bak"
+  echo "Test after both sides are configured: ping $TM9_REMOTE_IP"
+}
+
+tm9_overlay_collect_ids() {
+  local kind="$1" f id dir
+  dir="$(tm9_overlay_dir "$kind")"
+  [ -d "$dir" ] || return 0
+  for f in "$dir"/tunnel-*.conf; do
+    [ -e "$f" ] || continue
+    id="${f##*/tunnel-}"; id="${id%.conf}"
+    validate_tunnel_id "$id" && echo "$id"
+  done | sort -n -u
+}
+
+tm9_overlay_remove() {
+  local kind="$1" id="$2" ifc svc
+  ifc="$(tm9_overlay_iface "$kind" "$id")"; svc="$(tm9_overlay_service "$kind" "$id")"
+  systemctl disable --now "$svc" >/dev/null 2>&1 || true
+  wg-quick down "$ifc" >/dev/null 2>&1 || true
+  ip link delete "$ifc" 2>/dev/null || true
+  rm -f "$(tm9_overlay_wg_config "$kind" "$id")" "$(tm9_overlay_meta "$kind" "$id")" "$(tm9_overlay_key_private "$kind" "$id")" "$(tm9_overlay_key_public "$kind" "$id")"
+  rm -rf "$TM9_HEALTH_DIR/$kind-$id"
+  ok_msg "$kind tunnel $id removed. Transport GRE/Vira7 was not touched."
+}
+
+tm9_overlay_status_line() {
+  local kind="$1" id="$2" ifc state target health pending=""
+  ifc="$(tm9_overlay_iface "$kind" "$id")"; state="inactive"
+  ip link show "$ifc" >/dev/null 2>&1 && state="active"
+  if tm9_overlay_load "$kind" "$id"; then
+    target="${TM9_REMOTE_IP:-unknown}"; health="${HEALTH_ENABLED:-0}"
+    [ -z "${TM9_REMOTE_PUBLIC_KEY:-}" ] && pending="/pending"
+    echo "  - $kind $id | $ifc | ${state}${pending} | remote $target | UDP $TM9_LISTEN_PORT | health=$health"
+  fi
+}
+
+tm9_vira_port_reserved_elsewhere() {
+  local want="$1" current_id="$2" f id saved
+  [ -d "$VIRA7_CONFIG_DIR" ] || return 1
+  for f in "$VIRA7_CONFIG_DIR"/tunnel-*.conf; do
+    [ -e "$f" ] || continue
+    id="${f##*/tunnel-}"; id="${id%.conf}"
+    [ "$id" = "$current_id" ] && continue
+    saved="$(bash -c '. "$1" 2>/dev/null; printf "%s" "${VIRA7_PORT:-${port:-}}"' _ "$f" 2>/dev/null || true)"
+    [ "$saved" = "$want" ] && return 0
+  done
+  return 1
+}
+
+# -----------------------------
+# Improved Vira7 protocol (wire-compatible with existing Vira7)
+# -----------------------------
+# New configs opt into peer locking, dead-path recovery and lightweight status.
+# Old configs do not contain these keys and retain old behavior (all defaults 0).
+vira7_compile_engine() {
+  vira7_ensure_deps || return 1
+  mkdir -p "$VIRA7_CONFIG_DIR"
+  cat > "$VIRA7_SOURCE" <<'ENGINEEOF'
+#define _GNU_SOURCE
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/if.h>
+#include <linux/if_tun.h>
+#include <netinet/in.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <time.h>
+#include <unistd.h>
+
+#define TUN_DEVICE "/dev/net/tun"
+#define MAX_PKT_SIZE 2000
+#define VIRA7_MAGIC 0x5637
+#define PKT_DATA 1
+#define PKT_KEEPALIVE 2
+#define PKT_ACK 3
+
+typedef struct __attribute__((packed)) {
+    uint16_t magic;
+    uint16_t type;
+    uint32_t seq;
+    uint16_t length;
+    uint16_t checksum;
+} v7_hdr_t;
+
+typedef struct {
+    char iface[IFNAMSIZ];
+    char mode[16];
+    char bind_ip[64];
+    char remote_ip[64];
+    char local_priv[64];
+    char remote_priv[64];
+    int port, mtu, keepalive, buffer_size, queue_len, checksum, verify_checksum, batch;
+    int dead_timeout, peer_lock, status_interval;
+} v7_config_t;
+
+static volatile sig_atomic_t running = 1;
+static uint32_t seqno = 1;
+static int g_send_checksum = 1;
+static int g_verify_checksum = 0;
+static void on_signal(int sig) { (void)sig; running = 0; }
+static void trim(char *s) {
+    char *p=s; while (*p==' '||*p=='\t'||*p=='\r'||*p=='\n') p++;
+    if (p!=s) memmove(s,p,strlen(p)+1);
+    size_t n=strlen(s); while(n&&(s[n-1]==' '||s[n-1]=='\t'||s[n-1]=='\r'||s[n-1]=='\n')) s[--n]=0;
+}
+static uint16_t csum16(const uint8_t *buf,size_t len){uint32_t sum=0;for(size_t i=0;i<len;i++){sum+=buf[i];sum=(sum&0xffffU)+(sum>>16);}return(uint16_t)(~sum&0xffffU);}
+static int load_config(const char *path,v7_config_t *c){
+    memset(c,0,sizeof(*c)); snprintf(c->iface,sizeof(c->iface),"vira7"); snprintf(c->mode,sizeof(c->mode),"client");
+    c->port=5571;c->mtu=1400;c->keepalive=5;c->buffer_size=2097152;c->queue_len=1000;c->checksum=1;c->verify_checksum=0;c->batch=128;
+    c->dead_timeout=0;c->peer_lock=0;c->status_interval=0;
+    FILE*f=fopen(path,"r");if(!f)return-1;char line[512];
+    while(fgets(line,sizeof(line),f)){trim(line);if(!line[0]||line[0]=='#')continue;char*eq=strchr(line,'=');if(!eq)continue;*eq=0;char*key=line;char*val=eq+1;trim(key);trim(val);
+        if(!strcmp(key,"iface"))snprintf(c->iface,sizeof(c->iface),"%s",val);else if(!strcmp(key,"mode"))snprintf(c->mode,sizeof(c->mode),"%s",val);
+        else if(!strcmp(key,"bind_ip"))snprintf(c->bind_ip,sizeof(c->bind_ip),"%s",val);else if(!strcmp(key,"remote_ip"))snprintf(c->remote_ip,sizeof(c->remote_ip),"%s",val);
+        else if(!strcmp(key,"local_priv"))snprintf(c->local_priv,sizeof(c->local_priv),"%s",val);else if(!strcmp(key,"remote_priv"))snprintf(c->remote_priv,sizeof(c->remote_priv),"%s",val);
+        else if(!strcmp(key,"port"))c->port=atoi(val);else if(!strcmp(key,"mtu"))c->mtu=atoi(val);else if(!strcmp(key,"keepalive"))c->keepalive=atoi(val);
+        else if(!strcmp(key,"buffer_size"))c->buffer_size=atoi(val);else if(!strcmp(key,"queue_len"))c->queue_len=atoi(val);else if(!strcmp(key,"checksum"))c->checksum=atoi(val);
+        else if(!strcmp(key,"verify_checksum"))c->verify_checksum=atoi(val);else if(!strcmp(key,"batch"))c->batch=atoi(val);else if(!strcmp(key,"dead_timeout"))c->dead_timeout=atoi(val);
+        else if(!strcmp(key,"peer_lock"))c->peer_lock=atoi(val);else if(!strcmp(key,"status_interval"))c->status_interval=atoi(val);
+    }
+    fclose(f);if(!c->local_priv[0]||!c->remote_priv[0]||c->port<=0||c->port>65535)return-1;if(!strcmp(c->mode,"client")&&!c->remote_ip[0])return-1;
+    if (c->mtu < 576 || c->mtu > 1600) c->mtu = 1400;
+    if (c->keepalive < 1 || c->keepalive > 60) c->keepalive = 5;
+    if (c->queue_len < 100) c->queue_len = 1000;
+    if (c->buffer_size < 65536) c->buffer_size = 2097152;
+    c->checksum = c->checksum ? 1 : 0;
+    c->verify_checksum = c->verify_checksum ? 1 : 0;
+    if (c->batch < 1) c->batch = 1;
+    if (c->batch > 512) c->batch = 512;
+    if (c->dead_timeout < 0 || c->dead_timeout > 600) c->dead_timeout = 0;
+    c->peer_lock = c->peer_lock ? 1 : 0;
+    if (c->status_interval < 0 || c->status_interval > 60) c->status_interval = 0;
+    return 0;
+}
+static int tun_alloc_named(const char*dev){struct ifreq ifr;int fd=open(TUN_DEVICE,O_RDWR);if(fd<0)return-1;memset(&ifr,0,sizeof(ifr));ifr.ifr_flags=IFF_TUN|IFF_NO_PI;snprintf(ifr.ifr_name,IFNAMSIZ,"%s",dev);if(ioctl(fd,TUNSETIFF,&ifr)<0){close(fd);return-1;}int flags=fcntl(fd,F_GETFL,0);if(flags>=0)fcntl(fd,F_SETFL,flags|O_NONBLOCK);return fd;}
+static void cleanup_iface(const char*iface){char cmd[256];snprintf(cmd,sizeof(cmd),"ip link del %s 2>/dev/null",iface);system(cmd);}
+static int configure_tun(const v7_config_t*c){char cmd[512];snprintf(cmd,sizeof(cmd),"ip link set dev %s up mtu %d txqueuelen %d",c->iface,c->mtu,c->queue_len);if(system(cmd)!=0)return-1;snprintf(cmd,sizeof(cmd),"ip addr add %s/32 peer %s dev %s 2>/dev/null || true",c->local_priv,c->remote_priv,c->iface);return system(cmd)==0?0:-1;}
+static int udp_socket_create(const v7_config_t*c){int fd=socket(AF_INET,SOCK_DGRAM,0);if(fd<0)return-1;int yes=1;setsockopt(fd,SOL_SOCKET,SO_REUSEADDR,&yes,sizeof(yes));setsockopt(fd,SOL_SOCKET,SO_RCVBUF,&c->buffer_size,sizeof(c->buffer_size));setsockopt(fd,SOL_SOCKET,SO_SNDBUF,&c->buffer_size,sizeof(c->buffer_size));struct sockaddr_in addr;memset(&addr,0,sizeof(addr));addr.sin_family=AF_INET;addr.sin_port=htons((uint16_t)c->port);if(c->bind_ip[0]){if(inet_pton(AF_INET,c->bind_ip,&addr.sin_addr)!=1){close(fd);return-1;}}else addr.sin_addr.s_addr=htonl(INADDR_ANY);if(bind(fd,(struct sockaddr*)&addr,sizeof(addr))<0){close(fd);return-1;}int flags=fcntl(fd,F_GETFL,0);if(flags>=0)fcntl(fd,F_SETFL,flags|O_NONBLOCK);return fd;}
+static int send_v7(int fd,const struct sockaddr_in*dst,uint16_t type,const uint8_t*payload,uint16_t len){uint8_t buf[sizeof(v7_hdr_t)+MAX_PKT_SIZE];if(len>MAX_PKT_SIZE)return-1;v7_hdr_t*h=(v7_hdr_t*)buf;h->magic=htons(VIRA7_MAGIC);h->type=htons(type);h->seq=htonl(seqno++);h->length=htons(len);h->checksum=0;if(payload&&len)memcpy(buf+sizeof(v7_hdr_t),payload,len);if(g_send_checksum)h->checksum=htons(csum16(buf,sizeof(v7_hdr_t)+len));ssize_t n=sendto(fd,buf,sizeof(v7_hdr_t)+len,0,(const struct sockaddr*)dst,sizeof(*dst));return n==(ssize_t)(sizeof(v7_hdr_t)+len)?0:-1;}
+static int verify_packet(uint8_t*buf,ssize_t n,uint16_t*type,uint8_t**payload,uint16_t*len){if(n<(ssize_t)sizeof(v7_hdr_t))return-1;v7_hdr_t*h=(v7_hdr_t*)buf;if(ntohs(h->magic)!=VIRA7_MAGIC)return-1;*len=ntohs(h->length);if((ssize_t)(sizeof(v7_hdr_t)+*len)!=n||*len>MAX_PKT_SIZE)return-1;uint16_t got=ntohs(h->checksum);if(got!=0&&g_verify_checksum){h->checksum=0;if(got!=csum16(buf,(size_t)n))return-1;}*type=ntohs(h->type);*payload=buf+sizeof(v7_hdr_t);return 0;}
+static int peer_allowed(const v7_config_t*c,const struct sockaddr_in*sender){if(!c->peer_lock||!c->remote_ip[0])return 1;struct in_addr allowed;if(inet_pton(AF_INET,c->remote_ip,&allowed)!=1)return 0;return sender->sin_addr.s_addr==allowed.s_addr;}
+static void write_status(const v7_config_t*c,time_t now,time_t last_rx,unsigned long long tx,unsigned long long rx,unsigned long long drop,int remote_known){char path[160],tmp[180];snprintf(path,sizeof(path),"/run/%s.status",c->iface);snprintf(tmp,sizeof(tmp),"%s.tmp",path);FILE*f=fopen(tmp,"w");if(!f)return;fprintf(f,"pid=%d\nnow=%ld\nlast_rx=%ld\nrx_age=%ld\ntx_packets=%llu\nrx_packets=%llu\ndrops=%llu\nremote_known=%d\n",getpid(),(long)now,(long)last_rx,last_rx? (long)(now-last_rx):-1L,tx,rx,drop,remote_known);fclose(f);rename(tmp,path);}
+int main(int argc,char**argv){if(argc<2||getuid()!=0)return 1;v7_config_t cfg;if(load_config(argv[1],&cfg)!=0)return 1;g_send_checksum=cfg.checksum?1:0;g_verify_checksum=cfg.verify_checksum?1:0;signal(SIGINT,on_signal);signal(SIGTERM,on_signal);signal(SIGPIPE,SIG_IGN);mkdir("/dev/net",0755);if(access(TUN_DEVICE,F_OK)!=0)system("mknod /dev/net/tun c 10 200 2>/dev/null || true");system("modprobe tun 2>/dev/null || true");cleanup_iface(cfg.iface);int tun_fd=tun_alloc_named(cfg.iface);if(tun_fd<0)return 1;if(configure_tun(&cfg)!=0){cleanup_iface(cfg.iface);close(tun_fd);return 1;}int udp_fd=udp_socket_create(&cfg);if(udp_fd<0){cleanup_iface(cfg.iface);close(tun_fd);return 1;}
+    struct sockaddr_in remote;memset(&remote,0,sizeof(remote));remote.sin_family=AF_INET;remote.sin_port=htons((uint16_t)cfg.port);int remote_known=0;if(!strcmp(cfg.mode,"client")){if(inet_pton(AF_INET,cfg.remote_ip,&remote.sin_addr)!=1){close(udp_fd);close(tun_fd);cleanup_iface(cfg.iface);return 1;}remote_known=1;}
+    char pidfile[128];snprintf(pidfile,sizeof(pidfile),"/run/%s.pid",cfg.iface);FILE*pf=fopen(pidfile,"w");if(pf){fprintf(pf,"%d\n",getpid());fclose(pf);}uint8_t tun_buf[MAX_PKT_SIZE],udp_buf[sizeof(v7_hdr_t)+MAX_PKT_SIZE];time_t now=time(NULL),last_keepalive=0,last_rx=now,last_status=0;unsigned long long tx=0,rx=0,drop=0;int send_errors=0;
+    while(running){fd_set rfds;FD_ZERO(&rfds);FD_SET(tun_fd,&rfds);FD_SET(udp_fd,&rfds);int maxfd=tun_fd>udp_fd?tun_fd:udp_fd;struct timeval tv={1,0};int rc=select(maxfd+1,&rfds,NULL,NULL,&tv);if(rc<0){if(errno==EINTR)continue;break;}now=time(NULL);
+        if(remote_known&&now-last_keepalive>=cfg.keepalive){if(send_v7(udp_fd,&remote,PKT_KEEPALIVE,NULL,0)==0){tx++;send_errors=0;}else if(++send_errors>=5&&!strcmp(cfg.mode,"client"))break;last_keepalive=now;}
+        if(FD_ISSET(tun_fd,&rfds)){for(int i=0;i<cfg.batch;i++){ssize_t n=read(tun_fd,tun_buf,sizeof(tun_buf));if(n>0){if(remote_known){if(send_v7(udp_fd,&remote,PKT_DATA,tun_buf,(uint16_t)n)==0){tx++;send_errors=0;}else send_errors++;}continue;}if(n<0&&(errno==EAGAIN||errno==EWOULDBLOCK))break;break;}}
+        if(FD_ISSET(udp_fd,&rfds)){for(int i=0;i<cfg.batch;i++){struct sockaddr_in sender;socklen_t slen=sizeof(sender);ssize_t n=recvfrom(udp_fd,udp_buf,sizeof(udp_buf),0,(struct sockaddr*)&sender,&slen);if(n<0){if(errno==EAGAIN||errno==EWOULDBLOCK)break;break;}if(n==0)break;if(!peer_allowed(&cfg,&sender)){drop++;continue;}uint16_t type,len;uint8_t*payload;if(verify_packet(udp_buf,n,&type,&payload,&len)!=0){drop++;continue;}last_rx=now;rx++;if(!strcmp(cfg.mode,"server")){memcpy(&remote,&sender,sizeof(remote));remote_known=1;}if(type==PKT_DATA&&len>0){ssize_t w=write(tun_fd,payload,len);if(w!=(ssize_t)len)drop++;}else if(type==PKT_KEEPALIVE&&remote_known){if(send_v7(udp_fd,&remote,PKT_ACK,NULL,0)==0)tx++;}}}
+        if(cfg.dead_timeout>0&&remote_known&&now-last_rx>=cfg.dead_timeout){if(!strcmp(cfg.mode,"client"))break;remote_known=0;last_rx=now;}
+        if(cfg.status_interval>0&&now-last_status>=cfg.status_interval){write_status(&cfg,now,last_rx,tx,rx,drop,remote_known);last_status=now;}
+    }
+    close(udp_fd);close(tun_fd);unlink(pidfile);char statusfile[160];snprintf(statusfile,sizeof(statusfile),"/run/%s.status",cfg.iface);unlink(statusfile);cleanup_iface(cfg.iface);return 0;
+}
+ENGINEEOF
+  gcc -O3 -flto -Wall -Wextra -o "$VIRA7_BINARY" "$VIRA7_SOURCE" 2>/dev/null || gcc -O3 -Wall -Wextra -o "$VIRA7_BINARY" "$VIRA7_SOURCE"
+  chmod 755 "$VIRA7_BINARY"
+}
+
+# Override loader to clear values first and read v9 optional fields safely.
+vira7_load_config() {
+  local id="${1:-${TUNNEL_ID:-}}" file
+  validate_tunnel_id "$id" || return 1
+  file="$(vira7_config_file "$id")"; [ -f "$file" ] || return 1
+  unset TUNNEL_TYPE TUNNEL_ID VIRA7_IFACE ROLE SERVER_ROLE LOCAL_PUBLIC_IP REMOTE_PUBLIC_IP LOCAL_VIRA7_IP REMOTE_VIRA7_IP VIRA7_PORT VIRA7_MTU VIRA7_CHECKSUM VIRA7_VERIFY_CHECKSUM VIRA7_BATCH VIRA7_DEAD_TIMEOUT VIRA7_PEER_LOCK VIRA7_STATUS_INTERVAL HEALTH_ENABLED iface mode bind_ip remote_ip local_priv remote_priv port mtu keepalive buffer_size queue_len checksum verify_checksum batch dead_timeout peer_lock status_interval 2>/dev/null || true
+  # shellcheck disable=SC1090
+  source "$file"
+  TUNNEL_ID="$id"
+  VIRA7_IFACE="${VIRA7_IFACE:-${iface:-$(vira7_iface_name "$id")}}"
+  LOCAL_PUBLIC_IP="${LOCAL_PUBLIC_IP:-${bind_ip:-}}"; REMOTE_PUBLIC_IP="${REMOTE_PUBLIC_IP:-${remote_ip:-}}"
+  LOCAL_VIRA7_IP="${LOCAL_VIRA7_IP:-${local_priv:-}}"; REMOTE_VIRA7_IP="${REMOTE_VIRA7_IP:-${remote_priv:-}}"
+  VIRA7_PORT="${VIRA7_PORT:-${port:-$(vira7_default_port "$id")}}"; VIRA7_MTU="${VIRA7_MTU:-${mtu:-$VIRA7_DEFAULT_MTU}}"
+  VIRA7_CHECKSUM="${VIRA7_CHECKSUM:-${checksum:-$VIRA7_DEFAULT_CHECKSUM}}"; VIRA7_VERIFY_CHECKSUM="${VIRA7_VERIFY_CHECKSUM:-${verify_checksum:-$VIRA7_DEFAULT_VERIFY_CHECKSUM}}"; VIRA7_BATCH="${VIRA7_BATCH:-${batch:-$VIRA7_DEFAULT_BATCH}}"
+  VIRA7_DEAD_TIMEOUT="${VIRA7_DEAD_TIMEOUT:-${dead_timeout:-0}}"; VIRA7_PEER_LOCK="${VIRA7_PEER_LOCK:-${peer_lock:-0}}"; VIRA7_STATUS_INTERVAL="${VIRA7_STATUS_INTERVAL:-${status_interval:-0}}"; HEALTH_ENABLED="${HEALTH_ENABLED:-0}"
+  if [ -z "${ROLE:-}" ]; then if [ "$LOCAL_VIRA7_IP" = "10.71.$id.1" ]; then ROLE=1; else ROLE=2; fi; fi
+}
+
+vira7_save_config() {
+  mkdir -p "$VIRA7_CONFIG_DIR"
+  local file; file="$(vira7_config_file "$TUNNEL_ID")"
+  {
+    write_var TUNNEL_TYPE "vira7"
+    write_var TUNNEL_ID "$TUNNEL_ID"
+    write_var VIRA7_IFACE "$VIRA7_IFACE"
+    write_var ROLE "$ROLE"
+    write_var SERVER_ROLE "$SERVER_ROLE"
+    write_var LOCAL_PUBLIC_IP "$LOCAL_PUBLIC_IP"
+    write_var REMOTE_PUBLIC_IP "$REMOTE_PUBLIC_IP"
+    write_var LOCAL_VIRA7_IP "$LOCAL_VIRA7_IP"
+    write_var REMOTE_VIRA7_IP "$REMOTE_VIRA7_IP"
+    write_var VIRA7_PORT "$VIRA7_PORT"
+    write_var VIRA7_MTU "$VIRA7_MTU"
+    write_var VIRA7_CHECKSUM "${VIRA7_CHECKSUM:-$VIRA7_DEFAULT_CHECKSUM}"
+    write_var VIRA7_VERIFY_CHECKSUM "${VIRA7_VERIFY_CHECKSUM:-$VIRA7_DEFAULT_VERIFY_CHECKSUM}"
+    write_var VIRA7_BATCH "${VIRA7_BATCH:-$VIRA7_DEFAULT_BATCH}"
+    write_var VIRA7_DEAD_TIMEOUT "${VIRA7_DEAD_TIMEOUT:-0}"
+    write_var VIRA7_PEER_LOCK "${VIRA7_PEER_LOCK:-0}"
+    write_var VIRA7_STATUS_INTERVAL "${VIRA7_STATUS_INTERVAL:-0}"
+    write_var HEALTH_ENABLED "${HEALTH_ENABLED:-0}"
+    echo
+    printf 'iface=%s\n' "$VIRA7_IFACE"
+    printf 'mode=%s\n' "$VIRA7_MODE"
+    printf 'bind_ip=%s\n' "$LOCAL_PUBLIC_IP"
+    printf 'remote_ip=%s\n' "$REMOTE_PUBLIC_IP"
+    printf 'local_priv=%s\n' "$LOCAL_VIRA7_IP"
+    printf 'remote_priv=%s\n' "$REMOTE_VIRA7_IP"
+    printf 'port=%s\n' "$VIRA7_PORT"
+    printf 'mtu=%s\n' "$VIRA7_MTU"
+    printf 'keepalive=%s\n' "$VIRA7_DEFAULT_KEEPALIVE"
+    printf 'buffer_size=%s\n' "$VIRA7_DEFAULT_BUFFER_SIZE"
+    printf 'queue_len=%s\n' "$VIRA7_DEFAULT_QUEUE_LEN"
+    printf 'checksum=%s\n' "${VIRA7_CHECKSUM:-$VIRA7_DEFAULT_CHECKSUM}"
+    printf 'verify_checksum=%s\n' "${VIRA7_VERIFY_CHECKSUM:-$VIRA7_DEFAULT_VERIFY_CHECKSUM}"
+    printf 'batch=%s\n' "${VIRA7_BATCH:-$VIRA7_DEFAULT_BATCH}"
+    printf 'dead_timeout=%s\n' "${VIRA7_DEAD_TIMEOUT:-0}"
+    printf 'peer_lock=%s\n' "${VIRA7_PEER_LOCK:-0}"
+    printf 'status_interval=%s\n' "${VIRA7_STATUS_INTERVAL:-0}"
+  } > "$file"
+  chmod 600 "$file"
+  echo "Saved Improved Vira7 tunnel $TUNNEL_ID configuration to $file"
+}
+
+vira7_menu_config_tunnel() {
+  show_header "Improved Vira7 UDP-TUN"
+  prompt_role || return
+  local selected_role existing_local_ip="" existing_remote_ip="" existing_port="" existing_mtu="" existing_health=0 existing_dead=30 existing_lock=1 existing_status=5
+  local port_input mtu_input new_local new_remote new_port new_mtu new_dead new_lock new_status new_health old_file old_backup="" was_active=0
+  selected_role="$ROLE"
+  echo
+  prompt_tunnel_id "Enter Improved Vira7 tunnel number [1-254]: " || return
+  old_file="$(vira7_config_file "$TUNNEL_ID")"
+  if vira7_load_config "$TUNNEL_ID"; then
+    existing_local_ip="${LOCAL_PUBLIC_IP:-}"; existing_remote_ip="${REMOTE_PUBLIC_IP:-}"; existing_port="${VIRA7_PORT:-}"; existing_mtu="${VIRA7_MTU:-}"
+    existing_health="${HEALTH_ENABLED:-0}"; existing_dead="${VIRA7_DEAD_TIMEOUT:-0}"; existing_lock="${VIRA7_PEER_LOCK:-0}"; existing_status="${VIRA7_STATUS_INTERVAL:-0}"
+  fi
+  ROLE="$selected_role"
+  echo
+  echo "Interface       : $(vira7_iface_name "$TUNNEL_ID")"
+  echo "Iran IP        : 10.71.$TUNNEL_ID.1"
+  echo "Kharej IP      : 10.71.$TUNNEL_ID.2"
+  echo "Default port   : $(vira7_default_port "$TUNNEL_ID")/udp"
+  echo "Protocol v9    : original wire format + fixed peer + ACK timeout recovery + counters"
+  echo "Compatibility  : existing Vira7 config is not changed until this update succeeds"
+  echo
+  prompt_local_tunnel_ip "${existing_local_ip:-$(detect_local_public_ip || true)}" "Enter LOCAL public IPv4 for Vira7 bind" || return
+  new_local="$LOCAL_PUBLIC_IP"
+  echo
+  prompt_remote_public_ip "$existing_remote_ip" || return
+  new_remote="$REMOTE_PUBLIC_IP"
+
+  new_port="${existing_port:-$(vira7_default_port "$TUNNEL_ID")}" 
+  read -rp "Enter SAME Vira7 UDP port on both servers [$new_port] (00=menu): " port_input
+  if is_main_menu_token "$port_input"; then return_main_msg; return 99; fi
+  new_port="${port_input:-$new_port}"
+  validate_port "$new_port" || { err_msg "Invalid Vira7 port."; return 1; }
+  if tm9_vira_port_reserved_elsewhere "$new_port" "$TUNNEL_ID"; then err_msg "Vira7 port $new_port is already reserved by another saved Vira tunnel."; return 1; fi
+
+  read -rp "Enter Vira7 MTU [${existing_mtu:-1320}] (00=menu): " mtu_input
+  if is_main_menu_token "$mtu_input"; then return_main_msg; return 99; fi
+  new_mtu="${mtu_input:-${existing_mtu:-1320}}"
+  [[ "$new_mtu" =~ ^[0-9]+$ ]] && [ "$new_mtu" -ge 576 ] && [ "$new_mtu" -le 1500 ] || { err_msg "Invalid MTU."; return 1; }
+
+  new_dead="$existing_dead"; new_lock="$existing_lock"; new_status="$existing_status"; new_health="$existing_health"
+  if confirm_default_yes "Enable built-in dead-path recovery (recommended, near-zero CPU)?"; then new_dead=30; else new_dead=0; fi
+  if confirm_default_yes "Lock Vira7 packets to the configured remote public IP?"; then new_lock=1; else new_lock=0; fi
+  if confirm_default_yes "Write lightweight runtime counters every 5 seconds?"; then new_status=5; else new_status=0; fi
+  if confirm_yes "Enable optional external health ping for this Vira7 tunnel?"; then new_health=1; else new_health=0; fi
+
+  systemctl is-active --quiet "$(vira7_service_name "$TUNNEL_ID")" 2>/dev/null && was_active=1 || true
+  if [ -f "$old_file" ]; then old_backup="$(mktemp)"; cp -f "$old_file" "$old_backup"; fi
+  systemctl stop "$(vira7_service_name "$TUNNEL_ID")" >/dev/null 2>&1 || true
+  ip link delete "$(vira7_iface_name "$TUNNEL_ID")" 2>/dev/null || true
+  if ! tm9_validate_free_port udp "$new_port" "Vira7"; then
+    [ "$was_active" = 1 ] && systemctl restart "$(vira7_service_name "$TUNNEL_ID")" >/dev/null 2>&1 || true
+    rm -f "$old_backup"
+    return 1
+  fi
+
+  if ! vira7_compile_engine; then
+    err_msg "Improved Vira engine compilation failed. Previous tunnel config was not changed."
+    [ "$was_active" = 1 ] && systemctl restart "$(vira7_service_name "$TUNNEL_ID")" >/dev/null 2>&1 || true
+    rm -f "$old_backup"
+    return 1
+  fi
+
+  LOCAL_PUBLIC_IP="$new_local"; REMOTE_PUBLIC_IP="$new_remote"; VIRA7_PORT="$new_port"; VIRA7_MTU="$new_mtu"
+  VIRA7_IFACE="$(vira7_iface_name "$TUNNEL_ID")"
+  if [ "$ROLE" = "1" ]; then SERVER_ROLE="IRAN"; VIRA7_MODE="server"; LOCAL_VIRA7_IP="10.71.$TUNNEL_ID.1"; REMOTE_VIRA7_IP="10.71.$TUNNEL_ID.2"; else SERVER_ROLE="KHAREJ"; VIRA7_MODE="client"; LOCAL_VIRA7_IP="10.71.$TUNNEL_ID.2"; REMOTE_VIRA7_IP="10.71.$TUNNEL_ID.1"; fi
+  VIRA7_CHECKSUM=1; VIRA7_VERIFY_CHECKSUM=0; VIRA7_BATCH=128; VIRA7_DEAD_TIMEOUT="$new_dead"; VIRA7_PEER_LOCK="$new_lock"; VIRA7_STATUS_INTERVAL="$new_status"; HEALTH_ENABLED="$new_health"
+  enable_ip_forward; modprobe tun || true; vira7_save_config; vira7_apply_firewall_rules "$TUNNEL_ID" || true
+  if ! vira7_install_service "$TUNNEL_ID"; then
+    err_msg "Improved Vira start failed; restoring previous configuration."
+    if [ -n "$old_backup" ] && [ -s "$old_backup" ]; then cp -f "$old_backup" "$old_file"; systemctl restart "$(vira7_service_name "$TUNNEL_ID")" >/dev/null 2>&1 || true; else rm -f "$old_file"; fi
+    rm -f "$old_backup"
+    return 1
+  fi
+  rm -f "$old_backup"
+  echo "Improved Vira7 status file: /run/$VIRA7_IFACE.status"
+}
+
+vira7_list_tunnels() {
+  echo "Improved/legacy Vira7 UDP-TUN tunnels:"
+  local ids id ifc state age="-" mode_text
+  ids="$(vira7_collect_ids || true)"; [ -n "$ids" ] || { echo "  none"; return 0; }
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    ifc="$(vira7_iface_name "$id")"; state="inactive"; ip link show "$ifc" >/dev/null 2>&1 && state="active"
+    mode_text="legacy-compatible"
+    if vira7_load_config "$id"; then
+      [ "${VIRA7_DEAD_TIMEOUT:-0}" -gt 0 ] && mode_text="improved"
+      if [ -f "/run/$ifc.status" ]; then age="$(awk -F= '$1=="rx_age"{print $2}' "/run/$ifc.status" 2>/dev/null || echo -)"; else age="-"; fi
+      echo "  - Vira7 $id | $ifc | $state | remote ${REMOTE_VIRA7_IP:-?} | UDP ${VIRA7_PORT:-?} | mode=$mode_text | rx_age=${age}s | health=${HEALTH_ENABLED:-0}"
+    fi
+  done <<< "$ids"
+}
+
+# -----------------------------
+# WSS/TCP emergency WireGuard tunnel
+# -----------------------------
+tm9_wss_meta() { echo "$TM9_DIR/wss/tunnel-$1.conf"; }
+tm9_wss_iface() { echo "wsswg$1"; }
+tm9_wss_wg_config() { echo "$WG_CONFIG_DIR/$(tm9_wss_iface "$1").conf"; }
+tm9_wss_key_private() { echo "$TM9_DIR/wss/keys/tunnel-$1.private"; }
+tm9_wss_key_public() { echo "$TM9_DIR/wss/keys/tunnel-$1.public"; }
+tm9_wss_service() { echo "tm9-wss@$1.service"; }
+tm9_wss_wg_service() { echo "wg-quick@$(tm9_wss_iface "$1").service"; }
+tm9_wss_local_ip() { if [ "$2" = 1 ]; then echo "10.84.$1.1"; else echo "10.84.$1.2"; fi; }
+tm9_wss_remote_ip() { if [ "$2" = 1 ]; then echo "10.84.$1.2"; else echo "10.84.$1.1"; fi; }
+
+tm9_wss_reset_vars() { unset WSS_ID WSS_ROLE WSS_IFACE WSS_LOCAL_IP WSS_REMOTE_IP WSS_LOCAL_PUBLIC_IP WSS_REMOTE_PUBLIC_IP WSS_TCP_PORT WSS_WG_PORT WSS_CLIENT_LISTEN_PORT WSS_SECRET WSS_REMOTE_PUBLIC_KEY WSS_MTU HEALTH_ENABLED 2>/dev/null || true; }
+tm9_wss_load() {
+  local id="$1" file; validate_tunnel_id "$id" || return 1; file="$(tm9_wss_meta "$id")"; [ -f "$file" ] || return 1
+  tm9_wss_reset_vars
+  # shellcheck disable=SC1090
+  source "$file"
+  WSS_ID="$id"; WSS_IFACE="${WSS_IFACE:-$(tm9_wss_iface "$id")}"; HEALTH_ENABLED="${HEALTH_ENABLED:-0}"
+}
+
+tm9_install_wstunnel() {
+  if [ -x "$TM9_WSTUNNEL_BIN" ]; then return 0; fi
+  local arch asset tmp version candidate latest=""
+  case "$(uname -m)" in x86_64|amd64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; *) err_msg "Unsupported wstunnel architecture: $(uname -m)"; return 1 ;; esac
+  if ! command -v curl >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then
+    if command -v apt-get >/dev/null 2>&1; then
+      apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y curl ca-certificates tar
+    elif command -v dnf >/dev/null 2>&1; then
+      dnf install -y curl ca-certificates tar
+    elif command -v yum >/dev/null 2>&1; then
+      yum install -y curl ca-certificates tar
+    else
+      err_msg "curl and tar are required to install wstunnel."
+      return 1
+    fi
+  fi
+  tmp="$(mktemp -d)"
+  latest="$(curl -fsSL --connect-timeout 10 https://api.github.com/repos/erebe/wstunnel/releases/latest 2>/dev/null | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v\([^"]*\)".*/\1/p' | head -n1 || true)"
+  for version in "$latest" "$TM9_WSTUNNEL_VERSION" 10.5.5; do
+    [ -n "$version" ] || continue
+    asset="wstunnel_${version}_linux_${arch}.tar.gz"
+    candidate="https://github.com/erebe/wstunnel/releases/download/v${version}/${asset}"
+    info_msg "Downloading wstunnel v$version for linux/$arch..."
+    if curl -fL --connect-timeout 15 --retry 2 -o "$tmp/wstunnel.tgz" "$candidate"; then
+      tar -xzf "$tmp/wstunnel.tgz" -C "$tmp"
+      if [ -f "$tmp/wstunnel" ]; then install -m 755 "$tmp/wstunnel" "$TM9_WSTUNNEL_BIN"; rm -rf "$tmp"; return 0; fi
+    fi
+  done
+  rm -rf "$tmp"; err_msg "Could not download wstunnel binary."; return 1
+}
+
+tm9_wss_generate_keys() {
+  local id="$1" private public
+  wg_ensure_tools || return 1; tm9_prepare_dirs
+  private="$(tm9_wss_key_private "$id")"; public="$(tm9_wss_key_public "$id")"
+  if [ ! -s "$private" ]; then umask 077; wg genkey > "$private"; wg pubkey < "$private" > "$public"; chmod 600 "$private"; chmod 644 "$public"; elif [ ! -s "$public" ]; then wg pubkey < "$private" > "$public"; chmod 644 "$public"; fi
+}
+
+tm9_wss_save() {
+  local file; tm9_prepare_dirs; file="$(tm9_wss_meta "$WSS_ID")"
+  {
+    write_var WSS_ID "$WSS_ID"; write_var WSS_ROLE "$WSS_ROLE"; write_var WSS_IFACE "$WSS_IFACE"
+    write_var WSS_LOCAL_IP "$WSS_LOCAL_IP"; write_var WSS_REMOTE_IP "$WSS_REMOTE_IP"
+    write_var WSS_LOCAL_PUBLIC_IP "$WSS_LOCAL_PUBLIC_IP"; write_var WSS_REMOTE_PUBLIC_IP "$WSS_REMOTE_PUBLIC_IP"
+    write_var WSS_TCP_PORT "$WSS_TCP_PORT"; write_var WSS_WG_PORT "$WSS_WG_PORT"; write_var WSS_CLIENT_LISTEN_PORT "$WSS_CLIENT_LISTEN_PORT"
+    write_var WSS_SECRET "$WSS_SECRET"; write_var WSS_REMOTE_PUBLIC_KEY "${WSS_REMOTE_PUBLIC_KEY:-}"; write_var WSS_MTU "${WSS_MTU:-1280}"; write_var HEALTH_ENABLED "${HEALTH_ENABLED:-0}"
+  } > "$file"; chmod 600 "$file"
+}
+
+tm9_wss_write_wg_config() {
+  local id="$1" private conf
+  tm9_wss_load "$id" || return 1
+  private="$(cat "$(tm9_wss_key_private "$id")")"; conf="$(tm9_wss_wg_config "$id")"; mkdir -p "$WG_CONFIG_DIR"
+  if [ "$WSS_ROLE" = "1" ]; then
+    cat > "$conf" <<EOF
+[Interface]
+PrivateKey = $private
+Address = $WSS_LOCAL_IP/30
+ListenPort = $WSS_CLIENT_LISTEN_PORT
+MTU = ${WSS_MTU:-1280}
+
+[Peer]
+PublicKey = $WSS_REMOTE_PUBLIC_KEY
+Endpoint = 127.0.0.1:$WSS_WG_PORT
+AllowedIPs = $WSS_REMOTE_IP/32
+PersistentKeepalive = 20
+EOF
+  else
+    cat > "$conf" <<EOF
+[Interface]
+PrivateKey = $private
+Address = $WSS_LOCAL_IP/30
+ListenPort = $WSS_WG_PORT
+MTU = ${WSS_MTU:-1280}
+
+[Peer]
+PublicKey = $WSS_REMOTE_PUBLIC_KEY
+AllowedIPs = $WSS_REMOTE_IP/32
+EOF
+  fi
+  chmod 600 "$conf"
+}
+
+tm9_wss_write_service_template() {
+  tm9_install_self
+  cat > "$TM9_WSS_SERVICE_TEMPLATE" <<EOF
+[Unit]
+Description=Tunnel Manager v9 WSS transport %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=TOKIO_WORKER_THREADS=1
+ExecStart=/bin/bash $INSTALL_BIN --service run-wss %i
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+}
+
+tm9_wss_run() {
+  local id="$1"
+  tm9_wss_load "$id" || return 1
+  [ -x "$TM9_WSTUNNEL_BIN" ] || return 1
+  if [ "$WSS_ROLE" = "1" ]; then
+    exec "$TM9_WSTUNNEL_BIN" client --log-lvl=WARN --websocket-ping-frequency-sec 30 --http-upgrade-path-prefix "$WSS_SECRET" -L "udp://127.0.0.1:${WSS_WG_PORT}:127.0.0.1:${WSS_WG_PORT}?timeout_sec=0" "wss://${WSS_REMOTE_PUBLIC_IP}:${WSS_TCP_PORT}"
+  else
+    exec "$TM9_WSTUNNEL_BIN" server --log-lvl=WARN --websocket-ping-frequency-sec 30 --restrict-to "127.0.0.1:${WSS_WG_PORT}" --restrict-http-upgrade-path-prefix "$WSS_SECRET" "wss://0.0.0.0:${WSS_TCP_PORT}"
+  fi
+}
+
+tm9_wss_apply_firewall() {
+  local id="$1"; tm9_wss_load "$id" || return 1; enable_ip_forward; tm9_disable_rp_filter "$WSS_IFACE"
+  if command -v iptables >/dev/null 2>&1; then
+    iptables -C INPUT -i "$WSS_IFACE" -j ACCEPT 2>/dev/null || iptables -A INPUT -i "$WSS_IFACE" -j ACCEPT || true
+    iptables -C OUTPUT -o "$WSS_IFACE" -j ACCEPT 2>/dev/null || iptables -A OUTPUT -o "$WSS_IFACE" -j ACCEPT || true
+    if [ "$WSS_ROLE" = 2 ]; then iptables -C INPUT -p tcp --dport "$WSS_TCP_PORT" -j ACCEPT 2>/dev/null || iptables -A INPUT -p tcp --dport "$WSS_TCP_PORT" -j ACCEPT || true; fi
+  fi
+  if command -v ufw >/dev/null 2>&1 && [ "$WSS_ROLE" = 2 ]; then ufw allow "$WSS_TCP_PORT/tcp" >/dev/null 2>&1 || true; fi
+}
+
+tm9_wss_start() {
+  local id="$1"; tm9_wss_load "$id" || return 1
+  [ -n "${WSS_REMOTE_PUBLIC_KEY:-}" ] || { warn_msg "WSS tunnel $id is pending peer key."; return 0; }
+  tm9_install_wstunnel || return 1; tm9_wss_write_service_template; tm9_wss_write_wg_config "$id"; tm9_wss_apply_firewall "$id"
+  systemctl enable "$(tm9_wss_service "$id")" >/dev/null 2>&1 || true
+  systemctl restart "$(tm9_wss_service "$id")" || return 1
+  sleep 1
+  systemctl enable "$(tm9_wss_wg_service "$id")" >/dev/null 2>&1 || true
+  wg-quick down "$WSS_IFACE" >/dev/null 2>&1 || true
+  systemctl restart "$(tm9_wss_wg_service "$id")" || return 1
+  ok_msg "WSS/TCP emergency tunnel $id started. Remote secure IP: $WSS_REMOTE_IP"
+}
+
+tm9_wss_configure() {
+  show_header "WSS/TCP Emergency Tunnel"
+  prompt_role || return
+  local selected_role="$ROLE" existing_key="" existing_secret="" existing_health=0 peer_input secret_input local_pub was_active=0 meta_bak="" conf_bak=""
+  echo "Role mapping: Iran=client, Kharej=TLS WebSocket server."
+  echo
+  prompt_tunnel_id "Enter WSS tunnel number [1-254]: " || return
+  WSS_ID="$TUNNEL_ID"; WSS_ROLE="$selected_role"; WSS_IFACE="$(tm9_wss_iface "$WSS_ID")"
+  WSS_LOCAL_IP="$(tm9_wss_local_ip "$WSS_ID" "$WSS_ROLE")"; WSS_REMOTE_IP="$(tm9_wss_remote_ip "$WSS_ID" "$WSS_ROLE")"
+  WSS_TCP_PORT="$(tm9_fixed_port wss-tcp "$WSS_ID")"; WSS_WG_PORT="$(tm9_fixed_port wss-wg "$WSS_ID")"; WSS_CLIENT_LISTEN_PORT="$(tm9_fixed_port wss-client "$WSS_ID")"; WSS_MTU=1280; HEALTH_ENABLED=0
+  WSS_LOCAL_PUBLIC_IP="$(detect_local_public_ip || true)"; WSS_REMOTE_PUBLIC_IP=""; WSS_SECRET=""; WSS_REMOTE_PUBLIC_KEY=""
+  if tm9_wss_load "$WSS_ID"; then existing_key="${WSS_REMOTE_PUBLIC_KEY:-}"; existing_secret="${WSS_SECRET:-}"; existing_health="${HEALTH_ENABLED:-0}"; fi
+  WSS_ROLE="$selected_role"; WSS_IFACE="$(tm9_wss_iface "$WSS_ID")"; WSS_LOCAL_IP="$(tm9_wss_local_ip "$WSS_ID" "$WSS_ROLE")"; WSS_REMOTE_IP="$(tm9_wss_remote_ip "$WSS_ID" "$WSS_ROLE")"
+  WSS_TCP_PORT="$(tm9_fixed_port wss-tcp "$WSS_ID")"; WSS_WG_PORT="$(tm9_fixed_port wss-wg "$WSS_ID")"; WSS_CLIENT_LISTEN_PORT="$(tm9_fixed_port wss-client "$WSS_ID")"; WSS_MTU=1280; HEALTH_ENABLED="$existing_health"; WSS_REMOTE_PUBLIC_KEY="$existing_key"; WSS_SECRET="$existing_secret"
+
+  prompt_local_tunnel_ip "${WSS_LOCAL_PUBLIC_IP:-$(detect_local_public_ip || true)}" "Enter LOCAL public IPv4" || return
+  WSS_LOCAL_PUBLIC_IP="$LOCAL_PUBLIC_IP"
+  echo
+  prompt_remote_public_ip "$WSS_REMOTE_PUBLIC_IP" || return
+  WSS_REMOTE_PUBLIC_IP="$REMOTE_PUBLIC_IP"
+
+  echo "Public WSS TCP port : $WSS_TCP_PORT"
+  echo "Forwarded WG UDP    : $WSS_WG_PORT"
+  echo "Secure IP range     : 10.84.$WSS_ID.x"
+  echo
+  if [ -n "$WSS_SECRET" ]; then read -rp "Shared WSS path secret [Enter=keep or paste replacement]: " secret_input; [ -n "$secret_input" ] && WSS_SECRET="$secret_input"; else read -rp "Paste shared WSS path secret, or Enter to generate on this server: " secret_input; WSS_SECRET="${secret_input:-$(tm9_generate_secret)}"; fi
+  echo "WSS shared secret (must be identical on both servers): $WSS_SECRET"
+
+  tm9_wss_generate_keys "$WSS_ID" || return 1; local_pub="$(cat "$(tm9_wss_key_public "$WSS_ID")")"; echo "LOCAL WireGuard public key:"; echo "$local_pub"
+  if [ -n "$WSS_REMOTE_PUBLIC_KEY" ]; then read -rp "REMOTE peer key [Enter=keep, CLEAR=remove, or paste new]: " peer_input; case "$peer_input" in "") ;; CLEAR|clear) WSS_REMOTE_PUBLIC_KEY="" ;; *) WSS_REMOTE_PUBLIC_KEY="$(normalize_wg_public_key "$peer_input")" ;; esac; else read -rp "Paste OTHER server WireGuard public key, or Enter for pending: " peer_input; WSS_REMOTE_PUBLIC_KEY="$(normalize_wg_public_key "$peer_input")"; fi
+  if [ -n "$WSS_REMOTE_PUBLIC_KEY" ] && ! validate_wg_public_key "$WSS_REMOTE_PUBLIC_KEY"; then
+    if [ -n "$existing_key" ]; then warn_msg "Invalid replacement key; keeping previous peer key."; WSS_REMOTE_PUBLIC_KEY="$existing_key"; else err_msg "Invalid peer key; saved pending."; WSS_REMOTE_PUBLIC_KEY=""; fi
+  fi
+  if [ "$WSS_REMOTE_PUBLIC_KEY" = "$local_pub" ]; then
+    if [ -n "$existing_key" ]; then warn_msg "Own key entered; keeping previous peer key."; WSS_REMOTE_PUBLIC_KEY="$existing_key"; else err_msg "Own key entered; saved pending."; WSS_REMOTE_PUBLIC_KEY=""; fi
+  fi
+  if confirm_yes "Enable optional low-CPU health check for WSS tunnel?"; then HEALTH_ENABLED=1; else HEALTH_ENABLED=0; fi
+
+  systemctl is-active --quiet "$(tm9_wss_service "$WSS_ID")" 2>/dev/null && was_active=1 || true
+  if [ -f "$(tm9_wss_meta "$WSS_ID")" ]; then meta_bak="$(mktemp)"; cp -f "$(tm9_wss_meta "$WSS_ID")" "$meta_bak"; fi
+  if [ -f "$(tm9_wss_wg_config "$WSS_ID")" ]; then conf_bak="$(mktemp)"; cp -f "$(tm9_wss_wg_config "$WSS_ID")" "$conf_bak"; fi
+  systemctl stop "$(tm9_wss_service "$WSS_ID")" "$(tm9_wss_wg_service "$WSS_ID")" >/dev/null 2>&1 || true
+  wg-quick down "$WSS_IFACE" >/dev/null 2>&1 || true
+  if [ "$WSS_ROLE" = 2 ]; then
+    if ! tm9_validate_free_port tcp "$WSS_TCP_PORT" "WSS public" || ! tm9_validate_free_port udp "$WSS_WG_PORT" "WSS server WireGuard"; then [ "$was_active" = 1 ] && systemctl restart "$(tm9_wss_service "$WSS_ID")" "$(tm9_wss_wg_service "$WSS_ID")" >/dev/null 2>&1 || true; rm -f "$meta_bak" "$conf_bak"; return 1; fi
+  else
+    if ! tm9_validate_free_port udp "$WSS_WG_PORT" "WSS local forward" || ! tm9_validate_free_port udp "$WSS_CLIENT_LISTEN_PORT" "WSS client WireGuard"; then [ "$was_active" = 1 ] && systemctl restart "$(tm9_wss_service "$WSS_ID")" "$(tm9_wss_wg_service "$WSS_ID")" >/dev/null 2>&1 || true; rm -f "$meta_bak" "$conf_bak"; return 1; fi
+  fi
+
+  tm9_wss_save
+  if [ -z "$WSS_REMOTE_PUBLIC_KEY" ]; then rm -f "$(tm9_wss_wg_config "$WSS_ID")"; warn_msg "Saved pending. Configure the same WSS number and secret on the other server."; rm -f "$meta_bak" "$conf_bak"; return 0; fi
+  if ! tm9_wss_start "$WSS_ID"; then
+    err_msg "New WSS configuration failed; restoring previous saved configuration."
+    if [ -n "$meta_bak" ] && [ -s "$meta_bak" ]; then cp -f "$meta_bak" "$(tm9_wss_meta "$WSS_ID")"; fi
+    if [ -n "$conf_bak" ] && [ -s "$conf_bak" ]; then cp -f "$conf_bak" "$(tm9_wss_wg_config "$WSS_ID")"; fi
+    [ "$was_active" = 1 ] && { systemctl restart "$(tm9_wss_service "$WSS_ID")" >/dev/null 2>&1 || true; systemctl restart "$(tm9_wss_wg_service "$WSS_ID")" >/dev/null 2>&1 || true; }
+    rm -f "$meta_bak" "$conf_bak"
+    return 1
+  fi
+  rm -f "$meta_bak" "$conf_bak"
+}
+
+tm9_wss_collect_ids() { local f id; [ -d "$TM9_DIR/wss" ] || return 0; for f in "$TM9_DIR/wss"/tunnel-*.conf; do [ -e "$f" ] || continue; id="${f##*/tunnel-}"; id="${id%.conf}"; validate_tunnel_id "$id" && echo "$id"; done | sort -n -u; }
+tm9_wss_remove() { local id="$1" ifc; ifc="$(tm9_wss_iface "$id")"; systemctl disable --now "$(tm9_wss_service "$id")" "$(tm9_wss_wg_service "$id")" >/dev/null 2>&1 || true; wg-quick down "$ifc" >/dev/null 2>&1 || true; ip link delete "$ifc" 2>/dev/null || true; rm -f "$(tm9_wss_meta "$id")" "$(tm9_wss_wg_config "$id")" "$(tm9_wss_key_private "$id")" "$(tm9_wss_key_public "$id")"; rm -rf "$TM9_HEALTH_DIR/wss-$id"; ok_msg "WSS tunnel $id removed."; }
+
+# -----------------------------
+# Hybrid GRE + Vira failover using stable 10.83.N.x addresses
+# -----------------------------
+tm9_hybrid_meta() { echo "$TM9_DIR/hybrid/tunnel-$1.conf"; }
+tm9_hybrid_iface() { echo "hyb$1"; }
+tm9_hybrid_load() { local id="$1" file; validate_tunnel_id "$id" || return 1; file="$(tm9_hybrid_meta "$id")"; [ -f "$file" ] || return 1; unset HYB_ID HYB_ROLE HYB_IFACE HYB_LOCAL_IP HYB_REMOTE_IP HYB_PRIMARY HYB_ACTIVE_PATH HEALTH_ENABLED 2>/dev/null || true; source "$file"; HYB_ID="$id"; HYB_IFACE="${HYB_IFACE:-$(tm9_hybrid_iface "$id")}"; HEALTH_ENABLED="${HEALTH_ENABLED:-1}"; }
+tm9_hybrid_save() { tm9_prepare_dirs; local file; file="$(tm9_hybrid_meta "$HYB_ID")"; { write_var HYB_ID "$HYB_ID"; write_var HYB_ROLE "$HYB_ROLE"; write_var HYB_IFACE "$HYB_IFACE"; write_var HYB_LOCAL_IP "$HYB_LOCAL_IP"; write_var HYB_REMOTE_IP "$HYB_REMOTE_IP"; write_var HYB_PRIMARY "${HYB_PRIMARY:-wggre}"; write_var HYB_ACTIVE_PATH "${HYB_ACTIVE_PATH:-wggre}"; write_var HEALTH_ENABLED "${HEALTH_ENABLED:-1}"; } > "$file"; chmod 600 "$file"; }
+
+tm9_hybrid_switch() {
+  local id="$1" path="$2" ifc
+  tm9_hybrid_load "$id" || return 1
+  case "$path" in wggre|wgvira) ifc="$(tm9_overlay_iface "$path" "$id")" ;; *) return 1 ;; esac
+  ip link show "$ifc" >/dev/null 2>&1 || return 1
+  ip route replace "$HYB_REMOTE_IP/32" dev "$ifc" src "$HYB_LOCAL_IP" metric 10
+  HYB_ACTIVE_PATH="$path"; tm9_hybrid_save
+  echo "$path" > "$TM9_HEALTH_DIR/hybrid-$id.active"
+  ok_msg "Hybrid $id route switched to $path ($ifc) -> $HYB_REMOTE_IP"
+}
+
+tm9_hybrid_start() {
+  local id="$1" primary backup primary_target backup_target
+  tm9_hybrid_load "$id" || return 1
+  modprobe dummy 2>/dev/null || true
+  ip link show "$HYB_IFACE" >/dev/null 2>&1 || ip link add "$HYB_IFACE" type dummy
+  ip addr replace "$HYB_LOCAL_IP/32" dev "$HYB_IFACE"
+  ip link set "$HYB_IFACE" up
+  primary="${HYB_PRIMARY:-wggre}"; [ "$primary" = wggre ] && backup=wgvira || backup=wggre
+  primary_target="$(tm9_overlay_remote_ip "$primary" "$id" "$HYB_ROLE")"; backup_target="$(tm9_overlay_remote_ip "$backup" "$id" "$HYB_ROLE")"
+  if tm9_ping_quiet "$primary_target" "$(tm9_overlay_iface "$primary" "$id")"; then tm9_hybrid_switch "$id" "$primary"; elif tm9_ping_quiet "$backup_target" "$(tm9_overlay_iface "$backup" "$id")"; then tm9_hybrid_switch "$id" "$backup"; else warn_msg "Neither Hybrid path responds yet. Installing primary route for later recovery."; tm9_hybrid_switch "$id" "$primary" || true; fi
+}
+
+tm9_hybrid_write_service() {
+  tm9_install_self
+  cat > "$TM9_HYBRID_SERVICE_TEMPLATE" <<EOF
+[Unit]
+Description=Tunnel Manager v9 Hybrid stable route %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash $INSTALL_BIN --service start-hybrid %i
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+}
+
+tm9_hybrid_configure() {
+  show_header "Hybrid GRE + Vira Failover"
+  prompt_role || return
+  local selected_role="$ROLE" primary_choice
+  echo
+  prompt_tunnel_id "Enter Hybrid tunnel number [1-254]: " || return
+  HYB_ID="$TUNNEL_ID"; HYB_ROLE="$selected_role"; HYB_IFACE="$(tm9_hybrid_iface "$HYB_ID")"; HYB_LOCAL_IP="$(tm9_hybrid_local_ip_for_role "$HYB_ID" "$HYB_ROLE")"; HYB_REMOTE_IP="$(tm9_hybrid_remote_ip_for_role "$HYB_ID" "$HYB_ROLE")"; HYB_PRIMARY=wggre; HYB_ACTIVE_PATH=wggre; HEALTH_ENABLED=1
+  if ! tm9_overlay_load wggre "$HYB_ID" || [ -z "${TM9_REMOTE_PUBLIC_KEY:-}" ]; then err_msg "WireGuard over GRE $HYB_ID must be configured with peer keys first."; return 1; fi
+  [ "${TM9_ROLE:-}" = "$HYB_ROLE" ] || { err_msg "wggre$HYB_ID role does not match the selected Hybrid role."; return 1; }
+  if ! tm9_overlay_load wgvira "$HYB_ID" || [ -z "${TM9_REMOTE_PUBLIC_KEY:-}" ]; then err_msg "WireGuard over Vira7 $HYB_ID must be configured with peer keys first."; return 1; fi
+  [ "${TM9_ROLE:-}" = "$HYB_ROLE" ] || { err_msg "wgvira$HYB_ID role does not match the selected Hybrid role."; return 1; }
+  echo "Stable Iran IP  : 10.83.$HYB_ID.1"
+  echo "Stable Kharej IP: 10.83.$HYB_ID.2"
+  echo "Applications/HAProxy can always target the stable remote IP: $HYB_REMOTE_IP"
+  echo "1) GRE secure path as primary (recommended)"
+  echo "2) Vira secure path as primary"
+  read -rp "Select primary [1-2]: " primary_choice
+  [ "$primary_choice" = 2 ] && HYB_PRIMARY=wgvira || HYB_PRIMARY=wggre
+  tm9_hybrid_save; tm9_hybrid_write_service
+  systemctl enable "tm9-hybrid@$HYB_ID.service" >/dev/null 2>&1 || true
+  systemctl restart "tm9-hybrid@$HYB_ID.service" || return 1
+  echo
+  warn_msg "Hybrid automatic switching requires the optional health timer."
+  if confirm_default_yes "Enable lightweight global health timer now?"; then tm9_health_enable; fi
+}
+
+tm9_hybrid_collect_ids() { local f id; [ -d "$TM9_DIR/hybrid" ] || return 0; for f in "$TM9_DIR/hybrid"/tunnel-*.conf; do [ -e "$f" ] || continue; id="${f##*/tunnel-}"; id="${id%.conf}"; validate_tunnel_id "$id" && echo "$id"; done | sort -n -u; }
+tm9_hybrid_remove() { local id="$1" ifc; ifc="$(tm9_hybrid_iface "$id")"; systemctl disable --now "tm9-hybrid@$id.service" >/dev/null 2>&1 || true; if tm9_hybrid_load "$id"; then ip route del "$HYB_REMOTE_IP/32" 2>/dev/null || true; fi; ip link delete "$ifc" 2>/dev/null || true; rm -f "$(tm9_hybrid_meta "$id")" "$TM9_HEALTH_DIR/hybrid-$id.active"; rm -rf "$TM9_HEALTH_DIR/hybrid-$id"; ok_msg "Hybrid profile $id removed; GRE/Vira/WireGuard paths were kept."; }
+
+# -----------------------------
+# Optional low-CPU health manager
+# -----------------------------
+tm9_health_write_units() {
+  local interval="$1"
+  tm9_install_self
+  cat > "$TM9_HEALTH_SERVICE" <<EOF
+[Unit]
+Description=Tunnel Manager v9 lightweight health check
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash $INSTALL_BIN --service health-run
+Nice=10
+IOSchedulingClass=idle
+EOF
+  cat > "$TM9_HEALTH_TIMER" <<EOF
+[Unit]
+Description=Tunnel Manager v9 health timer
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=${interval}s
+AccuracySec=5s
+RandomizedDelaySec=3s
+Persistent=false
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+}
+
+tm9_health_enable() {
+  tm9_write_health_defaults
+  local ENABLED=0 INTERVAL=$TM9_HEALTH_DEFAULT_INTERVAL FAIL_LIMIT=$TM9_HEALTH_DEFAULT_FAIL_LIMIT COOLDOWN=$TM9_HEALTH_DEFAULT_COOLDOWN
+  source "$TM9_HEALTH_CONFIG"; ENABLED=1
+  cat > "$TM9_HEALTH_CONFIG" <<EOF
+ENABLED=1
+INTERVAL=${INTERVAL:-$TM9_HEALTH_DEFAULT_INTERVAL}
+FAIL_LIMIT=${FAIL_LIMIT:-$TM9_HEALTH_DEFAULT_FAIL_LIMIT}
+COOLDOWN=${COOLDOWN:-$TM9_HEALTH_DEFAULT_COOLDOWN}
+EOF
+  tm9_health_write_units "${INTERVAL:-$TM9_HEALTH_DEFAULT_INTERVAL}"
+  systemctl enable --now tm9-health.timer >/dev/null 2>&1 || true
+  ok_msg "Low-CPU health timer enabled (one ping per enabled tunnel every ${INTERVAL}s)."
+}
+
+tm9_health_disable() {
+  tm9_write_health_defaults
+  local INTERVAL=$TM9_HEALTH_DEFAULT_INTERVAL FAIL_LIMIT=$TM9_HEALTH_DEFAULT_FAIL_LIMIT COOLDOWN=$TM9_HEALTH_DEFAULT_COOLDOWN
+  source "$TM9_HEALTH_CONFIG"
+  cat > "$TM9_HEALTH_CONFIG" <<EOF
+ENABLED=0
+INTERVAL=${INTERVAL:-$TM9_HEALTH_DEFAULT_INTERVAL}
+FAIL_LIMIT=${FAIL_LIMIT:-$TM9_HEALTH_DEFAULT_FAIL_LIMIT}
+COOLDOWN=${COOLDOWN:-$TM9_HEALTH_DEFAULT_COOLDOWN}
+EOF
+  systemctl disable --now tm9-health.timer >/dev/null 2>&1 || true
+  ok_msg "Health timer disabled. Built-in Vira dead-path recovery remains controlled per Vira config."
+}
+
+tm9_health_record() {
+  local key="$1" success="$2" fail_limit="$3" cooldown="$4" dir now fails last_action
+  dir="$TM9_HEALTH_DIR/$key"; mkdir -p "$dir"; now="$(date +%s)"; fails="$(cat "$dir/fails" 2>/dev/null || echo 0)"; last_action="$(cat "$dir/last_action" 2>/dev/null || echo 0)"
+  if [ "$success" = 1 ]; then echo 0 > "$dir/fails"; return 1; fi
+  fails=$((fails + 1)); echo "$fails" > "$dir/fails"
+  if [ "$fails" -ge "$fail_limit" ] && [ $((now - last_action)) -ge "$cooldown" ]; then echo "$now" > "$dir/last_action"; echo 0 > "$dir/fails"; return 0; fi
+  return 1
+}
+
+tm9_health_check_vira() {
+  local id="$1" target ok=0
+  vira7_load_config "$id" || return 0; [ "${HEALTH_ENABLED:-0}" = 1 ] || return 0; target="${REMOTE_VIRA7_IP:-}"
+  tm9_ping_quiet "$target" "$VIRA7_IFACE" && ok=1
+  if tm9_health_record "vira-$id" "$ok" "$HEALTH_FAIL_LIMIT" "$HEALTH_COOLDOWN"; then systemctl restart "$(vira7_service_name "$id")" >/dev/null 2>&1 || true; fi
+}
+
+tm9_health_check_overlay() {
+  local kind="$1" id="$2" ok=0 target ifc
+  tm9_overlay_load "$kind" "$id" || return 0; [ "${HEALTH_ENABLED:-0}" = 1 ] || return 0; target="$TM9_REMOTE_IP"; ifc="$TM9_IFACE"
+  tm9_ping_quiet "$target" "$ifc" && ok=1
+  if tm9_health_record "$kind-$id" "$ok" "$HEALTH_FAIL_LIMIT" "$HEALTH_COOLDOWN"; then
+    if [ "$kind" = wgvira ]; then systemctl restart "$(vira7_service_name "$id")" >/dev/null 2>&1 || true; sleep 1; fi
+    tm9_overlay_start "$kind" "$id" >/dev/null 2>&1 || true
+  fi
+}
+
+tm9_health_check_wss() {
+  local id="$1" ok=0
+  tm9_wss_load "$id" || return 0; [ "${HEALTH_ENABLED:-0}" = 1 ] || return 0
+  tm9_ping_quiet "$WSS_REMOTE_IP" "$WSS_IFACE" && ok=1
+  if tm9_health_record "wss-$id" "$ok" "$HEALTH_FAIL_LIMIT" "$HEALTH_COOLDOWN"; then systemctl restart "$(tm9_wss_service "$id")" >/dev/null 2>&1 || true; sleep 1; systemctl restart "$(tm9_wss_wg_service "$id")" >/dev/null 2>&1 || true; fi
+}
+
+tm9_health_check_hybrid() {
+  local id="$1" primary backup ptarget btarget pif bif current state_dir rise=0 ok=0
+  tm9_hybrid_load "$id" || return 0
+  [ "${HEALTH_ENABLED:-1}" = "1" ] || return 0
+  primary="${HYB_PRIMARY:-wggre}"; [ "$primary" = "wggre" ] && backup="wgvira" || backup="wggre"
+  pif="$(tm9_overlay_iface "$primary" "$id")"; bif="$(tm9_overlay_iface "$backup" "$id")"
+  ptarget="$(tm9_overlay_remote_ip "$primary" "$id" "$HYB_ROLE")"; btarget="$(tm9_overlay_remote_ip "$backup" "$id" "$HYB_ROLE")"
+  current="${HYB_ACTIVE_PATH:-$primary}"; state_dir="$TM9_HEALTH_DIR/hybrid-$id"; mkdir -p "$state_dir"
+
+  if [ "$current" = "$primary" ]; then
+    tm9_ping_quiet "$ptarget" "$pif" && ok=1 || ok=0
+    if tm9_health_record "hybrid-$id-primary" "$ok" "$HEALTH_FAIL_LIMIT" "$HEALTH_COOLDOWN"; then
+      if tm9_ping_quiet "$btarget" "$bif"; then tm9_hybrid_switch "$id" "$backup" >/dev/null 2>&1 || true; fi
+    fi
+    echo 0 > "$state_dir/primary_rise"
+    return 0
+  fi
+
+  # While on backup, require two consecutive successful primary checks before failback.
+  if tm9_ping_quiet "$ptarget" "$pif"; then
+    rise="$(cat "$state_dir/primary_rise" 2>/dev/null || echo 0)"; rise=$((rise + 1)); echo "$rise" > "$state_dir/primary_rise"
+    if [ "$rise" -ge 2 ]; then tm9_hybrid_switch "$id" "$primary" >/dev/null 2>&1 || true; echo 0 > "$state_dir/primary_rise"; fi
+    return 0
+  fi
+  echo 0 > "$state_dir/primary_rise"
+
+  # Backup is also checked, but no route flapping occurs on a single failed ping.
+  tm9_ping_quiet "$btarget" "$bif" && ok=1 || ok=0
+  if tm9_health_record "hybrid-$id-backup" "$ok" "$HEALTH_FAIL_LIMIT" "$HEALTH_COOLDOWN"; then
+    if tm9_ping_quiet "$ptarget" "$pif"; then tm9_hybrid_switch "$id" "$primary" >/dev/null 2>&1 || true; fi
+  fi
+}
+
+tm9_health_run() {
+  tm9_write_health_defaults
+  local ENABLED=0 INTERVAL=$TM9_HEALTH_DEFAULT_INTERVAL FAIL_LIMIT=$TM9_HEALTH_DEFAULT_FAIL_LIMIT COOLDOWN=$TM9_HEALTH_DEFAULT_COOLDOWN ids id
+  source "$TM9_HEALTH_CONFIG"; [ "${ENABLED:-0}" = 1 ] || [ "${TM9_HEALTH_FORCE:-0}" = 1 ] || return 0
+  HEALTH_FAIL_LIMIT="${FAIL_LIMIT:-$TM9_HEALTH_DEFAULT_FAIL_LIMIT}"; HEALTH_COOLDOWN="${COOLDOWN:-$TM9_HEALTH_DEFAULT_COOLDOWN}"
+  exec 9>"$TM9_HEALTH_DIR/health.lock"; flock -n 9 || return 0
+  ids="$(vira7_collect_ids || true)"; while IFS= read -r id; do [ -n "$id" ] && tm9_health_check_vira "$id"; done <<< "$ids"
+  for kind in wggre wgvira; do ids="$(tm9_overlay_collect_ids "$kind" || true)"; while IFS= read -r id; do [ -n "$id" ] && tm9_health_check_overlay "$kind" "$id"; done <<< "$ids"; done
+  ids="$(tm9_wss_collect_ids || true)"; while IFS= read -r id; do [ -n "$id" ] && tm9_health_check_wss "$id"; done <<< "$ids"
+  ids="$(tm9_hybrid_collect_ids || true)"; while IFS= read -r id; do [ -n "$id" ] && tm9_health_check_hybrid "$id"; done <<< "$ids"
+}
+
+tm9_health_set_interval() {
+  local interval="$1" ENABLED=0 INTERVAL=30 FAIL_LIMIT=3 COOLDOWN=120
+  [[ "$interval" =~ ^[0-9]+$ ]] && [ "$interval" -ge 15 ] && [ "$interval" -le 600 ] || { err_msg "Interval must be 15-600 seconds."; return 1; }
+  tm9_write_health_defaults; source "$TM9_HEALTH_CONFIG"; INTERVAL="$interval"
+  cat > "$TM9_HEALTH_CONFIG" <<EOF
+ENABLED=${ENABLED:-0}
+INTERVAL=$INTERVAL
+FAIL_LIMIT=${FAIL_LIMIT:-3}
+COOLDOWN=${COOLDOWN:-120}
+EOF
+  tm9_health_write_units "$INTERVAL"; [ "${ENABLED:-0}" = 1 ] && systemctl restart tm9-health.timer >/dev/null 2>&1 || true
+  ok_msg "Health interval changed to ${INTERVAL}s."
+}
+
+tm9_health_toggle_all() {
+  local value="$1" f kind id
+  for f in "$VIRA7_CONFIG_DIR"/tunnel-*.conf "$TM9_DIR/wggre"/tunnel-*.conf "$TM9_DIR/wgvira"/tunnel-*.conf "$TM9_DIR/wss"/tunnel-*.conf; do [ -e "$f" ] || continue; tm9_set_health_flag_in_file "$f" "$value"; done
+  ok_msg "Per-tunnel external health flag set to $value for all saved Vira/v9 secure tunnels."
+}
+
+tm9_health_menu() {
+  local choice interval ENABLED=0 INTERVAL=30 FAIL_LIMIT=3 COOLDOWN=120
+  while true; do
+    tm9_write_health_defaults; source "$TM9_HEALTH_CONFIG"
+    show_header "Optional Low-CPU Health Manager"
+    echo "Global timer : $([ "${ENABLED:-0}" = 1 ] && echo ENABLED || echo DISABLED)"
+    echo "Interval     : ${INTERVAL}s"
+    echo "Fail limit   : ${FAIL_LIMIT} consecutive failures"
+    echo "Cooldown     : ${COOLDOWN}s"
+    echo
+    echo "1) Enable global health timer"
+    echo "2) Disable global health timer"
+    echo "3) Run one health pass now"
+    echo "4) Change interval (15-600 seconds)"
+    echo "5) Enable health flag for all v9/Vira tunnels"
+    echo "6) Disable health flag for all v9/Vira tunnels"
+    echo "00) Back"
+    read -rp "Choose [1-6/00]: " choice
+    case "$choice" in
+      1) tm9_health_enable; pause ;;
+      2) tm9_health_disable; pause ;;
+      3) TM9_HEALTH_FORCE=1 tm9_health_run; ok_msg "Health pass completed."; pause ;;
+      4) read -rp "New interval seconds [15-600]: " interval; tm9_health_set_interval "$interval" || true; pause ;;
+      5) tm9_health_toggle_all 1; pause ;;
+      6) tm9_health_toggle_all 0; pause ;;
+      00) return ;;
+      *) err_msg "Invalid option"; sleep 1 ;;
+    esac
+  done
+}
+
+# -----------------------------
+# v9 unified create/status/inventory/remove/reset menus
+# -----------------------------
+ask_tunnel_type() {
+  echo "Tunnel Manager v9 types:"
+  echo "1) Normal GRE"
+  echo "2) Improved Vira7"
+  echo "3) WireGuard over GRE"
+  echo "4) WireGuard over Vira7"
+  echo "5) Hybrid GRE + Vira Failover"
+  echo "6) WSS/TCP Emergency Tunnel"
+  echo
+  read -rp "Choose [1-6] (00=menu): " TUNNEL_TYPE_CHOICE
+  if is_main_menu_token "$TUNNEL_TYPE_CHOICE"; then return_main_msg; return 99; fi
+  case "$TUNNEL_TYPE_CHOICE" in
+    1) SELECTED_TUNNEL_TYPE=gre ;;
+    2) SELECTED_TUNNEL_TYPE=vira7 ;;
+    3) SELECTED_TUNNEL_TYPE=wggre ;;
+    4) SELECTED_TUNNEL_TYPE=wgvira ;;
+    5) SELECTED_TUNNEL_TYPE=hybrid ;;
+    6) SELECTED_TUNNEL_TYPE=wss ;;
+    *) err_msg "Invalid tunnel type"; return 1 ;;
+  esac
+}
+
+menu_config_tunnel() {
+  show_header "Tunnel Manager v9 - Create / Update"
+  ask_tunnel_type || return
+  case "$SELECTED_TUNNEL_TYPE" in
+    gre) gre_menu_config_tunnel ;;
+    vira7) vira7_menu_config_tunnel ;;
+    wggre) tm9_overlay_configure wggre ;;
+    wgvira) tm9_overlay_configure wgvira ;;
+    hybrid) tm9_hybrid_configure ;;
+    wss) tm9_wss_configure ;;
+  esac
+}
+
+build_tunnel_inventory() {
+  INV_TYPE=(); INV_ID=(); INV_IFACE=(); INV_LOCAL=(); INV_TARGET=(); INV_LOCAL_PUBLIC=(); INV_REMOTE_PUBLIC=(); INV_STATE=(); INV_DESC=()
+  local ids id ifc local_ip target local_pub remote_pub state desc kind
+
+  ids="$(gre_collect_ids || true)"
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    ifc="$(gre_iface "$id")"; local_ip=""; target=""; local_pub=""; remote_pub=""; desc="Normal GRE"
+    if gre_load_config "$id"; then
+      local_ip="${LOCAL_GRE_IP:-}"; target="${REMOTE_GRE_IP:-}"; local_pub="${LOCAL_PUBLIC_IP:-}"; remote_pub="${REMOTE_PUBLIC_IP:-}"
+    fi
+    if ip link show "$ifc" >/dev/null 2>&1; then state="active"; else state="inactive"; fi
+    INV_TYPE+=("gre"); INV_ID+=("$id"); INV_IFACE+=("$ifc"); INV_LOCAL+=("$local_ip"); INV_TARGET+=("$target"); INV_LOCAL_PUBLIC+=("$local_pub"); INV_REMOTE_PUBLIC+=("$remote_pub"); INV_STATE+=("$state"); INV_DESC+=("$desc")
+  done <<< "$ids"
+
+  ids="$(wg_collect_ids || true)"
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    ifc="$(wg_iface_name "$id")"; local_ip=""; target=""; local_pub=""; remote_pub=""; desc="Legacy WireGuard"
+    if wg_load_meta "$id"; then
+      local_ip="${LOCAL_WG_IP:-}"; target="${REMOTE_WG_IP:-}"; local_pub="${LOCAL_PUBLIC_IP:-}"; remote_pub="${REMOTE_PUBLIC_IP:-${WG_ENDPOINT_IP:-}}"
+      [ -z "${REMOTE_WG_PUBLIC_KEY:-}" ] && desc="Legacy WG/PENDING"
+    fi
+    if ip link show "$ifc" >/dev/null 2>&1; then state="active"; else state="inactive"; fi
+    INV_TYPE+=("wireguard"); INV_ID+=("$id"); INV_IFACE+=("$ifc"); INV_LOCAL+=("$local_ip"); INV_TARGET+=("$target"); INV_LOCAL_PUBLIC+=("$local_pub"); INV_REMOTE_PUBLIC+=("$remote_pub"); INV_STATE+=("$state"); INV_DESC+=("$desc")
+  done <<< "$ids"
+
+  ids="$(vira7_collect_ids || true)"
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    ifc="$(vira7_iface_name "$id")"; local_ip=""; target=""; local_pub=""; remote_pub=""; desc="Improved Vira7"
+    if vira7_load_config "$id"; then
+      local_ip="${LOCAL_VIRA7_IP:-}"; target="${REMOTE_VIRA7_IP:-}"; local_pub="${LOCAL_PUBLIC_IP:-}"; remote_pub="${REMOTE_PUBLIC_IP:-}"
+      [ "${VIRA7_DEAD_TIMEOUT:-0}" = "0" ] && desc="Legacy Vira7"
+    fi
+    if ip link show "$ifc" >/dev/null 2>&1; then state="active"; else state="inactive"; fi
+    INV_TYPE+=("vira7"); INV_ID+=("$id"); INV_IFACE+=("$ifc"); INV_LOCAL+=("$local_ip"); INV_TARGET+=("$target"); INV_LOCAL_PUBLIC+=("$local_pub"); INV_REMOTE_PUBLIC+=("$remote_pub"); INV_STATE+=("$state"); INV_DESC+=("$desc")
+  done <<< "$ids"
+
+  for kind in wggre wgvira; do
+    ids="$(tm9_overlay_collect_ids "$kind" || true)"
+    while IFS= read -r id; do
+      [ -n "$id" ] || continue
+      if tm9_overlay_load "$kind" "$id"; then
+        ifc="$TM9_IFACE"; local_ip="$TM9_LOCAL_IP"; target="$TM9_REMOTE_IP"; local_pub="$TM9_TRANSPORT_IFACE"; remote_pub="$TM9_TRANSPORT_REMOTE_IP"; desc="$kind"
+        [ -z "${TM9_REMOTE_PUBLIC_KEY:-}" ] && desc="$kind/PENDING"
+        if ip link show "$ifc" >/dev/null 2>&1; then state="active"; else state="inactive"; fi
+        INV_TYPE+=("$kind"); INV_ID+=("$id"); INV_IFACE+=("$ifc"); INV_LOCAL+=("$local_ip"); INV_TARGET+=("$target"); INV_LOCAL_PUBLIC+=("$local_pub"); INV_REMOTE_PUBLIC+=("$remote_pub"); INV_STATE+=("$state"); INV_DESC+=("$desc")
+      fi
+    done <<< "$ids"
+  done
+
+  ids="$(tm9_hybrid_collect_ids || true)"
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    if tm9_hybrid_load "$id"; then
+      ifc="$HYB_IFACE"; local_ip="$HYB_LOCAL_IP"; target="$HYB_REMOTE_IP"; local_pub="${HYB_PRIMARY:-wggre}"; remote_pub="${HYB_ACTIVE_PATH:-?}"; desc="Hybrid stable"
+      if ip link show "$ifc" >/dev/null 2>&1; then state="active"; else state="inactive"; fi
+      INV_TYPE+=("hybrid"); INV_ID+=("$id"); INV_IFACE+=("$ifc"); INV_LOCAL+=("$local_ip"); INV_TARGET+=("$target"); INV_LOCAL_PUBLIC+=("$local_pub"); INV_REMOTE_PUBLIC+=("$remote_pub"); INV_STATE+=("$state"); INV_DESC+=("$desc")
+    fi
+  done <<< "$ids"
+
+  ids="$(tm9_wss_collect_ids || true)"
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    if tm9_wss_load "$id"; then
+      ifc="$WSS_IFACE"; local_ip="$WSS_LOCAL_IP"; target="$WSS_REMOTE_IP"; local_pub="$WSS_LOCAL_PUBLIC_IP"; remote_pub="$WSS_REMOTE_PUBLIC_IP"; desc="WSS/TCP"
+      [ -z "${WSS_REMOTE_PUBLIC_KEY:-}" ] && desc="WSS/PENDING"
+      if ip link show "$ifc" >/dev/null 2>&1; then state="active"; else state="inactive"; fi
+      INV_TYPE+=("wss"); INV_ID+=("$id"); INV_IFACE+=("$ifc"); INV_LOCAL+=("$local_ip"); INV_TARGET+=("$target"); INV_LOCAL_PUBLIC+=("$local_pub"); INV_REMOTE_PUBLIC+=("$remote_pub"); INV_STATE+=("$state"); INV_DESC+=("$desc")
+    fi
+  done <<< "$ids"
+}
+
+remove_inventory_item() {
+  local index="$1" i type id
+  i=$((index - 1)); type="${INV_TYPE[$i]}"; id="${INV_ID[$i]}"
+  case "$type" in
+    gre) gre_remove_one_tunnel "$id" ;;
+    wireguard) wg_remove_one_tunnel "$id" ;;
+    vira7) vira7_remove_one_tunnel "$id" ;;
+    wggre|wgvira) tm9_overlay_remove "$type" "$id" ;;
+    hybrid) tm9_hybrid_remove "$id" ;;
+    wss) tm9_wss_remove "$id" ;;
+  esac
+}
+
+ping_inventory_item() {
+  local index="$1" i type id
+  i=$((index - 1)); type="${INV_TYPE[$i]}"; id="${INV_ID[$i]}"
+  case "$type" in
+    gre) test_gre_tunnel_ping "$id" ;;
+    wireguard) test_wg_tunnel_ping "$id" ;;
+    vira7) test_vira7_tunnel_ping "$id" ;;
+    wggre|wgvira)
+      if tm9_overlay_load "$type" "$id"; then ping4_target "$type $id remote secure IP" "$TM9_REMOTE_IP"; fi
+      ;;
+    hybrid)
+      if tm9_hybrid_load "$id"; then ping4_target "Hybrid $id stable remote IP" "$HYB_REMOTE_IP"; fi
+      ;;
+    wss)
+      if tm9_wss_load "$id"; then ping4_target "WSS $id remote secure IP" "$WSS_REMOTE_IP"; fi
+      ;;
+  esac
+}
+
+remove_tun() {
+  show_header "Remove Tunnel Safely"
+  build_tunnel_inventory
+  print_tunnel_inventory || return
+  local selected i type id
+  read -rp "Enter one row number to remove (00=menu): " selected
+  if is_main_menu_token "$selected"; then return_main_msg; return 99; fi
+  if ! [[ "$selected" =~ ^[0-9]+$ ]] || [ "$selected" -lt 1 ] || [ "$selected" -gt "${#INV_TYPE[@]}" ]; then
+    err_msg "Invalid row."
+    return 1
+  fi
+  i=$((selected - 1)); type="${INV_TYPE[$i]}"; id="${INV_ID[$i]}"
+  if [ "$type" = "gre" ] && [ -f "$(tm9_overlay_meta wggre "$id")" ]; then err_msg "Cannot remove gre$id while wggre$id exists. Remove WireGuard over GRE first."; return 1; fi
+  if [ "$type" = "vira7" ] && [ -f "$(tm9_overlay_meta wgvira "$id")" ]; then err_msg "Cannot remove vira7$id while wgvira$id exists. Remove WireGuard over Vira first."; return 1; fi
+  if { [ "$type" = "wggre" ] || [ "$type" = "wgvira" ]; } && [ -f "$(tm9_hybrid_meta "$id")" ]; then err_msg "Cannot remove $type$id while Hybrid $id uses it. Remove Hybrid profile first."; return 1; fi
+  if confirm_yes "Remove $type tunnel/profile $id?"; then remove_inventory_item "$selected"; else echo "Cancelled."; fi
+}
+
+status_check() { show_header "Tunnel Manager v9 Status"; build_tunnel_inventory; print_tunnel_inventory || true; tm9_port_range_text; echo; if tm9_health_is_enabled;then echo "Health timer: ENABLED";else echo "Health timer: DISABLED";fi; }
+
+reset_all_tunnels() {
+  show_header "Reset All Tunnels (safe service restart)"
+  echo "This restarts saved services without deleting or rewriting Normal GRE configs."
+  if ! confirm_yes "Restart all saved legacy and v9 tunnels?"; then echo "Cancelled."; return 0; fi
+  local ids id kind svc
+
+  ids="$(gre_collect_ids || true)"
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    svc="$(gre_service_name "$id")"
+    systemctl enable "$svc" >/dev/null 2>&1 || true
+    systemctl restart "$svc" >/dev/null 2>&1 || gre_service_start "$id" >/dev/null 2>&1 || true
+  done <<< "$ids"
+
+  ids="$(vira7_collect_ids || true)"
+  while IFS= read -r id; do [ -n "$id" ] && systemctl restart "$(vira7_service_name "$id")" >/dev/null 2>&1 || true; done <<< "$ids"
+
+  ids="$(wg_collect_ids || true)"
+  while IFS= read -r id; do [ -n "$id" ] && systemctl restart "$(wg_service_name "$id")" >/dev/null 2>&1 || true; done <<< "$ids"
+
+  for kind in wggre wgvira; do
+    ids="$(tm9_overlay_collect_ids "$kind" || true)"
+    while IFS= read -r id; do [ -n "$id" ] && tm9_overlay_start "$kind" "$id" >/dev/null 2>&1 || true; done <<< "$ids"
+  done
+
+  ids="$(tm9_wss_collect_ids || true)"
+  while IFS= read -r id; do [ -n "$id" ] && tm9_wss_start "$id" >/dev/null 2>&1 || true; done <<< "$ids"
+
+  ids="$(tm9_hybrid_collect_ids || true)"
+  while IFS= read -r id; do [ -n "$id" ] && tm9_hybrid_start "$id" >/dev/null 2>&1 || true; done <<< "$ids"
+  ok_msg "Safe restart pass finished."
+}
+
+show_menu() {
+  show_header "Tunnel Manager v9"
+  echo -e "${C_BOLD}${C_WHITE}Main Menu${C_RESET}"
+  echo -e "  ${C_GREEN}1)${C_RESET} create/update tunnel (6 v9 types)"
+  echo -e "  ${C_RED}2)${C_RESET} remove one tunnel safely"
+  echo -e "  ${C_YELLOW}3)${C_RESET} reset all saved tunnels"
+  echo -e "  ${C_CYAN}4)${C_RESET} ping test tunnels"
+  echo -e "  ${C_MAGENTA}5)${C_RESET} HAProxy port manager"
+  echo -e "  ${C_BLUE}6)${C_RESET} optimize Vira7 CPU"
+  echo -e "  ${C_CYAN}7)${C_RESET} optional low-CPU health manager"
+  echo -e "  ${C_WHITE}8)${C_RESET} show status / IP and port ranges"
+  echo -e "  ${C_DIM}0) Exit${C_RESET}"
+  echo
+  read -rp "Choose [0-8]: " CHOICE
+  case "$CHOICE" in
+    1) if menu_config_tunnel;then pause;fi;;
+    2) if remove_tun;then pause;fi;;
+    3) if reset_all_tunnels;then pause;fi;;
+    4) if test_tunnels_menu;then pause;fi;;
+    5) haproxy_menu||true;;
+    6) if vira7_optimize_cpu_menu;then pause;fi;;
+    7) tm9_health_menu;;
+    8) status_check;pause;;
+    0) echo "Bye";exit 0;;
+    *) err_msg "Invalid option";sleep 1;;
+  esac
+}
+
+
 ### Script entry
+if [[ "${1:-}" == "--self-test" ]]; then
+  echo "Tunnel Manager v9 self-test"
+  echo "Version: $TM9_VERSION"
+  echo "GRE function preserved: $(declare -F gre_create_tunnel >/dev/null && echo yes || echo no)"
+  echo "Improved Vira compiler: $(declare -F vira7_compile_engine >/dev/null && echo yes || echo no)"
+  echo "WGGRE IP example : $(tm9_overlay_local_ip wggre 3 1) <-> $(tm9_overlay_remote_ip wggre 3 1)"
+  echo "WGVIRA IP example: $(tm9_overlay_local_ip wgvira 3 1) <-> $(tm9_overlay_remote_ip wgvira 3 1)"
+  echo "Hybrid IP example: $(tm9_hybrid_local_ip_for_role 3 1) <-> $(tm9_hybrid_remote_ip_for_role 3 1)"
+  echo "WSS IP example   : $(tm9_wss_local_ip 3 1) <-> $(tm9_wss_remote_ip 3 1)"
+  tm9_port_range_text
+  exit 0
+fi
 if [[ "${1:-}" == "--service" ]]; then
   case "${2:-}" in
     start-gre)
@@ -3926,8 +5438,23 @@ if [[ "${1:-}" == "--service" ]]; then
       vira7_restart_one_tunnel "${3:-}"
       exit $?
       ;;
+    run-wss)
+      ensure_root
+      tm9_wss_run "${3:-}"
+      exit $?
+      ;;
+    start-hybrid)
+      ensure_root
+      tm9_hybrid_start "${3:-}"
+      exit $?
+      ;;
+    health-run)
+      ensure_root
+      tm9_health_run
+      exit $?
+      ;;
     *)
-      echo "Unknown service command. Use --service start-gre <id>." >&2
+      echo "Unknown service command." >&2
       exit 1
       ;;
   esac
