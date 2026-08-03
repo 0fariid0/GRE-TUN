@@ -1,18 +1,26 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + WireGuard + Vira7 + HAProxy multi-tunnel manager v8.5-gre-key-fix
+# GRE + WireGuard + Vira7 + HAProxy multi-tunnel manager v8.6-self-heal
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
 # - Local tunnel/bind IPv4 can be selected manually for servers with multiple IPs
 # - v8.5-safe-remove-heal prevents removing active transports used by WireGuard and re-heals remaining tunnels after deletion
+# - v8.6-self-heal keeps GRE under a persistent supervisor, disables rp_filter for encapsulated paths,
+#   pins public peer routes to the physical uplink, and repairs GRE/Vira7/WireGuard in dependency order
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
 INSTALL_BIN="/usr/local/bin/gretun-manager.sh"
 GRE_SERVICE_TEMPLATE="/etc/systemd/system/gre-tunnel@.service"
 GRE_LEGACY_SERVICE_UNIT="/etc/systemd/system/gre-tunnel.service"
+GRE_SUPERVISOR_INTERVAL=10
+GRE_SUPERVISOR_FAIL_LIMIT=3
+HEALTH_SERVICE_UNIT="/etc/systemd/system/gretun-health.service"
+HEALTH_TIMER_UNIT="/etc/systemd/system/gretun-health.timer"
+HEALTH_STATE_DIR="/run/gretun-health"
+HEALTH_FAIL_LIMIT=3
 
 WG_META_DIR="/etc/wgtun-tunnels"
 WG_KEY_DIR="$WG_META_DIR/keys"
@@ -396,6 +404,332 @@ firewall_allow_ip_peer() {
 }
 
 # -----------------------------
+# Runtime stability / self-heal helpers
+# -----------------------------
+tunnel_iface_is_up() {
+  local ifc="${1:-}"
+  [ -n "$ifc" ] || return 1
+  ip -o link show dev "$ifc" 2>/dev/null | grep -Eq '<[^>]*UP([,>])'
+}
+
+apply_tunnel_sysctls() {
+  local sysctl_file="/etc/sysctl.d/99-gretun-self-heal.conf"
+  mkdir -p /etc/sysctl.d 2>/dev/null || true
+  if [ ! -f "$sysctl_file" ] || ! grep -q 'gretun-self-heal' "$sysctl_file" 2>/dev/null; then
+    cat > "$sysctl_file" <<'EOF_SYSCTL'
+# gretun-self-heal: stable settings for GRE/WireGuard/UDP-TUN encapsulation
+net.ipv4.ip_forward=1
+net.ipv4.conf.all.rp_filter=0
+net.ipv4.conf.default.rp_filter=0
+net.ipv4.conf.all.src_valid_mark=1
+EOF_SYSCTL
+  fi
+
+  sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.conf.all.src_valid_mark=1 >/dev/null 2>&1 || true
+
+  local rp
+  for rp in /proc/sys/net/ipv4/conf/*/rp_filter; do
+    [ -e "$rp" ] && echo 0 > "$rp" 2>/dev/null || true
+  done
+}
+
+# Keep the public peer reachable through the physical uplink. This avoids a
+# recursive route after overlay routes are added or restored by other tools.
+ensure_public_endpoint_route() {
+  local remote_ip="${1:-}"
+  local local_ip="${2:-}"
+  local route dev gateway
+  validate_ipv4 "$remote_ip" || return 0
+  validate_ipv4 "$local_ip" || return 0
+  [ "$remote_ip" != "$local_ip" ] || return 0
+
+  route="$(ip -4 route get "$remote_ip" from "$local_ip" 2>/dev/null | head -n 1 || true)"
+  dev="$(awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}' <<< "$route")"
+  gateway="$(awk '{for(i=1;i<=NF;i++) if($i=="via") {print $(i+1); exit}}' <<< "$route")"
+
+  case "$dev" in
+    gre*|wgtun*|vira7*|"")
+      route="$(ip -4 route get 1.1.1.1 from "$local_ip" 2>/dev/null | head -n 1 || true)"
+      dev="$(awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}' <<< "$route")"
+      gateway="$(awk '{for(i=1;i<=NF;i++) if($i=="via") {print $(i+1); exit}}' <<< "$route")"
+      ;;
+  esac
+
+  [ -n "$dev" ] || return 0
+  case "$dev" in gre*|wgtun*|vira7*) return 0 ;; esac
+  if [ -n "$gateway" ]; then
+    ip -4 route replace "$remote_ip/32" via "$gateway" dev "$dev" src "$local_ip" metric 5 2>/dev/null || true
+  else
+    ip -4 route replace "$remote_ip/32" dev "$dev" src "$local_ip" metric 5 2>/dev/null || true
+  fi
+}
+
+quick_tunnel_ping() {
+  local ifc="${1:-}"
+  local target="${2:-}"
+  target="${target%%/*}"
+  [ -n "$ifc" ] && [ -n "$target" ] || return 1
+  tunnel_iface_is_up "$ifc" || return 1
+  ping -n -I "$ifc" -c 1 -W 2 "$target" >/dev/null 2>&1
+}
+
+health_counter_reset() {
+  local kind="$1" id="$2"
+  rm -f "$HEALTH_STATE_DIR/${kind}-${id}.fail" 2>/dev/null || true
+}
+
+health_counter_fail() {
+  local kind="$1" id="$2" file count
+  mkdir -p "$HEALTH_STATE_DIR" 2>/dev/null || true
+  file="$HEALTH_STATE_DIR/${kind}-${id}.fail"
+  count="$(cat "$file" 2>/dev/null || echo 0)"
+  [[ "$count" =~ ^[0-9]+$ ]] || count=0
+  count=$((count + 1))
+  printf '%s\n' "$count" > "$file"
+  printf '%s\n' "$count"
+}
+
+restart_wg_dependents_for_transport() {
+  local transport_type="$1" transport_id="$2"
+  local ids wg_id svc
+  command -v systemctl >/dev/null 2>&1 || return 0
+  ids="$(wg_collect_ids 2>/dev/null || true)"
+  while IFS= read -r wg_id; do
+    [ -n "$wg_id" ] || continue
+    if wg_uses_transport_tunnel "$wg_id" "$transport_type" "$transport_id"; then
+      wg_load_meta "$wg_id" || continue
+      [ -n "${REMOTE_WG_PUBLIC_KEY:-}" ] || continue
+      svc="$(wg_service_name "$wg_id")"
+      if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
+        wg_apply_firewall_rules "$wg_id" >/dev/null 2>&1 || true
+        systemctl restart "$svc" >/dev/null 2>&1 || true
+      fi
+    fi
+  done <<< "$ids"
+}
+
+install_health_monitor() {
+  command -v systemctl >/dev/null 2>&1 || return 0
+  mkdir -p "$(dirname "$INSTALL_BIN")" "$HEALTH_STATE_DIR" 2>/dev/null || true
+  cp -f "$0" "$INSTALL_BIN" 2>/dev/null || true
+  chmod 755 "$INSTALL_BIN" 2>/dev/null || true
+
+  cat > "$HEALTH_SERVICE_UNIT" <<EOF_HEALTH_SERVICE
+[Unit]
+Description=GRE/WireGuard/Vira7 dependency-aware health check
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash $INSTALL_BIN --service health-check-all
+EOF_HEALTH_SERVICE
+
+  cat > "$HEALTH_TIMER_UNIT" <<'EOF_HEALTH_TIMER'
+[Unit]
+Description=Run GRE/WireGuard/Vira7 health check periodically
+
+[Timer]
+OnBootSec=25s
+OnUnitActiveSec=20s
+AccuracySec=3s
+RandomizedDelaySec=2s
+Persistent=true
+Unit=gretun-health.service
+
+[Install]
+WantedBy=timers.target
+EOF_HEALTH_TIMER
+
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable --now gretun-health.timer >/dev/null 2>&1 || true
+}
+
+# GRE uses a persistent supervisor instead of a oneshot service. A oneshot unit
+# can remain "active" after the kernel interface has disappeared, which prevents
+# systemd from repairing it. The supervisor verifies both interface presence and
+# inner reachability, then recreates only this GRE and restarts dependent WG.
+gre_supervisor() {
+  local id="${1:-}" ifc target failures=0
+  validate_tunnel_id "$id" || return 1
+  trap 'exit 0' TERM INT HUP
+
+  while true; do
+    if ! gre_load_config "$id"; then
+      echo "GRE supervisor: missing config for tunnel $id" >&2
+      return 1
+    fi
+    ifc="$(gre_iface "$id")"
+    target="${REMOTE_GRE_IP:-$(gre_remote_inner_ip_for_role "$id" "${ROLE:-2}")}"
+    apply_tunnel_sysctls
+    ensure_public_endpoint_route "${REMOTE_PUBLIC_IP:-}" "${LOCAL_PUBLIC_IP:-}"
+
+    if ! tunnel_iface_is_up "$ifc"; then
+      echo "GRE supervisor: $ifc is missing/down; recreating tunnel $id" >&2
+      if gre_create_tunnel 0; then
+        failures=0
+        restart_wg_dependents_for_transport gre "$id"
+      else
+        sleep "$GRE_SUPERVISOR_INTERVAL"
+        continue
+      fi
+    elif quick_tunnel_ping "$ifc" "$target"; then
+      failures=0
+    else
+      failures=$((failures + 1))
+      if [ "$failures" -ge "$GRE_SUPERVISOR_FAIL_LIMIT" ]; then
+        echo "GRE supervisor: tunnel $id failed $failures health checks; recreating" >&2
+        if gre_create_tunnel 0; then
+          restart_wg_dependents_for_transport gre "$id"
+        fi
+        failures=0
+      fi
+    fi
+
+    sleep "$GRE_SUPERVISOR_INTERVAL" &
+    wait $! || true
+  done
+}
+
+gre_write_service_template() {
+  cat > "$GRE_SERVICE_TEMPLATE" <<EOF_SERVICE
+[Unit]
+Description=Normal GRE Tunnel %i Self-Healing Service
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/bin/bash $INSTALL_BIN --service supervise-gre %i
+Restart=always
+RestartSec=2
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF_SERVICE
+}
+
+tunnel_health_check_all() {
+  local lockdir="/run/gretun-health.lock"
+  mkdir "$lockdir" 2>/dev/null || return 0
+  trap 'rmdir /run/gretun-health.lock 2>/dev/null || true' EXIT
+  apply_tunnel_sysctls
+
+  local ids id ifc svc target count transport_ok
+
+  # GRE first: the persistent service handles inner-ping repair itself. Here we
+  # only revive a stopped service or a missing interface immediately.
+  ids="$(gre_collect_ids || true)"
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    svc="$(gre_service_name "$id")"
+    if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
+      ifc="$(gre_iface "$id")"
+      if ! systemctl is-active --quiet "$svc" 2>/dev/null || ! tunnel_iface_is_up "$ifc"; then
+        systemctl restart "$svc" >/dev/null 2>&1 || true
+      fi
+    fi
+  done <<< "$ids"
+
+  # Vira7 can stay alive while its UDP path is stale. Restart only after three
+  # consecutive failed inner pings, then refresh dependent WireGuard tunnels.
+  ids="$(vira7_collect_ids || true)"
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    svc="$(vira7_service_name "$id")"
+    systemctl is-enabled --quiet "$svc" 2>/dev/null || continue
+    vira7_load_config "$id" || continue
+    ifc="$(vira7_iface_name "$id")"
+    target="${REMOTE_VIRA7_IP:-${remote_priv:-}}"
+    ensure_public_endpoint_route "${REMOTE_PUBLIC_IP:-${remote_ip:-}}" "${LOCAL_PUBLIC_IP:-${bind_ip:-}}"
+    vira7_apply_firewall_rules "$id" >/dev/null 2>&1 || true
+
+    if ! systemctl is-active --quiet "$svc" 2>/dev/null || ! tunnel_iface_is_up "$ifc"; then
+      systemctl restart "$svc" >/dev/null 2>&1 || true
+      health_counter_reset vira7 "$id"
+      sleep 1
+      restart_wg_dependents_for_transport vira7 "$id"
+    elif quick_tunnel_ping "$ifc" "$target"; then
+      health_counter_reset vira7 "$id"
+    else
+      count="$(health_counter_fail vira7 "$id")"
+      if [ "$count" -ge "$HEALTH_FAIL_LIMIT" ]; then
+        systemctl restart "$svc" >/dev/null 2>&1 || true
+        health_counter_reset vira7 "$id"
+        sleep 1
+        restart_wg_dependents_for_transport vira7 "$id"
+      fi
+    fi
+  done <<< "$ids"
+
+  # WireGuard is checked last so its selected GRE/Vira7 transport is repaired
+  # before the overlay is touched.
+  ids="$(wg_collect_ids || true)"
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    wg_load_meta "$id" || continue
+    [ -n "${REMOTE_WG_PUBLIC_KEY:-}" ] || continue
+    svc="$(wg_service_name "$id")"
+    systemctl is-enabled --quiet "$svc" 2>/dev/null || continue
+    ifc="$(wg_iface_name "$id")"
+    target="${REMOTE_WG_IP:-}"
+    transport_ok=1
+    case "${WG_ENDPOINT_MODE:-public}" in
+      gre|vira7)
+        if ! tunnel_iface_is_up "${WG_TRANSPORT_IFACE:-}"; then transport_ok=0; fi
+        ;;
+    esac
+    [ "$transport_ok" -eq 1 ] || { health_counter_reset wireguard "$id"; continue; }
+    wg_apply_firewall_rules "$id" >/dev/null 2>&1 || true
+
+    if ! systemctl is-active --quiet "$svc" 2>/dev/null || ! tunnel_iface_is_up "$ifc"; then
+      systemctl restart "$svc" >/dev/null 2>&1 || true
+      health_counter_reset wireguard "$id"
+    elif quick_tunnel_ping "$ifc" "$target"; then
+      health_counter_reset wireguard "$id"
+    else
+      count="$(health_counter_fail wireguard "$id")"
+      if [ "$count" -ge "$HEALTH_FAIL_LIMIT" ]; then
+        systemctl restart "$svc" >/dev/null 2>&1 || true
+        health_counter_reset wireguard "$id"
+      fi
+    fi
+  done <<< "$ids"
+}
+
+bootstrap_runtime_repairs() {
+  command -v systemctl >/dev/null 2>&1 || return 0
+  local migrate=0 ids id svc ifc
+  mkdir -p "$(dirname "$INSTALL_BIN")" 2>/dev/null || true
+  cp -f "$0" "$INSTALL_BIN" 2>/dev/null || true
+  chmod 755 "$INSTALL_BIN" 2>/dev/null || true
+  if [ ! -f "$GRE_SERVICE_TEMPLATE" ] || ! grep -q 'supervise-gre' "$GRE_SERVICE_TEMPLATE" 2>/dev/null; then
+    migrate=1
+  fi
+  gre_write_service_template
+  install_health_monitor
+  apply_tunnel_sysctls
+  systemctl daemon-reload >/dev/null 2>&1 || true
+
+  ids="$(gre_collect_ids || true)"
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    svc="$(gre_service_name "$id")"
+    ifc="$(gre_iface "$id")"
+    if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
+      if [ "$migrate" -eq 1 ] || ! systemctl is-active --quiet "$svc" 2>/dev/null || ! tunnel_iface_is_up "$ifc"; then
+        systemctl restart "$svc" >/dev/null 2>&1 || true
+      fi
+    fi
+  done <<< "$ids"
+}
+
+# -----------------------------
 # GRE helpers
 # -----------------------------
 gre_iface() {
@@ -536,7 +870,7 @@ gre_collect_ids() {
     if [ -f "$GRE_LEGACY_CONF_FILE" ]; then
       echo "1"
     fi
-    ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1 | grep -E '^gre[0-9]+$' | sed 's/^gre//' || true
+    ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1 | grep -E '^gre[0-9]+$' | sed 's/^gre//' | awk '$1 >= 1 && $1 <= 254' || true
   } | sort -n -u
 }
 
@@ -572,7 +906,7 @@ gre_list_tunnels() {
       fi
     fi
 
-    if ip link show "$ifc" >/dev/null 2>&1; then
+    if tunnel_iface_is_up "$ifc"; then
       echo "  - tunnel $id | iface $ifc | active | remote public: $remote | config: $file | service: $service_state"
     else
       echo "  - tunnel $id | iface $ifc | inactive | remote public: $remote | config: $file | service: $service_state"
@@ -624,6 +958,8 @@ gre_create_tunnel() {
     return 1
   fi
 
+  apply_tunnel_sysctls
+  ensure_public_endpoint_route "$REMOTE_PUBLIC_IP" "$LOCAL_PUBLIC_IP"
   modprobe gre || true
   modprobe ip_gre || true
 
@@ -631,7 +967,7 @@ gre_create_tunnel() {
   ip link set "$TUN_IFACE" down 2>/dev/null || true
   ip tunnel del "$TUN_IFACE" 2>/dev/null || true
 
-  if ! ip tunnel add "$TUN_IFACE" mode gre local "$LOCAL_PUBLIC_IP" remote "$REMOTE_PUBLIC_IP" key "$TUN_KEY" ttl 255; then
+  if ! ip tunnel add "$TUN_IFACE" mode gre local "$LOCAL_PUBLIC_IP" remote "$REMOTE_PUBLIC_IP" key "$TUN_KEY" ttl 255 nopmtudisc; then
     echo "Failed to create $TUN_IFACE (local=$LOCAL_PUBLIC_IP remote=$REMOTE_PUBLIC_IP key=$TUN_KEY)." >&2
     echo "Another GRE interface may already use the same local/remote/key tuple." >&2
     echo "Current GRE interfaces:" >&2
@@ -645,7 +981,7 @@ gre_create_tunnel() {
     return 1
   fi
 
-  if ! ip link set "$TUN_IFACE" mtu 1390 || ! ip link set "$TUN_IFACE" up; then
+  if ! ip link set "$TUN_IFACE" mtu 1390 txqueuelen 1000 || ! ip link set "$TUN_IFACE" up; then
     echo "Failed to bring $TUN_IFACE up" >&2
     ip tunnel del "$TUN_IFACE" 2>/dev/null || true
     return 1
@@ -658,6 +994,7 @@ gre_create_tunnel() {
   fi
 
   enable_ip_forward
+  apply_tunnel_sysctls
 
   if command -v iptables >/dev/null 2>&1; then
     iptables -C INPUT -p gre -s "$REMOTE_PUBLIC_IP" -j ACCEPT 2>/dev/null || iptables -A INPUT -p gre -s "$REMOTE_PUBLIC_IP" -j ACCEPT
@@ -850,23 +1187,11 @@ gre_install_service() {
   fi
 
   mkdir -p "$(dirname "$INSTALL_BIN")"
-  cp -f "$0" "$INSTALL_BIN"
+  cp -f "$0" "$INSTALL_BIN" 2>/dev/null || true
   chmod 755 "$INSTALL_BIN"
 
-  cat > "$GRE_SERVICE_TEMPLATE" <<EOF_SERVICE
-[Unit]
-Description=Normal GRE Tunnel %i Service
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/bin/bash $INSTALL_BIN --service start-gre %i
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF_SERVICE
+  gre_write_service_template
+  install_health_monitor
 
   if [ -f "$GRE_LEGACY_SERVICE_UNIT" ]; then
     systemctl disable --now gre-tunnel.service 2>/dev/null || true
@@ -1114,7 +1439,7 @@ wg_collect_ids() {
         validate_tunnel_id "$id2" && echo "$id2"
       done
     fi
-    ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1 | grep -E "^${WG_IFACE_PREFIX}[0-9]+$" | sed "s/^${WG_IFACE_PREFIX}//" || true
+    ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1 | grep -E "^${WG_IFACE_PREFIX}[0-9]+$" | sed "s/^${WG_IFACE_PREFIX}//" | awk '$1 >= 1 && $1 <= 254' || true
   } | sort -n -u
 }
 
@@ -1162,7 +1487,7 @@ wg_list_tunnels() {
       fi
     fi
 
-    if ip link show "$ifc" >/dev/null 2>&1; then
+    if tunnel_iface_is_up "$ifc"; then
       link_state="active"
     else
       link_state="inactive"
@@ -1725,11 +2050,33 @@ wg_install_service() {
   mkdir -p "$(dirname "$INSTALL_BIN")"
   cp -f "$0" "$INSTALL_BIN" 2>/dev/null || true
   chmod 755 "$INSTALL_BIN" 2>/dev/null || true
+  install_health_monitor
   mkdir -p "/etc/systemd/system/wg-quick@$ifc.service.d"
-  cat > "/etc/systemd/system/wg-quick@$ifc.service.d/10-gretun-firewall.conf" <<EOF_WG_FW
+  local transport_after=""
+  if wg_load_meta "$id"; then
+    case "${WG_ENDPOINT_MODE:-public}" in
+      gre) transport_after="gre-tunnel@$id.service" ;;
+      vira7) transport_after="vira7-tunnel@$id.service" ;;
+    esac
+  fi
+  if [ -n "$transport_after" ]; then
+    cat > "/etc/systemd/system/wg-quick@$ifc.service.d/10-gretun-firewall.conf" <<EOF_WG_FW
+[Unit]
+After=network-online.target $transport_after
+Wants=$transport_after
+
 [Service]
 ExecStartPre=/bin/bash $INSTALL_BIN --service firewall-wg $id
 EOF_WG_FW
+  else
+    cat > "/etc/systemd/system/wg-quick@$ifc.service.d/10-gretun-firewall.conf" <<EOF_WG_FW
+[Unit]
+After=network-online.target
+
+[Service]
+ExecStartPre=/bin/bash $INSTALL_BIN --service firewall-wg $id
+EOF_WG_FW
+  fi
 
   systemctl daemon-reload
 
@@ -2378,6 +2725,7 @@ vira7_write_service_template() {
 Description=Vira7 UDP-TUN Tunnel %i Service
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -2512,6 +2860,7 @@ vira7_install_service() {
   mkdir -p "$(dirname "$INSTALL_BIN")"
   cp -f "$0" "$INSTALL_BIN" 2>/dev/null || true
   chmod 755 "$INSTALL_BIN" 2>/dev/null || true
+  install_health_monitor
   vira7_write_service_template
   systemctl enable "$(vira7_service_name "$id")" || return 1
   if systemctl restart "$(vira7_service_name "$id")"; then
@@ -2627,7 +2976,7 @@ vira7_collect_ids() {
         validate_tunnel_id "$id" && echo "$id"
       done
     fi
-    ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1 | grep -E "^${VIRA7_IFACE_PREFIX}[0-9]+$" | sed "s/^${VIRA7_IFACE_PREFIX}//" || true
+    ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1 | grep -E "^${VIRA7_IFACE_PREFIX}[0-9]+$" | sed "s/^${VIRA7_IFACE_PREFIX}//" | awk '$1 >= 1 && $1 <= 254' || true
   } | sort -n -u
 }
 
@@ -2816,7 +3165,7 @@ build_tunnel_inventory() {
         target="$(gre_remote_inner_ip_for_role "$id" "$ROLE")"
       fi
     fi
-    if ip link show "$ifc" >/dev/null 2>&1; then state="active"; else state="inactive"; fi
+    if tunnel_iface_is_up "$ifc"; then state="active"; else state="inactive"; fi
     INV_TYPE+=("gre"); INV_ID+=("$id"); INV_IFACE+=("$ifc"); INV_LOCAL+=("$local_ip"); INV_TARGET+=("$target"); INV_LOCAL_PUBLIC+=("$local_pub"); INV_REMOTE_PUBLIC+=("$remote_pub"); INV_STATE+=("$state"); INV_DESC+=("$desc")
   done <<< "$ids"
 
@@ -2832,7 +3181,7 @@ build_tunnel_inventory() {
       remote_pub="${REMOTE_PUBLIC_IP:-${WG_ENDPOINT_IP:-}}"
       if [ -z "${REMOTE_WG_PUBLIC_KEY:-}" ]; then desc="WireGuard/PENDING"; fi
     fi
-    if ip link show "$ifc" >/dev/null 2>&1; then state="active"; else state="inactive"; fi
+    if tunnel_iface_is_up "$ifc"; then state="active"; else state="inactive"; fi
     INV_TYPE+=("wireguard"); INV_ID+=("$id"); INV_IFACE+=("$ifc"); INV_LOCAL+=("$local_ip"); INV_TARGET+=("$target"); INV_LOCAL_PUBLIC+=("$local_pub"); INV_REMOTE_PUBLIC+=("$remote_pub"); INV_STATE+=("$state"); INV_DESC+=("$desc")
   done <<< "$ids"
 
@@ -2847,7 +3196,7 @@ build_tunnel_inventory() {
       local_pub="${LOCAL_PUBLIC_IP:-${bind_ip:-}}"
       remote_pub="${REMOTE_PUBLIC_IP:-${remote_ip:-}}"
     fi
-    if ip link show "$ifc" >/dev/null 2>&1; then state="active"; else state="inactive"; fi
+    if tunnel_iface_is_up "$ifc"; then state="active"; else state="inactive"; fi
     INV_TYPE+=("vira7"); INV_ID+=("$id"); INV_IFACE+=("$ifc"); INV_LOCAL+=("$local_ip"); INV_TARGET+=("$target"); INV_LOCAL_PUBLIC+=("$local_pub"); INV_REMOTE_PUBLIC+=("$remote_pub"); INV_STATE+=("$state"); INV_DESC+=("$desc")
   done <<< "$ids"
 }
@@ -3175,6 +3524,7 @@ list_saved_tunnels() {
 ping4_target() {
   local label="$1"
   local target_ip="$2"
+  local bind_if="${3:-}"
   if [ -z "${target_ip:-}" ]; then
     echo "[SKIP] $label: remote IP is empty"
     return 1
@@ -3184,18 +3534,29 @@ ping4_target() {
   echo "============================================================"
   echo "Testing: $label"
   echo "Target : $target_ip"
-  echo "Command: ping -c 4 -W 2 $target_ip"
+  if [ -n "$bind_if" ]; then
+    echo "Command: ping -I $bind_if -c 4 -W 2 $target_ip"
+  else
+    echo "Command: ping -c 4 -W 2 $target_ip"
+  fi
   echo "------------------------------------------------------------"
-  if ping -c 4 -W 2 "$target_ip"; then
-    echo "[OK] $label ping success"
-    return 0
+  if [ -n "$bind_if" ]; then
+    if ping -I "$bind_if" -c 4 -W 2 "$target_ip"; then
+      echo "[OK] $label ping success"
+      return 0
+    fi
+  else
+    if ping -c 4 -W 2 "$target_ip"; then
+      echo "[OK] $label ping success"
+      return 0
+    fi
   fi
   echo "[FAIL] $label ping failed"
   return 1
 }
 
 test_gre_tunnel_ping() {
-  local id="$1"
+  local id="$1" ifc svc
   if ! gre_load_config "$id"; then
     echo "[SKIP] GRE tunnel $id: no saved config"
     return 1
@@ -3204,7 +3565,18 @@ test_gre_tunnel_ping() {
   if [ -z "$target" ] && [ -n "${ROLE:-}" ]; then
     target="$(gre_remote_inner_ip_for_role "$id" "$ROLE")"
   fi
-  ping4_target "GRE tunnel $id ($(gre_iface "$id")) remote inner IP" "$target"
+  ifc="$(gre_iface "$id")"
+  svc="$(gre_service_name "$id")"
+  if ! tunnel_iface_is_up "$ifc"; then
+    echo "[REPAIR] $ifc is inactive; restarting its self-healing service..."
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl restart "$svc" >/dev/null 2>&1 || gre_service_start "$id" || true
+    else
+      gre_service_start "$id" || true
+    fi
+    sleep 2
+  fi
+  ping4_target "GRE tunnel $id ($ifc) remote inner IP" "$target" "$ifc"
 }
 
 test_wg_tunnel_ping() {
@@ -3217,7 +3589,7 @@ test_wg_tunnel_ping() {
     echo "[SKIP] WireGuard tunnel $id: pending peer public key"
     return 1
   fi
-  ping4_target "WireGuard tunnel $id ($(wg_iface_name "$id")) remote inner IP" "${REMOTE_WG_IP:-}"
+  ping4_target "WireGuard tunnel $id ($(wg_iface_name "$id")) remote inner IP" "${REMOTE_WG_IP:-}" "$(wg_iface_name "$id")"
 }
 
 test_vira7_tunnel_ping() {
@@ -3226,7 +3598,7 @@ test_vira7_tunnel_ping() {
     echo "[SKIP] Vira7 tunnel $id: no saved config"
     return 1
   fi
-  ping4_target "Vira7 tunnel $id ($(vira7_iface_name "$id")) remote inner IP" "${REMOTE_VIRA7_IP:-${remote_priv:-}}"
+  ping4_target "Vira7 tunnel $id ($(vira7_iface_name "$id")) remote inner IP" "${REMOTE_VIRA7_IP:-${remote_priv:-}}" "$(vira7_iface_name "$id")"
 }
 
 test_one_tunnel_ping_menu() {
@@ -3905,6 +4277,16 @@ if [[ "${1:-}" == "--service" ]]; then
       gre_service_start "${3:-}"
       exit $?
       ;;
+    supervise-gre)
+      ensure_root
+      gre_supervisor "${3:-}"
+      exit $?
+      ;;
+    health-check-all)
+      ensure_root
+      tunnel_health_check_all
+      exit $?
+      ;;
     start)
       # Backward compatibility with older gre-tunnel@ service template.
       ensure_root
@@ -3927,13 +4309,14 @@ if [[ "${1:-}" == "--service" ]]; then
       exit $?
       ;;
     *)
-      echo "Unknown service command. Use --service start-gre <id>." >&2
+      echo "Unknown service command. Use --service supervise-gre <id> or health-check-all." >&2
       exit 1
       ;;
   esac
 fi
 
 ensure_root
+bootstrap_runtime_repairs >/dev/null 2>&1 || true
 while true; do
   show_menu
 done
