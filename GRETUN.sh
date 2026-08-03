@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + WireGuard + Vira7 + HAProxy multi-tunnel manager v8.6.2-self-heal-gre-fix
+# GRE + WireGuard + Vira7 + HAProxy multi-tunnel manager v8.6.3-version-header
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
@@ -11,6 +11,9 @@ set -euo pipefail
 #   pins public peer routes to the physical uplink, and repairs GRE/Vira7/WireGuard in dependency order
 # - v8.6.1 fixes execution through bash <(curl ...) without consuming the script pipe
 # - v8.6.2 fixes GRE creation on kernels that reject fixed TTL together with nopmtudisc
+# - v8.6.3 displays the installed script version in the main menu header
+
+APP_VERSION="8.6.3"
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -4289,7 +4292,7 @@ haproxy_menu() {
 }
 
 show_menu() {
-  show_header "GRE + WireGuard + Vira7 Tunnel Management"
+  show_header "GRE + WireGuard + Vira7 Tunnel Management v${APP_VERSION}"
   echo -e "${C_BOLD}${C_WHITE}Main Menu${C_RESET}"
   echo -e "  ${C_GREEN}1)${C_RESET} create/update tunnel"
   echo -e "  ${C_RED}2)${C_RESET} remove tunnel"
