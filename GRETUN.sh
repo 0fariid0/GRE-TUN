@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + WireGuard + Vira7 + HAProxy multi-tunnel manager v8.6.3-version-header
+# GRE + WireGuard + Vira7 + ViraTCP + HAProxy multi-tunnel manager v8.7.0
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
@@ -12,8 +12,9 @@ set -euo pipefail
 # - v8.6.1 fixes execution through bash <(curl ...) without consuming the script pipe
 # - v8.6.2 fixes GRE creation on kernels that reject fixed TTL together with nopmtudisc
 # - v8.6.3 displays the installed script version in the main menu header
+# - v8.7.0 adds encrypted self-healing TCP-TUN (type 4) for paths that throttle/block GRE or UDP
 
-APP_VERSION="8.6.3"
+APP_VERSION="8.7.0"
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -50,6 +51,19 @@ VIRA7_DEFAULT_QUEUE_LEN=1000
 VIRA7_DEFAULT_CHECKSUM=1
 VIRA7_DEFAULT_VERIFY_CHECKSUM=0
 VIRA7_DEFAULT_BATCH=128
+
+# ViraTCP: encrypted TCP based TUN. Iran initiates the outbound TCP connection
+# and Kharej listens, which is useful where GRE/UDP paths are short-lived or filtered.
+VIRATCP_CONFIG_DIR="/etc/viratcp-tunnels"
+VIRATCP_BINARY="/usr/local/bin/viratcp-engine"
+VIRATCP_SOURCE="$VIRATCP_CONFIG_DIR/viratcp_engine.c"
+VIRATCP_SERVICE_TEMPLATE="/etc/systemd/system/viratcp-tunnel@.service"
+VIRATCP_IFACE_PREFIX="viratcp"
+VIRATCP_DEFAULT_PORT=443
+VIRATCP_DEFAULT_MTU=1280
+VIRATCP_DEFAULT_KEEPALIVE=10
+VIRATCP_DEFAULT_RECONNECT=3
+VIRATCP_DEFAULT_TCP_USER_TIMEOUT=20000
 
 HAPROXY_CONFIG="/etc/haproxy/haproxy.cfg"
 HAPROXY_BACKUP_DIR="/etc/haproxy/gretun-backups"
@@ -223,13 +237,15 @@ ask_tunnel_type() {
   echo "1) Normal GRE tunnel"
   echo "2) WireGuard tunnel"
   echo "3) Vira7 UDP-TUN tunnel"
+  echo "4) ViraTCP encrypted TCP-TUN (anti UDP/GRE filtering)"
   echo
-  read -rp "Choose [1-3] (00=menu): " TUNNEL_TYPE_CHOICE
+  read -rp "Choose [1-4] (00=menu): " TUNNEL_TYPE_CHOICE
   if is_main_menu_token "$TUNNEL_TYPE_CHOICE"; then return_main_msg; return 99; fi
   case "$TUNNEL_TYPE_CHOICE" in
     1) SELECTED_TUNNEL_TYPE="gre" ;;
     2) SELECTED_TUNNEL_TYPE="wireguard" ;;
     3) SELECTED_TUNNEL_TYPE="vira7" ;;
+    4) SELECTED_TUNNEL_TYPE="viratcp" ;;
     *) echo "Invalid tunnel type"; return 1 ;;
   esac
 }
@@ -417,6 +433,43 @@ firewall_allow_udp_port_and_ip() {
   echo "Firewall opened for $label: UDP $port, peer ${peer_ip:-any}, interface ${ifc:-none}"
 }
 
+firewall_allow_tcp_port_and_ip() {
+  local label="$1"
+  local port="$2"
+  local peer_ip="${3:-}"
+  local ifc="${4:-}"
+  local listen_mode="${5:-0}"
+
+  if command -v iptables >/dev/null 2>&1; then
+    if [ "$listen_mode" = "1" ]; then
+      iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || iptables -A INPUT -p tcp --dport "$port" -j ACCEPT || true
+    fi
+    if [ -n "$peer_ip" ] && validate_ipv4 "$peer_ip"; then
+      iptables -C OUTPUT -d "$peer_ip" -p tcp --dport "$port" -j ACCEPT 2>/dev/null || iptables -A OUTPUT -d "$peer_ip" -p tcp --dport "$port" -j ACCEPT || true
+      if [ "$listen_mode" = "1" ]; then
+        iptables -C INPUT -s "$peer_ip" -p tcp --dport "$port" -j ACCEPT 2>/dev/null || iptables -A INPUT -s "$peer_ip" -p tcp --dport "$port" -j ACCEPT || true
+      fi
+    fi
+    if [ -n "$ifc" ]; then
+      iptables -C INPUT -i "$ifc" -j ACCEPT 2>/dev/null || iptables -A INPUT -i "$ifc" -j ACCEPT || true
+      iptables -C OUTPUT -o "$ifc" -j ACCEPT 2>/dev/null || iptables -A OUTPUT -o "$ifc" -j ACCEPT || true
+      iptables -C FORWARD -i "$ifc" -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$ifc" -j ACCEPT || true
+      iptables -C FORWARD -o "$ifc" -j ACCEPT 2>/dev/null || iptables -A FORWARD -o "$ifc" -j ACCEPT || true
+    fi
+  fi
+
+  if command -v ufw >/dev/null 2>&1; then
+    if [ "$listen_mode" = "1" ]; then ufw allow "$port/tcp" >/dev/null 2>&1 || true; fi
+    if [ -n "$peer_ip" ] && validate_ipv4 "$peer_ip"; then
+      ufw allow out to "$peer_ip" port "$port" proto tcp >/dev/null 2>&1 || true
+      if [ "$listen_mode" = "1" ]; then ufw allow from "$peer_ip" to any port "$port" proto tcp >/dev/null 2>&1 || true; fi
+    fi
+    if [ -n "$ifc" ]; then ufw allow in on "$ifc" >/dev/null 2>&1 || true; fi
+  fi
+
+  echo "Firewall opened for $label: TCP $port, peer ${peer_ip:-any}, interface ${ifc:-none}"
+}
+
 firewall_allow_ip_peer() {
   local label="$1"
   local peer_ip="${2:-}"
@@ -493,7 +546,7 @@ ensure_public_endpoint_route() {
   gateway="$(awk '{for(i=1;i<=NF;i++) if($i=="via") {print $(i+1); exit}}' <<< "$route")"
 
   case "$dev" in
-    gre*|wgtun*|vira7*|"")
+    gre*|wgtun*|vira7*|viratcp*|"")
       route="$(ip -4 route get 1.1.1.1 from "$local_ip" 2>/dev/null | head -n 1 || true)"
       dev="$(awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}' <<< "$route")"
       gateway="$(awk '{for(i=1;i<=NF;i++) if($i=="via") {print $(i+1); exit}}' <<< "$route")"
@@ -501,7 +554,7 @@ ensure_public_endpoint_route() {
   esac
 
   [ -n "$dev" ] || return 0
-  case "$dev" in gre*|wgtun*|vira7*) return 0 ;; esac
+  case "$dev" in gre*|wgtun*|vira7*|viratcp*) return 0 ;; esac
   if [ -n "$gateway" ]; then
     ip -4 route replace "$remote_ip/32" via "$gateway" dev "$dev" src "$local_ip" metric 5 2>/dev/null || true
   else
@@ -562,7 +615,7 @@ install_health_monitor() {
 
   cat > "$HEALTH_SERVICE_UNIT" <<EOF_HEALTH_SERVICE
 [Unit]
-Description=GRE/WireGuard/Vira7 dependency-aware health check
+Description=GRE/WireGuard/Vira7/ViraTCP dependency-aware health check
 After=network-online.target
 Wants=network-online.target
 
@@ -573,7 +626,7 @@ EOF_HEALTH_SERVICE
 
   cat > "$HEALTH_TIMER_UNIT" <<'EOF_HEALTH_TIMER'
 [Unit]
-Description=Run GRE/WireGuard/Vira7 health check periodically
+Description=Run GRE/WireGuard/Vira7/ViraTCP health check periodically
 
 [Timer]
 OnBootSec=25s
@@ -706,6 +759,32 @@ tunnel_health_check_all() {
         health_counter_reset vira7 "$id"
         sleep 1
         restart_wg_dependents_for_transport vira7 "$id"
+      fi
+    fi
+  done <<< "$ids"
+
+  # ViraTCP maintains a reconnecting TCP session itself. The health timer only
+  # restarts it after repeated inner-path failures or if the service/interface disappeared.
+  ids="$(viratcp_collect_ids || true)"
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    svc="$(viratcp_service_name "$id")"
+    systemctl is-enabled --quiet "$svc" 2>/dev/null || continue
+    viratcp_load_config "$id" || continue
+    ifc="$(viratcp_iface_name "$id")"
+    target="${REMOTE_VIRATCP_IP:-${remote_priv:-}}"
+    ensure_public_endpoint_route "${REMOTE_PUBLIC_IP:-${remote_ip:-}}" "${LOCAL_PUBLIC_IP:-${bind_ip:-}}"
+    viratcp_apply_firewall_rules "$id" >/dev/null 2>&1 || true
+    if ! systemctl is-active --quiet "$svc" 2>/dev/null || ! tunnel_iface_is_up "$ifc"; then
+      systemctl restart "$svc" >/dev/null 2>&1 || true
+      health_counter_reset viratcp "$id"
+    elif quick_tunnel_ping "$ifc" "$target"; then
+      health_counter_reset viratcp "$id"
+    else
+      count="$(health_counter_fail viratcp "$id")"
+      if [ "$count" -ge "$HEALTH_FAIL_LIMIT" ]; then
+        systemctl restart "$svc" >/dev/null 2>&1 || true
+        health_counter_reset viratcp "$id"
       fi
     fi
   done <<< "$ids"
@@ -3174,6 +3253,717 @@ vira7_optimize_cpu_menu() {
   fi
 }
 
+
+# -----------------------------
+# ViraTCP encrypted TCP-TUN helpers (tunnel type 4)
+# -----------------------------
+viratcp_iface_name() {
+  echo "${VIRATCP_IFACE_PREFIX}$1"
+}
+
+viratcp_config_file() {
+  echo "$VIRATCP_CONFIG_DIR/tunnel-$1.conf"
+}
+
+viratcp_service_name() {
+  echo "viratcp-tunnel@$1.service"
+}
+
+viratcp_inner_ip_for_role() {
+  local id="$1" role="$2"
+  if [ "$role" = "1" ]; then echo "10.81.$id.1"; else echo "10.81.$id.2"; fi
+}
+
+viratcp_remote_inner_ip_for_role() {
+  local id="$1" role="$2"
+  if [ "$role" = "1" ]; then echo "10.81.$id.2"; else echo "10.81.$id.1"; fi
+}
+
+viratcp_generate_psk() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 32
+  else
+    od -An -N32 -tx1 /dev/urandom | tr -d ' \n'
+  fi
+}
+
+viratcp_validate_psk() {
+  [[ "${1:-}" =~ ^[A-Fa-f0-9]{64}$ ]]
+}
+
+viratcp_ensure_deps() {
+  if command -v gcc >/dev/null 2>&1 && [ -f /usr/include/openssl/evp.h ]; then return 0; fi
+  echo "Installing ViraTCP build/runtime dependencies..."
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential gcc libssl-dev iproute2 iptables kmod openssl
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y gcc make openssl-devel iproute iptables kmod openssl
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y gcc make openssl-devel iproute iptables kmod openssl
+  else
+    echo "No supported package manager found. Install gcc, OpenSSL development headers, iproute2 and iptables manually." >&2
+    return 1
+  fi
+}
+
+viratcp_compile_engine() {
+  viratcp_ensure_deps || return 1
+  mkdir -p "$VIRATCP_CONFIG_DIR"
+  cat > "$VIRATCP_SOURCE" <<'VIRATCP_ENGINE_EOF'
+#define _GNU_SOURCE
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/if_tun.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <openssl/evp.h>
+#include <openssl/rand.h>
+#include <openssl/sha.h>
+#include <poll.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <time.h>
+#include <unistd.h>
+
+#define TUN_DEVICE "/dev/net/tun"
+#define VT_MAGIC 0x56544350U
+#define VT_VERSION 1U
+#define VT_DATA 1U
+#define VT_PING 2U
+#define VT_PONG 3U
+#define MAX_PACKET 65535U
+#define TAG_LEN 16U
+#define HEADER_LEN 20U
+
+typedef struct {
+    char iface[IFNAMSIZ];
+    char mode[16];
+    char bind_ip[64];
+    char remote_ip[64];
+    char local_priv[64];
+    char remote_priv[64];
+    char psk_hex[129];
+    int port;
+    int mtu;
+    int keepalive;
+    int reconnect;
+    int tcp_user_timeout;
+    int queue_len;
+} vt_config_t;
+
+typedef struct {
+    unsigned char tx_key[32];
+    unsigned char rx_key[32];
+    unsigned char tx_nonce_prefix[4];
+    unsigned char rx_nonce_prefix[4];
+    uint64_t tx_seq;
+    uint64_t rx_seq;
+} crypto_state_t;
+
+static volatile sig_atomic_t running = 1;
+static void on_signal(int sig) { (void)sig; running = 0; }
+
+static uint64_t bswap64_u(uint64_t x) {
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    return __builtin_bswap64(x);
+#else
+    return x;
+#endif
+}
+
+static void trim(char *s) {
+    char *p = s;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    if (p != s) memmove(s, p, strlen(p) + 1);
+    size_t n = strlen(s);
+    while (n && (s[n-1] == ' ' || s[n-1] == '\t' || s[n-1] == '\r' || s[n-1] == '\n')) s[--n] = 0;
+}
+
+static int load_config(const char *path, vt_config_t *c) {
+    memset(c, 0, sizeof(*c));
+    snprintf(c->iface, sizeof(c->iface), "viratcp");
+    snprintf(c->mode, sizeof(c->mode), "client");
+    c->port = 443; c->mtu = 1280; c->keepalive = 10; c->reconnect = 3;
+    c->tcp_user_timeout = 20000; c->queue_len = 2000;
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        trim(line); if (!line[0] || line[0] == '#') continue;
+        char *eq = strchr(line, '='); if (!eq) continue;
+        *eq = 0; char *key = line; char *val = eq + 1; trim(key); trim(val);
+        if (!strcmp(key, "iface")) snprintf(c->iface, sizeof(c->iface), "%s", val);
+        else if (!strcmp(key, "mode")) snprintf(c->mode, sizeof(c->mode), "%s", val);
+        else if (!strcmp(key, "bind_ip")) snprintf(c->bind_ip, sizeof(c->bind_ip), "%s", val);
+        else if (!strcmp(key, "remote_ip")) snprintf(c->remote_ip, sizeof(c->remote_ip), "%s", val);
+        else if (!strcmp(key, "local_priv")) snprintf(c->local_priv, sizeof(c->local_priv), "%s", val);
+        else if (!strcmp(key, "remote_priv")) snprintf(c->remote_priv, sizeof(c->remote_priv), "%s", val);
+        else if (!strcmp(key, "psk")) snprintf(c->psk_hex, sizeof(c->psk_hex), "%s", val);
+        else if (!strcmp(key, "port")) c->port = atoi(val);
+        else if (!strcmp(key, "mtu")) c->mtu = atoi(val);
+        else if (!strcmp(key, "keepalive")) c->keepalive = atoi(val);
+        else if (!strcmp(key, "reconnect")) c->reconnect = atoi(val);
+        else if (!strcmp(key, "tcp_user_timeout")) c->tcp_user_timeout = atoi(val);
+        else if (!strcmp(key, "queue_len")) c->queue_len = atoi(val);
+    }
+    fclose(f);
+    if (!c->iface[0] || !c->local_priv[0] || !c->remote_priv[0] || strlen(c->psk_hex) != 64) return -1;
+    if (strcmp(c->mode, "client") && strcmp(c->mode, "server")) return -1;
+    if (!strcmp(c->mode, "client") && !c->remote_ip[0]) return -1;
+    if (c->port < 1 || c->port > 65535) return -1;
+    if (c->mtu < 576 || c->mtu > 1500) c->mtu = 1280;
+    if (c->keepalive < 3 || c->keepalive > 60) c->keepalive = 10;
+    if (c->reconnect < 1 || c->reconnect > 60) c->reconnect = 3;
+    if (c->tcp_user_timeout < 5000 || c->tcp_user_timeout > 120000) c->tcp_user_timeout = 20000;
+    if (c->queue_len < 100) c->queue_len = 2000;
+    return 0;
+}
+
+static int hex_to_bytes(const char *hex, unsigned char *out, size_t outlen) {
+    if (strlen(hex) != outlen * 2) return -1;
+    for (size_t i = 0; i < outlen; i++) {
+        unsigned int v;
+        if (sscanf(hex + i * 2, "%2x", &v) != 1) return -1;
+        out[i] = (unsigned char)v;
+    }
+    return 0;
+}
+
+static void derive_session_value(const unsigned char psk[32], const unsigned char client_nonce[32],
+                                 const unsigned char server_nonce[32], const char *label, unsigned char out[32]) {
+    SHA256_CTX c;
+    SHA256_Init(&c);
+    SHA256_Update(&c, psk, 32);
+    SHA256_Update(&c, client_nonce, 32);
+    SHA256_Update(&c, server_nonce, 32);
+    SHA256_Update(&c, label, strlen(label));
+    SHA256_Final(out, &c);
+}
+
+static int crypto_init_state(const vt_config_t *cfg, const unsigned char client_nonce[32],
+                             const unsigned char server_nonce[32], crypto_state_t *st) {
+    unsigned char psk[32], c2s[32], s2c[32], nc2s[32], ns2c[32];
+    if (hex_to_bytes(cfg->psk_hex, psk, sizeof(psk)) != 0) return -1;
+    derive_session_value(psk, client_nonce, server_nonce, "viratcp-c2s-key-v1", c2s);
+    derive_session_value(psk, client_nonce, server_nonce, "viratcp-s2c-key-v1", s2c);
+    derive_session_value(psk, client_nonce, server_nonce, "viratcp-c2s-nonce-v1", nc2s);
+    derive_session_value(psk, client_nonce, server_nonce, "viratcp-s2c-nonce-v1", ns2c);
+    memset(st, 0, sizeof(*st)); st->tx_seq = 1; st->rx_seq = 0;
+    if (!strcmp(cfg->mode, "client")) {
+        memcpy(st->tx_key, c2s, 32); memcpy(st->rx_key, s2c, 32);
+        memcpy(st->tx_nonce_prefix, nc2s, 4); memcpy(st->rx_nonce_prefix, ns2c, 4);
+    } else {
+        memcpy(st->tx_key, s2c, 32); memcpy(st->rx_key, c2s, 32);
+        memcpy(st->tx_nonce_prefix, ns2c, 4); memcpy(st->rx_nonce_prefix, nc2s, 4);
+    }
+    OPENSSL_cleanse(psk, sizeof(psk)); OPENSSL_cleanse(c2s, sizeof(c2s)); OPENSSL_cleanse(s2c, sizeof(s2c));
+    OPENSSL_cleanse(nc2s, sizeof(nc2s)); OPENSSL_cleanse(ns2c, sizeof(ns2c));
+    return 0;
+}
+
+static int tun_alloc_named(const char *dev) {
+    int fd = open(TUN_DEVICE, O_RDWR); if (fd < 0) return -1;
+    struct ifreq ifr; memset(&ifr, 0, sizeof(ifr)); ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
+    snprintf(ifr.ifr_name, IFNAMSIZ, "%s", dev);
+    if (ioctl(fd, TUNSETIFF, &ifr) < 0) { close(fd); return -1; }
+    return fd;
+}
+
+static void cleanup_iface(const char *iface) {
+    char cmd[256]; snprintf(cmd, sizeof(cmd), "ip link del %s 2>/dev/null", iface); system(cmd);
+}
+
+static int configure_tun(const vt_config_t *c) {
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "ip link set dev %s up mtu %d txqueuelen %d", c->iface, c->mtu, c->queue_len);
+    if (system(cmd) != 0) return -1;
+    snprintf(cmd, sizeof(cmd), "ip addr replace %s/32 peer %s dev %s", c->local_priv, c->remote_priv, c->iface);
+    return system(cmd) == 0 ? 0 : -1;
+}
+
+static void set_sock_opts(int fd, const vt_config_t *c) {
+    int one = 1, idle = c->keepalive, intvl = c->keepalive / 2; if (intvl < 2) intvl = 2; int cnt = 3;
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+#ifdef TCP_KEEPIDLE
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+#endif
+#ifdef TCP_KEEPINTVL
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+#endif
+#ifdef TCP_KEEPCNT
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+#endif
+#ifdef TCP_USER_TIMEOUT
+    setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &c->tcp_user_timeout, sizeof(c->tcp_user_timeout));
+#endif
+    struct timeval tv; tv.tv_sec = c->keepalive * 4; tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)); setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
+static int create_listener(const vt_config_t *c) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0); if (fd < 0) return -1;
+    int one = 1; setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in a; memset(&a, 0, sizeof(a)); a.sin_family = AF_INET; a.sin_port = htons((uint16_t)c->port);
+    if (c->bind_ip[0]) { if (inet_pton(AF_INET, c->bind_ip, &a.sin_addr) != 1) { close(fd); return -1; } }
+    else a.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(fd, (struct sockaddr *)&a, sizeof(a)) != 0 || listen(fd, 8) != 0) { close(fd); return -1; }
+    return fd;
+}
+
+static int connect_client(const vt_config_t *c) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0); if (fd < 0) return -1;
+    if (c->bind_ip[0]) {
+        struct sockaddr_in l; memset(&l, 0, sizeof(l)); l.sin_family = AF_INET; l.sin_port = 0;
+        if (inet_pton(AF_INET, c->bind_ip, &l.sin_addr) != 1 || bind(fd, (struct sockaddr *)&l, sizeof(l)) != 0) { close(fd); return -1; }
+    }
+    struct sockaddr_in r; memset(&r, 0, sizeof(r)); r.sin_family = AF_INET; r.sin_port = htons((uint16_t)c->port);
+    if (inet_pton(AF_INET, c->remote_ip, &r.sin_addr) != 1) { close(fd); return -1; }
+    if (connect(fd, (struct sockaddr *)&r, sizeof(r)) != 0) { close(fd); return -1; }
+    set_sock_opts(fd, c); return fd;
+}
+
+static ssize_t read_full(int fd, void *buf, size_t len) {
+    unsigned char *p = buf; size_t got = 0;
+    while (got < len && running) {
+        ssize_t n = recv(fd, p + got, len - got, 0);
+        if (n == 0) return 0;
+        if (n < 0) { if (errno == EINTR) continue; return -1; }
+        got += (size_t)n;
+    }
+    return (ssize_t)got;
+}
+
+static int write_full(int fd, const void *buf, size_t len) {
+    const unsigned char *p = buf; size_t sent = 0;
+    while (sent < len && running) {
+        ssize_t n = send(fd, p + sent, len - sent, MSG_NOSIGNAL);
+        if (n < 0) { if (errno == EINTR) continue; return -1; }
+        if (n == 0) return -1;
+        sent += (size_t)n;
+    }
+    return sent == len ? 0 : -1;
+}
+
+static void make_nonce(const unsigned char prefix[4], uint64_t seq, unsigned char nonce[12]) {
+    uint64_t nseq = bswap64_u(seq); memcpy(nonce, prefix, 4); memcpy(nonce + 4, &nseq, 8);
+}
+
+static int aead_encrypt(const unsigned char key[32], const unsigned char nonce[12], const unsigned char *aad, int aad_len,
+                        const unsigned char *plain, int plain_len, unsigned char *cipher, unsigned char tag[TAG_LEN]) {
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new(); if (!ctx) return -1; int len = 0, out = 0, ok = -1;
+    if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1) goto end;
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL) != 1) goto end;
+    if (EVP_EncryptInit_ex(ctx, NULL, NULL, key, nonce) != 1) goto end;
+    if (EVP_EncryptUpdate(ctx, NULL, &len, aad, aad_len) != 1) goto end;
+    if (plain_len && EVP_EncryptUpdate(ctx, cipher, &len, plain, plain_len) != 1) goto end;
+    out = len;
+    if (EVP_EncryptFinal_ex(ctx, cipher + out, &len) != 1) goto end;
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, TAG_LEN, tag) != 1) goto end;
+    ok = 0;
+end: EVP_CIPHER_CTX_free(ctx); return ok;
+}
+
+static int aead_decrypt(const unsigned char key[32], const unsigned char nonce[12], const unsigned char *aad, int aad_len,
+                        const unsigned char *cipher, int cipher_len, const unsigned char tag[TAG_LEN], unsigned char *plain) {
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new(); if (!ctx) return -1; int len = 0, out = 0, ok = -1;
+    if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1) goto end;
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL) != 1) goto end;
+    if (EVP_DecryptInit_ex(ctx, NULL, NULL, key, nonce) != 1) goto end;
+    if (EVP_DecryptUpdate(ctx, NULL, &len, aad, aad_len) != 1) goto end;
+    if (cipher_len && EVP_DecryptUpdate(ctx, plain, &len, cipher, cipher_len) != 1) goto end;
+    out = len;
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, TAG_LEN, (void *)tag) != 1) goto end;
+    if (EVP_DecryptFinal_ex(ctx, plain + out, &len) != 1) goto end;
+    ok = 0;
+end: EVP_CIPHER_CTX_free(ctx); return ok;
+}
+
+static void put_u32(unsigned char *p, uint32_t v) { v = htonl(v); memcpy(p, &v, 4); }
+static uint32_t get_u32(const unsigned char *p) { uint32_t v; memcpy(&v, p, 4); return ntohl(v); }
+static void put_u64(unsigned char *p, uint64_t v) { v = bswap64_u(v); memcpy(p, &v, 8); }
+static uint64_t get_u64(const unsigned char *p) { uint64_t v; memcpy(&v, p, 8); return bswap64_u(v); }
+
+static int send_frame(int fd, crypto_state_t *st, uint8_t type, const unsigned char *payload, uint32_t len) {
+    if (len > MAX_PACKET) return -1;
+    unsigned char hdr[HEADER_LEN], nonce[12], tag[TAG_LEN];
+    unsigned char *cipher = malloc(len ? len : 1); if (!cipher) return -1;
+    uint64_t seq = st->tx_seq++;
+    put_u32(hdr, VT_MAGIC); hdr[4] = VT_VERSION; hdr[5] = type; hdr[6] = hdr[7] = 0;
+    put_u64(hdr + 8, seq); put_u32(hdr + 16, len); make_nonce(st->tx_nonce_prefix, seq, nonce);
+    if (aead_encrypt(st->tx_key, nonce, hdr, HEADER_LEN, payload, (int)len, cipher, tag) != 0) { free(cipher); return -1; }
+    int rc = write_full(fd, hdr, HEADER_LEN);
+    if (rc == 0 && len) rc = write_full(fd, cipher, len);
+    if (rc == 0) rc = write_full(fd, tag, TAG_LEN);
+    free(cipher); return rc;
+}
+
+static int recv_frame(int fd, crypto_state_t *st, uint8_t *type, unsigned char **payload, uint32_t *len) {
+    unsigned char hdr[HEADER_LEN], nonce[12], tag[TAG_LEN];
+    ssize_t n = read_full(fd, hdr, HEADER_LEN); if (n <= 0) return -1;
+    if (get_u32(hdr) != VT_MAGIC || hdr[4] != VT_VERSION) return -1;
+    uint64_t seq = get_u64(hdr + 8); uint32_t plen = get_u32(hdr + 16);
+    if (plen > MAX_PACKET || seq <= st->rx_seq) return -1;
+    unsigned char *cipher = malloc(plen ? plen : 1), *plain = malloc(plen ? plen : 1);
+    if (!cipher || !plain) { free(cipher); free(plain); return -1; }
+    if (plen && read_full(fd, cipher, plen) != (ssize_t)plen) { free(cipher); free(plain); return -1; }
+    if (read_full(fd, tag, TAG_LEN) != TAG_LEN) { free(cipher); free(plain); return -1; }
+    make_nonce(st->rx_nonce_prefix, seq, nonce);
+    if (aead_decrypt(st->rx_key, nonce, hdr, HEADER_LEN, cipher, (int)plen, tag, plain) != 0) { free(cipher); free(plain); return -1; }
+    free(cipher); st->rx_seq = seq; *type = hdr[5]; *payload = plain; *len = plen; return 0;
+}
+
+static int session_handshake(int sock, const vt_config_t *cfg, crypto_state_t *st) {
+    unsigned char client_nonce[32], server_nonce[32];
+    if (!strcmp(cfg->mode, "client")) {
+        if (RAND_bytes(client_nonce, sizeof(client_nonce)) != 1) return -1;
+        if (write_full(sock, client_nonce, sizeof(client_nonce)) != 0) return -1;
+        if (read_full(sock, server_nonce, sizeof(server_nonce)) != (ssize_t)sizeof(server_nonce)) return -1;
+    } else {
+        if (read_full(sock, client_nonce, sizeof(client_nonce)) != (ssize_t)sizeof(client_nonce)) return -1;
+        if (RAND_bytes(server_nonce, sizeof(server_nonce)) != 1) return -1;
+        if (write_full(sock, server_nonce, sizeof(server_nonce)) != 0) return -1;
+    }
+    return crypto_init_state(cfg, client_nonce, server_nonce, st);
+}
+
+static int connected_loop(int sock, int tun_fd, const vt_config_t *cfg) {
+    crypto_state_t st;
+    if (session_handshake(sock, cfg, &st) != 0) return -1;
+    time_t last_tx = time(NULL), last_rx = time(NULL);
+    while (running) {
+        struct pollfd fds[2]; fds[0].fd = tun_fd; fds[0].events = POLLIN; fds[1].fd = sock; fds[1].events = POLLIN;
+        int pr = poll(fds, 2, 1000); if (pr < 0) { if (errno == EINTR) continue; return -1; }
+        if (fds[1].revents & (POLLERR | POLLHUP | POLLNVAL)) return -1;
+        if (fds[0].revents & POLLIN) {
+            unsigned char packet[MAX_PACKET]; ssize_t n = read(tun_fd, packet, sizeof(packet));
+            if (n > 0 && send_frame(sock, &st, VT_DATA, packet, (uint32_t)n) != 0) return -1;
+            if (n > 0) last_tx = time(NULL);
+        }
+        if (fds[1].revents & POLLIN) {
+            uint8_t type; unsigned char *payload = NULL; uint32_t len = 0;
+            if (recv_frame(sock, &st, &type, &payload, &len) != 0) { free(payload); return -1; }
+            last_rx = time(NULL);
+            if (type == VT_DATA && len > 0) {
+                ssize_t w = write(tun_fd, payload, len); free(payload); if (w != (ssize_t)len) return -1;
+            } else if (type == VT_PING) {
+                free(payload); if (send_frame(sock, &st, VT_PONG, NULL, 0) != 0) return -1; last_tx = time(NULL);
+            } else free(payload);
+        }
+        time_t now = time(NULL);
+        if (now - last_tx >= cfg->keepalive) {
+            if (send_frame(sock, &st, VT_PING, NULL, 0) != 0) return -1;
+            last_tx = now;
+        }
+        if (now - last_rx > cfg->keepalive * 4 + 5) return -1;
+    }
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2 || getuid() != 0) return 1;
+    vt_config_t cfg; if (load_config(argv[1], &cfg) != 0) { fprintf(stderr, "invalid ViraTCP config\n"); return 1; }
+    signal(SIGINT, on_signal); signal(SIGTERM, on_signal); signal(SIGPIPE, SIG_IGN);
+    mkdir("/dev/net", 0755); if (access(TUN_DEVICE, F_OK) != 0) system("mknod /dev/net/tun c 10 200 2>/dev/null || true");
+    system("modprobe tun 2>/dev/null || true"); cleanup_iface(cfg.iface);
+    int tun_fd = tun_alloc_named(cfg.iface); if (tun_fd < 0 || configure_tun(&cfg) != 0) { cleanup_iface(cfg.iface); if (tun_fd >= 0) close(tun_fd); return 1; }
+    int listener = -1;
+    if (!strcmp(cfg.mode, "server")) {
+        listener = create_listener(&cfg); if (listener < 0) { perror("ViraTCP listen"); cleanup_iface(cfg.iface); close(tun_fd); return 1; }
+        fprintf(stderr, "ViraTCP server listening on %s:%d\n", cfg.bind_ip[0] ? cfg.bind_ip : "0.0.0.0", cfg.port);
+    }
+    while (running) {
+        int sock = -1;
+        if (!strcmp(cfg.mode, "client")) {
+            sock = connect_client(&cfg);
+            if (sock < 0) { sleep((unsigned int)cfg.reconnect); continue; }
+            fprintf(stderr, "ViraTCP connected to %s:%d\n", cfg.remote_ip, cfg.port);
+        } else {
+            struct sockaddr_in peer; socklen_t sl = sizeof(peer); sock = accept(listener, (struct sockaddr *)&peer, &sl);
+            if (sock < 0) { if (errno == EINTR) continue; sleep(1); continue; }
+            set_sock_opts(sock, &cfg); fprintf(stderr, "ViraTCP accepted client\n");
+        }
+        connected_loop(sock, tun_fd, &cfg); close(sock);
+        if (running) { fprintf(stderr, "ViraTCP connection lost; reconnecting\n"); sleep((unsigned int)cfg.reconnect); }
+    }
+    if (listener >= 0) close(listener);
+    close(tun_fd);
+    cleanup_iface(cfg.iface);
+    return 0;
+}
+VIRATCP_ENGINE_EOF
+  if ! gcc -O2 -Wall -Wextra -Wno-deprecated-declarations -o "$VIRATCP_BINARY" "$VIRATCP_SOURCE" -lcrypto; then
+    echo "Failed to compile ViraTCP engine." >&2
+    return 1
+  fi
+  chmod 755 "$VIRATCP_BINARY"
+}
+
+viratcp_write_service_template() {
+  cat > "$VIRATCP_SERVICE_TEMPLATE" <<EOF_SERVICE
+[Unit]
+Description=ViraTCP Encrypted TCP-TUN %i Self-Healing Service
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=$VIRATCP_BINARY $VIRATCP_CONFIG_DIR/tunnel-%i.conf
+Restart=always
+RestartSec=2
+TimeoutStopSec=10
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF_SERVICE
+  systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
+viratcp_save_config() {
+  mkdir -p "$VIRATCP_CONFIG_DIR"
+  local file; file="$(viratcp_config_file "$TUNNEL_ID")"
+  cat > "$file" <<EOF_CONF
+TUNNEL_TYPE=viratcp
+TUNNEL_ID=$TUNNEL_ID
+ROLE=$ROLE
+VIRATCP_IFACE=$VIRATCP_IFACE
+VIRATCP_MODE=$VIRATCP_MODE
+LOCAL_PUBLIC_IP=$LOCAL_PUBLIC_IP
+REMOTE_PUBLIC_IP=$REMOTE_PUBLIC_IP
+LOCAL_VIRATCP_IP=$LOCAL_VIRATCP_IP
+REMOTE_VIRATCP_IP=$REMOTE_VIRATCP_IP
+VIRATCP_PORT=$VIRATCP_PORT
+VIRATCP_MTU=$VIRATCP_MTU
+VIRATCP_PSK=$VIRATCP_PSK
+VIRATCP_KEEPALIVE=${VIRATCP_KEEPALIVE:-$VIRATCP_DEFAULT_KEEPALIVE}
+VIRATCP_RECONNECT=${VIRATCP_RECONNECT:-$VIRATCP_DEFAULT_RECONNECT}
+VIRATCP_TCP_USER_TIMEOUT=${VIRATCP_TCP_USER_TIMEOUT:-$VIRATCP_DEFAULT_TCP_USER_TIMEOUT}
+
+iface=$VIRATCP_IFACE
+mode=$VIRATCP_MODE
+bind_ip=$LOCAL_PUBLIC_IP
+remote_ip=$REMOTE_PUBLIC_IP
+local_priv=$LOCAL_VIRATCP_IP
+remote_priv=$REMOTE_VIRATCP_IP
+port=$VIRATCP_PORT
+mtu=$VIRATCP_MTU
+psk=$VIRATCP_PSK
+keepalive=${VIRATCP_KEEPALIVE:-$VIRATCP_DEFAULT_KEEPALIVE}
+reconnect=${VIRATCP_RECONNECT:-$VIRATCP_DEFAULT_RECONNECT}
+tcp_user_timeout=${VIRATCP_TCP_USER_TIMEOUT:-$VIRATCP_DEFAULT_TCP_USER_TIMEOUT}
+queue_len=2000
+EOF_CONF
+  chmod 600 "$file"
+  echo "Saved ViraTCP tunnel $TUNNEL_ID configuration to $file"
+}
+
+viratcp_load_config() {
+  local id="${1:-${TUNNEL_ID:-}}" file
+  validate_tunnel_id "$id" || return 1
+  file="$(viratcp_config_file "$id")"; [ -f "$file" ] || return 1
+  VIRATCP_IFACE=""; VIRATCP_MODE=""; ROLE=""; LOCAL_PUBLIC_IP=""; REMOTE_PUBLIC_IP=""
+  LOCAL_VIRATCP_IP=""; REMOTE_VIRATCP_IP=""; VIRATCP_PORT=""; VIRATCP_MTU=""; VIRATCP_PSK=""
+  # shellcheck disable=SC1090
+  source "$file"
+  TUNNEL_ID="$id"
+  VIRATCP_IFACE="${VIRATCP_IFACE:-${iface:-$(viratcp_iface_name "$id")}}"
+  VIRATCP_MODE="${VIRATCP_MODE:-${mode:-client}}"
+  LOCAL_PUBLIC_IP="${LOCAL_PUBLIC_IP:-${bind_ip:-}}"
+  REMOTE_PUBLIC_IP="${REMOTE_PUBLIC_IP:-${remote_ip:-}}"
+  LOCAL_VIRATCP_IP="${LOCAL_VIRATCP_IP:-${local_priv:-}}"
+  REMOTE_VIRATCP_IP="${REMOTE_VIRATCP_IP:-${remote_priv:-}}"
+  VIRATCP_PORT="${VIRATCP_PORT:-${port:-$VIRATCP_DEFAULT_PORT}}"
+  VIRATCP_MTU="${VIRATCP_MTU:-${mtu:-$VIRATCP_DEFAULT_MTU}}"
+  VIRATCP_PSK="${VIRATCP_PSK:-${psk:-}}"
+  VIRATCP_KEEPALIVE="${VIRATCP_KEEPALIVE:-${keepalive:-$VIRATCP_DEFAULT_KEEPALIVE}}"
+  VIRATCP_RECONNECT="${VIRATCP_RECONNECT:-${reconnect:-$VIRATCP_DEFAULT_RECONNECT}}"
+  VIRATCP_TCP_USER_TIMEOUT="${VIRATCP_TCP_USER_TIMEOUT:-${tcp_user_timeout:-$VIRATCP_DEFAULT_TCP_USER_TIMEOUT}}"
+  if [ -z "${ROLE:-}" ]; then if [ "$LOCAL_VIRATCP_IP" = "10.81.$id.1" ]; then ROLE="1"; else ROLE="2"; fi; fi
+}
+
+viratcp_apply_firewall_rules() {
+  local id="$1" listen_mode=0
+  viratcp_load_config "$id" || return 1
+  [ "$VIRATCP_MODE" = "server" ] && listen_mode=1
+  enable_ip_forward
+  ensure_public_endpoint_route "$REMOTE_PUBLIC_IP" "$LOCAL_PUBLIC_IP"
+  firewall_allow_tcp_port_and_ip "ViraTCP tunnel $id" "$VIRATCP_PORT" "$REMOTE_PUBLIC_IP" "$VIRATCP_IFACE" "$listen_mode"
+  firewall_allow_ip_peer "ViraTCP tunnel $id remote inner" "$REMOTE_VIRATCP_IP" "$VIRATCP_IFACE"
+}
+
+viratcp_install_service() {
+  local id="${1:-${TUNNEL_ID:-}}"
+  validate_tunnel_id "$id" || return 1
+  command -v systemctl >/dev/null 2>&1 || return 1
+  viratcp_compile_engine || return 1
+  install_manager_binary || { echo "Failed to install manager binary" >&2; return 1; }
+  viratcp_write_service_template
+  install_health_monitor
+  systemctl enable "$(viratcp_service_name "$id")" >/dev/null || return 1
+  if systemctl restart "$(viratcp_service_name "$id")"; then
+    echo "ViraTCP service enabled and started ($(viratcp_service_name "$id"))"
+    return 0
+  fi
+  systemctl status "$(viratcp_service_name "$id")" --no-pager -l 2>/dev/null || true
+  journalctl -u "$(viratcp_service_name "$id")" -n 40 --no-pager 2>/dev/null || true
+  return 1
+}
+
+viratcp_create_tunnel() {
+  validate_tunnel_id "${TUNNEL_ID:-}" || { echo "Invalid tunnel number." >&2; return 1; }
+  VIRATCP_IFACE="$(viratcp_iface_name "$TUNNEL_ID")"
+  LOCAL_PUBLIC_IP="${LOCAL_PUBLIC_IP:-$(detect_local_public_ip)}"
+  local_ipv4_is_assigned "$LOCAL_PUBLIC_IP" || { echo "Selected ViraTCP local IP is not assigned: $LOCAL_PUBLIC_IP" >&2; return 1; }
+  if [ "$ROLE" = "1" ]; then
+    SERVER_ROLE="IRAN"; VIRATCP_MODE="client"; LOCAL_VIRATCP_IP="10.81.$TUNNEL_ID.1"; REMOTE_VIRATCP_IP="10.81.$TUNNEL_ID.2"
+  else
+    SERVER_ROLE="KHAREJ"; VIRATCP_MODE="server"; LOCAL_VIRATCP_IP="10.81.$TUNNEL_ID.2"; REMOTE_VIRATCP_IP="10.81.$TUNNEL_ID.1"
+  fi
+  VIRATCP_PORT="${VIRATCP_PORT:-$VIRATCP_DEFAULT_PORT}"
+  VIRATCP_MTU="${VIRATCP_MTU:-$VIRATCP_DEFAULT_MTU}"
+  VIRATCP_KEEPALIVE="${VIRATCP_KEEPALIVE:-$VIRATCP_DEFAULT_KEEPALIVE}"
+  VIRATCP_RECONNECT="${VIRATCP_RECONNECT:-$VIRATCP_DEFAULT_RECONNECT}"
+  VIRATCP_TCP_USER_TIMEOUT="${VIRATCP_TCP_USER_TIMEOUT:-$VIRATCP_DEFAULT_TCP_USER_TIMEOUT}"
+  viratcp_validate_psk "$VIRATCP_PSK" || { echo "Invalid ViraTCP PSK; it must be exactly 64 hexadecimal characters." >&2; return 1; }
+
+  echo "[*] Local server public IP: $LOCAL_PUBLIC_IP"
+  echo "[*] Tunnel type: ViraTCP encrypted TCP-TUN"
+  echo "[*] Tunnel number: $TUNNEL_ID"
+  echo "[*] Interface: $VIRATCP_IFACE"
+  echo "[*] Server role: $SERVER_ROLE ($VIRATCP_MODE)"
+  echo "[*] Remote server public IP: $REMOTE_PUBLIC_IP"
+  echo "[*] Local ViraTCP IP: $LOCAL_VIRATCP_IP"
+  echo "[*] Remote ViraTCP IP: $REMOTE_VIRATCP_IP"
+  echo "[*] TCP port: $VIRATCP_PORT"
+  echo "[*] MTU: $VIRATCP_MTU"
+  echo "[*] Encryption: AES-256-GCM with pre-shared key"
+
+  modprobe tun || true
+  enable_ip_forward
+  viratcp_compile_engine || return 1
+  viratcp_save_config
+  viratcp_apply_firewall_rules "$TUNNEL_ID" || true
+  viratcp_install_service "$TUNNEL_ID"
+}
+
+viratcp_menu_config_tunnel() {
+  show_header "Configure ViraTCP Encrypted TCP-TUN"
+  echo "Iran role opens an outbound TCP connection; Kharej role listens on the selected TCP port."
+  echo "Use the exact same port and 64-character PSK on both servers."
+  echo
+  prompt_role || return
+  local selected_role existing_local_ip="" existing_remote_ip="" existing_port="" existing_mtu="" existing_psk="" input
+  selected_role="$ROLE"
+  echo
+  prompt_tunnel_id "Enter ViraTCP tunnel number before IP [1-254]: " || return
+  if viratcp_load_config "$TUNNEL_ID"; then
+    existing_local_ip="${LOCAL_PUBLIC_IP:-}"; existing_remote_ip="${REMOTE_PUBLIC_IP:-}"; existing_port="${VIRATCP_PORT:-}"
+    existing_mtu="${VIRATCP_MTU:-}"; existing_psk="${VIRATCP_PSK:-}"
+  fi
+  ROLE="$selected_role"
+  echo
+  echo "ViraTCP tunnel $TUNNEL_ID plan:"
+  echo "  Interface       : $(viratcp_iface_name "$TUNNEL_ID")"
+  echo "  Config file     : $(viratcp_config_file "$TUNNEL_ID")"
+  echo "  Service         : $(viratcp_service_name "$TUNNEL_ID")"
+  echo "  Iran role       : client / 10.81.$TUNNEL_ID.1"
+  echo "  Kharej role     : server / 10.81.$TUNNEL_ID.2"
+  echo
+  prompt_local_tunnel_ip "${existing_local_ip:-$(detect_local_public_ip || true)}" "Enter LOCAL server Public IPv4 for ViraTCP" || return
+  echo
+  prompt_remote_public_ip "$existing_remote_ip" || return
+  echo
+  read -rp "Enter ViraTCP TCP port [${existing_port:-$VIRATCP_DEFAULT_PORT}] (00=menu): " input
+  if is_main_menu_token "$input"; then return_main_msg; return 99; fi
+  VIRATCP_PORT="${input:-${existing_port:-$VIRATCP_DEFAULT_PORT}}"
+  validate_port "$VIRATCP_PORT" || { echo "Invalid TCP port."; return; }
+  if [ "$ROLE" = "2" ] && [ "$VIRATCP_PORT" != "${existing_port:-}" ] && command -v ss >/dev/null 2>&1 && ss -H -ltn "sport = :$VIRATCP_PORT" 2>/dev/null | grep -q .; then
+    warn_msg "TCP port $VIRATCP_PORT is already listening on this Kharej server. Choose another unused port, or stop the current service first."
+    return 1
+  fi
+  read -rp "Enter ViraTCP MTU [${existing_mtu:-$VIRATCP_DEFAULT_MTU}] (00=menu): " input
+  if is_main_menu_token "$input"; then return_main_msg; return 99; fi
+  VIRATCP_MTU="${input:-${existing_mtu:-$VIRATCP_DEFAULT_MTU}}"
+  [[ "$VIRATCP_MTU" =~ ^[0-9]+$ ]] && [ "$VIRATCP_MTU" -ge 576 ] && [ "$VIRATCP_MTU" -le 1500 ] || { echo "Invalid MTU."; return 1; }
+  echo
+  if [ -n "$existing_psk" ]; then
+    read -rp "ViraTCP PSK [press Enter to keep existing, or paste a new 64-hex key] (00=menu): " input
+    if is_main_menu_token "$input"; then return_main_msg; return 99; fi
+    VIRATCP_PSK="${input:-$existing_psk}"
+  else
+    read -rp "Paste the SAME 64-hex PSK used on the other server, or press Enter to generate one (00=menu): " input
+    if is_main_menu_token "$input"; then return_main_msg; return 99; fi
+    VIRATCP_PSK="${input:-$(viratcp_generate_psk)}"
+  fi
+  viratcp_validate_psk "$VIRATCP_PSK" || { echo "Invalid PSK. Use exactly 64 hexadecimal characters."; return 1; }
+  echo
+  echo -e "${C_YELLOW}${C_BOLD}ViraTCP PSK (copy this exact value to the other server):${C_RESET}"
+  echo "$VIRATCP_PSK"
+  echo
+  viratcp_create_tunnel || echo "ViraTCP tunnel creation failed"
+}
+
+viratcp_collect_ids() {
+  {
+    if [ -d "$VIRATCP_CONFIG_DIR" ]; then
+      local f id
+      for f in "$VIRATCP_CONFIG_DIR"/tunnel-*.conf; do
+        [ -e "$f" ] || continue; id="${f##*/tunnel-}"; id="${id%.conf}"; validate_tunnel_id "$id" && echo "$id"
+      done
+    fi
+    ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1 | grep -E "^${VIRATCP_IFACE_PREFIX}[0-9]+$" | sed "s/^${VIRATCP_IFACE_PREFIX}//" | awk '$1 >= 1 && $1 <= 254' || true
+  } | sort -n -u
+}
+
+viratcp_list_tunnels() {
+  echo "ViraTCP encrypted TCP-TUN tunnels:"
+  local ids id ifc state mode port
+  ids="$(viratcp_collect_ids || true)"; [ -n "$ids" ] || { echo "  none"; return 0; }
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue; ifc="$(viratcp_iface_name "$id")"; state="inactive"; mode="unknown"; port="unknown"
+    tunnel_iface_is_up "$ifc" && state="active"
+    if viratcp_load_config "$id"; then mode="${VIRATCP_MODE:-unknown}"; port="${VIRATCP_PORT:-unknown}"; fi
+    echo "  - tunnel $id | iface $ifc | $state | mode: $mode | TCP: $port | config: $(viratcp_config_file "$id") | service: $(systemctl is-enabled "$(viratcp_service_name "$id")" 2>/dev/null || true)"
+  done <<< "$ids"
+}
+
+viratcp_remove_one_tunnel() {
+  local id="$1" ifc file port mode
+  ifc="$(viratcp_iface_name "$id")"; file="$(viratcp_config_file "$id")"; port=""; mode=""
+  if viratcp_load_config "$id"; then port="${VIRATCP_PORT:-}"; mode="${VIRATCP_MODE:-}"; fi
+  echo "Removing ViraTCP tunnel $id ($ifc)..."
+  systemctl disable --now "$(viratcp_service_name "$id")" 2>/dev/null || true
+  ip link delete "$ifc" 2>/dev/null || true
+  if [ "$mode" = "server" ] && [ -n "$port" ] && command -v iptables >/dev/null 2>&1; then
+    while iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null; do iptables -D INPUT -p tcp --dport "$port" -j ACCEPT || break; done
+  fi
+  rm -f "$file"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  echo "[OK] ViraTCP tunnel $id removed."
+}
+
+viratcp_restart_one_tunnel() {
+  local id="$1"
+  viratcp_load_config "$id" || return 1
+  viratcp_compile_engine || return 1
+  viratcp_write_service_template
+  viratcp_apply_firewall_rules "$id" >/dev/null 2>&1 || true
+  systemctl enable "$(viratcp_service_name "$id")" >/dev/null 2>&1 || true
+  systemctl restart "$(viratcp_service_name "$id")"
+}
+
 # -----------------------------
 # Shared helpers/menus
 # -----------------------------
@@ -3247,6 +4037,21 @@ build_tunnel_inventory() {
     if tunnel_iface_is_up "$ifc"; then state="active"; else state="inactive"; fi
     INV_TYPE+=("vira7"); INV_ID+=("$id"); INV_IFACE+=("$ifc"); INV_LOCAL+=("$local_ip"); INV_TARGET+=("$target"); INV_LOCAL_PUBLIC+=("$local_pub"); INV_REMOTE_PUBLIC+=("$remote_pub"); INV_STATE+=("$state"); INV_DESC+=("$desc")
   done <<< "$ids"
+
+  ids="$(viratcp_collect_ids || true)"
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    ifc="$(viratcp_iface_name "$id")"
+    local_ip=""; target=""; local_pub=""; remote_pub=""; desc="ViraTCP encrypted TCP-TUN"
+    if viratcp_load_config "$id"; then
+      local_ip="${LOCAL_VIRATCP_IP:-${local_priv:-}}"
+      target="${REMOTE_VIRATCP_IP:-${remote_priv:-}}"
+      local_pub="${LOCAL_PUBLIC_IP:-${bind_ip:-}}"
+      remote_pub="${REMOTE_PUBLIC_IP:-${remote_ip:-}}"
+    fi
+    if tunnel_iface_is_up "$ifc"; then state="active"; else state="inactive"; fi
+    INV_TYPE+=("viratcp"); INV_ID+=("$id"); INV_IFACE+=("$ifc"); INV_LOCAL+=("$local_ip"); INV_TARGET+=("$target"); INV_LOCAL_PUBLIC+=("$local_pub"); INV_REMOTE_PUBLIC+=("$remote_pub"); INV_STATE+=("$state"); INV_DESC+=("$desc")
+  done <<< "$ids"
 }
 
 
@@ -3283,6 +4088,7 @@ remove_inventory_item() {
     gre) gre_remove_one_tunnel "$id" ;;
     wireguard) wg_remove_one_tunnel "$id" ;;
     vira7) vira7_remove_one_tunnel "$id" ;;
+    viratcp) viratcp_remove_one_tunnel "$id" ;;
   esac
 }
 
@@ -3295,6 +4101,7 @@ ping_inventory_item() {
     gre) test_gre_tunnel_ping "$id" ;;
     wireguard) test_wg_tunnel_ping "$id" ;;
     vira7) test_vira7_tunnel_ping "$id" ;;
+    viratcp) test_viratcp_tunnel_ping "$id" ;;
   esac
 }
 
@@ -3421,6 +4228,20 @@ heal_remaining_tunnels_after_remove() {
     fi
   done <<< "$ids"
 
+  ids="$(viratcp_collect_ids || true)"
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    if viratcp_load_config "$id"; then
+      ifc="$(viratcp_iface_name "$id")"
+      viratcp_apply_firewall_rules "$id" >/dev/null 2>&1 || true
+      svc="$(viratcp_service_name "$id")"
+      if command -v systemctl >/dev/null 2>&1 && systemctl is-enabled --quiet "$svc" 2>/dev/null && ! tunnel_iface_is_up "$ifc"; then
+        warn_msg "Remaining ViraTCP tunnel $id is enabled but inactive; restarting only this tunnel."
+        systemctl restart "$svc" 2>/dev/null || true
+      fi
+    fi
+  done <<< "$ids"
+
   ids="$(wg_collect_ids || true)"
   while IFS= read -r id; do
     [ -n "$id" ] || continue
@@ -3445,6 +4266,7 @@ menu_config_tunnel() {
     gre) gre_menu_config_tunnel ;;
     wireguard) wg_menu_config_tunnel ;;
     vira7) vira7_menu_config_tunnel ;;
+    viratcp) viratcp_menu_config_tunnel ;;
   esac
 }
 
@@ -3473,7 +4295,7 @@ remove_tun() {
 
   if [ "$selected" = "88" ]; then
     echo
-    echo -e "${C_RED}${C_BOLD}WARNING:${C_RESET} this will remove ALL GRE, WireGuard, and Vira7 tunnels."
+    echo -e "${C_RED}${C_BOLD}WARNING:${C_RESET} this will remove ALL GRE, WireGuard, Vira7, and ViraTCP tunnels."
     if ! confirm_yes "Are you sure?"; then
       echo "Cancelled."
       return
@@ -3485,6 +4307,8 @@ remove_tun() {
     while IFS= read -r id; do [ -n "$id" ] && wg_remove_one_tunnel "$id"; done <<< "$ids"
     ids="$(vira7_collect_ids || true)"
     while IFS= read -r id; do [ -n "$id" ] && vira7_remove_one_tunnel "$id"; done <<< "$ids"
+    ids="$(viratcp_collect_ids || true)"
+    while IFS= read -r id; do [ -n "$id" ] && viratcp_remove_one_tunnel "$id"; done <<< "$ids"
     ids="$(gre_collect_ids || true)"
     while IFS= read -r id; do [ -n "$id" ] && gre_remove_one_tunnel "$id"; done <<< "$ids"
     ok_msg "All tunnels removed."
@@ -3541,7 +4365,7 @@ remove_tun() {
 
   # Remove in dependency-safe order. WireGuard may depend on GRE/Vira transport,
   # so overlay tunnels are removed first, GRE transport last.
-  for phase in wireguard vira7 gre; do
+  for phase in wireguard vira7 viratcp gre; do
     for idx in "${SELECTED_INDEXES[@]}"; do
       i=$((idx - 1))
       if [ "${INV_TYPE[$i]}" = "$phase" ]; then
@@ -3567,6 +4391,8 @@ list_saved_tunnels() {
   wg_list_tunnels
   echo
   vira7_list_tunnels
+  echo
+  viratcp_list_tunnels
 }
 
 ping4_target() {
@@ -3649,6 +4475,21 @@ test_vira7_tunnel_ping() {
   ping4_target "Vira7 tunnel $id ($(vira7_iface_name "$id")) remote inner IP" "${REMOTE_VIRA7_IP:-${remote_priv:-}}" "$(vira7_iface_name "$id")"
 }
 
+test_viratcp_tunnel_ping() {
+  local id="$1" ifc svc
+  if ! viratcp_load_config "$id"; then
+    echo "[SKIP] ViraTCP tunnel $id: no saved config"
+    return 1
+  fi
+  ifc="$(viratcp_iface_name "$id")"; svc="$(viratcp_service_name "$id")"
+  if ! tunnel_iface_is_up "$ifc"; then
+    echo "[REPAIR] $ifc is inactive; restarting ViraTCP service..."
+    systemctl restart "$svc" >/dev/null 2>&1 || true
+    sleep 2
+  fi
+  ping4_target "ViraTCP tunnel $id ($ifc) remote inner IP" "${REMOTE_VIRATCP_IP:-${remote_priv:-}}" "$ifc"
+}
+
 test_one_tunnel_ping_menu() {
   show_header "Test One Tunnel"
   ask_tunnel_type || return
@@ -3658,6 +4499,7 @@ test_one_tunnel_ping_menu() {
     gre) test_gre_tunnel_ping "$TUNNEL_ID" ;;
     wireguard) test_wg_tunnel_ping "$TUNNEL_ID" ;;
     vira7) test_vira7_tunnel_ping "$TUNNEL_ID" ;;
+    viratcp) test_viratcp_tunnel_ping "$TUNNEL_ID" ;;
   esac
 }
 
@@ -3689,6 +4531,15 @@ test_all_tunnels_ping() {
     [ -n "$id" ] || continue
     total=$((total + 1))
     if test_vira7_tunnel_ping "$id"; then ok=$((ok + 1)); else fail=$((fail + 1)); fi
+  done <<< "$ids"
+
+  echo
+  echo "Testing all saved ViraTCP tunnels..."
+  ids="$(viratcp_collect_ids || true)"
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    total=$((total + 1))
+    if test_viratcp_tunnel_ping "$id"; then ok=$((ok + 1)); else fail=$((fail + 1)); fi
   done <<< "$ids"
 
   echo
@@ -3730,7 +4581,7 @@ test_tunnels_menu() {
 
 reset_all_tunnels() {
   show_header "Reset All Tunnels"
-  echo "This will restart/recreate all saved GRE, WireGuard, and Vira7 tunnels from their saved configs."
+  echo "This will restart/recreate all saved GRE, WireGuard, Vira7, and ViraTCP tunnels from their saved configs."
   echo "It will also re-enable their systemd services for boot."
   echo
   if ! confirm_yes "Continue with reset all tunnels?"; then
@@ -3739,7 +4590,7 @@ reset_all_tunnels() {
   fi
 
   echo
-  echo "Stopping WireGuard and Vira7 first..."
+  echo "Stopping WireGuard, Vira7, and ViraTCP first..."
   local ids id
 
   ids="$(wg_collect_ids || true)"
@@ -3755,6 +4606,13 @@ reset_all_tunnels() {
     [ -n "$id" ] || continue
     systemctl stop "$(vira7_service_name "$id")" 2>/dev/null || true
     ip link delete "$(vira7_iface_name "$id")" 2>/dev/null || true
+  done <<< "$ids"
+
+  ids="$(viratcp_collect_ids || true)"
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    systemctl stop "$(viratcp_service_name "$id")" 2>/dev/null || true
+    ip link delete "$(viratcp_iface_name "$id")" 2>/dev/null || true
   done <<< "$ids"
 
   echo "Stopping GRE tunnels..."
@@ -3789,6 +4647,18 @@ reset_all_tunnels() {
       echo "[OK] Vira7 tunnel $id reset"
     else
       echo "[WARN] Vira7 tunnel $id reset failed"
+    fi
+  done <<< "$ids"
+
+  echo
+  echo "Starting ViraTCP tunnels..."
+  ids="$(viratcp_collect_ids || true)"
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    if viratcp_restart_one_tunnel "$id"; then
+      echo "[OK] ViraTCP tunnel $id reset"
+    else
+      echo "[WARN] ViraTCP tunnel $id reset failed"
     fi
   done <<< "$ids"
 
@@ -4292,7 +5162,7 @@ haproxy_menu() {
 }
 
 show_menu() {
-  show_header "GRE + WireGuard + Vira7 Tunnel Management v${APP_VERSION}"
+  show_header "GRE + WireGuard + Vira7 + ViraTCP Management v${APP_VERSION}"
   echo -e "${C_BOLD}${C_WHITE}Main Menu${C_RESET}"
   echo -e "  ${C_GREEN}1)${C_RESET} create/update tunnel"
   echo -e "  ${C_RED}2)${C_RESET} remove tunnel"
@@ -4354,6 +5224,11 @@ if [[ "${1:-}" == "--service" ]]; then
     start-vira7)
       ensure_root
       vira7_restart_one_tunnel "${3:-}"
+      exit $?
+      ;;
+    start-viratcp)
+      ensure_root
+      viratcp_restart_one_tunnel "${3:-}"
       exit $?
       ;;
     *)
