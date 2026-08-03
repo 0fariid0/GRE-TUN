@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + WireGuard + Vira7 + HAProxy multi-tunnel manager v8.6-self-heal
+# GRE + WireGuard + Vira7 + HAProxy multi-tunnel manager v8.6.1-self-heal-pipe-fix
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
@@ -9,6 +9,7 @@ set -euo pipefail
 # - v8.5-safe-remove-heal prevents removing active transports used by WireGuard and re-heals remaining tunnels after deletion
 # - v8.6-self-heal keeps GRE under a persistent supervisor, disables rp_filter for encapsulated paths,
 #   pins public peer routes to the physical uplink, and repairs GRE/Vira7/WireGuard in dependency order
+# - v8.6.1 fixes execution through bash <(curl ...) without consuming the script pipe
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -21,6 +22,7 @@ HEALTH_SERVICE_UNIT="/etc/systemd/system/gretun-health.service"
 HEALTH_TIMER_UNIT="/etc/systemd/system/gretun-health.timer"
 HEALTH_STATE_DIR="/run/gretun-health"
 HEALTH_FAIL_LIMIT=3
+SELF_RAW_URL="https://raw.githubusercontent.com/0fariid0/GRE-TUN/refs/heads/main/GRETUN.sh"
 
 WG_META_DIR="/etc/wgtun-tunnels"
 WG_KEY_DIR="$WG_META_DIR/keys"
@@ -254,6 +256,42 @@ write_var() {
   local name="$1"
   local value="${2:-}"
   printf '%s=%q\n' "$name" "$value"
+}
+
+# Install a persistent copy safely. When this script is launched with
+#   bash <(curl ...)
+# $0 points to a live pipe (/dev/fd/N). Copying that pipe consumes the unread
+# tail of the running script and makes the menu disappear. In that case fetch
+# a complete regular-file copy instead; for normal file execution copy locally.
+install_manager_binary() {
+  local source_path="${BASH_SOURCE[0]:-$0}"
+  local target_dir tmp
+  target_dir="$(dirname "$INSTALL_BIN")"
+  tmp="${INSTALL_BIN}.tmp.$$"
+
+  mkdir -p "$target_dir" || return 1
+  rm -f "$tmp"
+
+  case "$source_path" in
+    /dev/fd/*|/proc/*/fd/*)
+      if command -v curl >/dev/null 2>&1; then
+        curl -fLsS --ipv4 "$SELF_RAW_URL" -o "$tmp" || { rm -f "$tmp"; return 1; }
+      elif command -v wget >/dev/null 2>&1; then
+        wget -qO "$tmp" "$SELF_RAW_URL" || { rm -f "$tmp"; return 1; }
+      else
+        return 1
+      fi
+      ;;
+    *)
+      [ -r "$source_path" ] || return 1
+      cp -f "$source_path" "$tmp" || { rm -f "$tmp"; return 1; }
+      ;;
+  esac
+
+  [ -s "$tmp" ] || { rm -f "$tmp"; return 1; }
+  bash -n "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; return 1; }
+  chmod 755 "$tmp" || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$INSTALL_BIN"
 }
 
 # -----------------------------
@@ -514,8 +552,9 @@ restart_wg_dependents_for_transport() {
 install_health_monitor() {
   command -v systemctl >/dev/null 2>&1 || return 0
   mkdir -p "$(dirname "$INSTALL_BIN")" "$HEALTH_STATE_DIR" 2>/dev/null || true
-  cp -f "$0" "$INSTALL_BIN" 2>/dev/null || true
-  chmod 755 "$INSTALL_BIN" 2>/dev/null || true
+  if [ ! -s "$INSTALL_BIN" ]; then
+    install_manager_binary >/dev/null 2>&1 || return 1
+  fi
 
   cat > "$HEALTH_SERVICE_UNIT" <<EOF_HEALTH_SERVICE
 [Unit]
@@ -706,8 +745,7 @@ bootstrap_runtime_repairs() {
   command -v systemctl >/dev/null 2>&1 || return 0
   local migrate=0 ids id svc ifc
   mkdir -p "$(dirname "$INSTALL_BIN")" 2>/dev/null || true
-  cp -f "$0" "$INSTALL_BIN" 2>/dev/null || true
-  chmod 755 "$INSTALL_BIN" 2>/dev/null || true
+  install_manager_binary >/dev/null 2>&1 || true
   if [ ! -f "$GRE_SERVICE_TEMPLATE" ] || ! grep -q 'supervise-gre' "$GRE_SERVICE_TEMPLATE" 2>/dev/null; then
     migrate=1
   fi
@@ -1187,8 +1225,10 @@ gre_install_service() {
   fi
 
   mkdir -p "$(dirname "$INSTALL_BIN")"
-  cp -f "$0" "$INSTALL_BIN" 2>/dev/null || true
-  chmod 755 "$INSTALL_BIN"
+  if ! install_manager_binary; then
+    echo "Failed to install the persistent manager copy at $INSTALL_BIN" >&2
+    return 1
+  fi
 
   gre_write_service_template
   install_health_monitor
@@ -2048,8 +2088,10 @@ wg_install_service() {
 
   # Install this manager path so systemd can re-apply firewall rules on every boot/restart.
   mkdir -p "$(dirname "$INSTALL_BIN")"
-  cp -f "$0" "$INSTALL_BIN" 2>/dev/null || true
-  chmod 755 "$INSTALL_BIN" 2>/dev/null || true
+  if ! install_manager_binary; then
+    echo "Failed to install the persistent manager copy at $INSTALL_BIN" >&2
+    return 1
+  fi
   install_health_monitor
   mkdir -p "/etc/systemd/system/wg-quick@$ifc.service.d"
   local transport_after=""
@@ -2858,8 +2900,10 @@ vira7_install_service() {
   command -v systemctl >/dev/null 2>&1 || return 1
   [ -x "$VIRA7_BINARY" ] || vira7_compile_engine || return 1
   mkdir -p "$(dirname "$INSTALL_BIN")"
-  cp -f "$0" "$INSTALL_BIN" 2>/dev/null || true
-  chmod 755 "$INSTALL_BIN" 2>/dev/null || true
+  if ! install_manager_binary; then
+    echo "Failed to install the persistent manager copy at $INSTALL_BIN" >&2
+    return 1
+  fi
   install_health_monitor
   vira7_write_service_template
   systemctl enable "$(vira7_service_name "$id")" || return 1
