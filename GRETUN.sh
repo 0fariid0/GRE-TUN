@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + WireGuard + Vira7 + HAProxy multi-tunnel manager v8.6.1-self-heal-pipe-fix
+# GRE + WireGuard + Vira7 + HAProxy multi-tunnel manager v8.6.2-self-heal-gre-fix
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
@@ -10,6 +10,7 @@ set -euo pipefail
 # - v8.6-self-heal keeps GRE under a persistent supervisor, disables rp_filter for encapsulated paths,
 #   pins public peer routes to the physical uplink, and repairs GRE/Vira7/WireGuard in dependency order
 # - v8.6.1 fixes execution through bash <(curl ...) without consuming the script pipe
+# - v8.6.2 fixes GRE creation on kernels that reject fixed TTL together with nopmtudisc
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -1005,7 +1006,7 @@ gre_create_tunnel() {
   ip link set "$TUN_IFACE" down 2>/dev/null || true
   ip tunnel del "$TUN_IFACE" 2>/dev/null || true
 
-  if ! ip tunnel add "$TUN_IFACE" mode gre local "$LOCAL_PUBLIC_IP" remote "$REMOTE_PUBLIC_IP" key "$TUN_KEY" ttl 255 nopmtudisc; then
+  if ! ip tunnel add "$TUN_IFACE" mode gre local "$LOCAL_PUBLIC_IP" remote "$REMOTE_PUBLIC_IP" key "$TUN_KEY" nopmtudisc; then
     echo "Failed to create $TUN_IFACE (local=$LOCAL_PUBLIC_IP remote=$REMOTE_PUBLIC_IP key=$TUN_KEY)." >&2
     echo "Another GRE interface may already use the same local/remote/key tuple." >&2
     echo "Current GRE interfaces:" >&2
