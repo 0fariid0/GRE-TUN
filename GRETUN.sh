@@ -14,8 +14,10 @@ set -euo pipefail
 # - v8.6.3 displays the installed script version in the main menu header
 # - v8.7.0 adds encrypted self-healing TCP-TUN (type 4) for paths that throttle/block GRE or UDP
 # - v8.8.0 upgrades HAProxy forwarding with multi-port input, tunnel target picker, and automatic managed UDP companions for TCP rows
+# - v8.8.1 fixes UDP companion forwarding by installing the proven DNAT/SNAT/FORWARD rules directly in built-in iptables chains
+#   and migrates/cleans the v8.8.0 custom-chain implementation without touching unrelated firewall rules
 
-APP_VERSION="8.8.0"
+APP_VERSION="8.8.1"
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -4946,31 +4948,19 @@ haproxy_prompt_target_ip() {
 # -----------------------------
 # Managed UDP companion forwarding for TCP HAProxy rows
 # -----------------------------
-# HAProxy forwards TCP/HTTP. For TCP rows (e.g. Shadowsocks), UDP on the same
-# public port is forwarded at L3 with iptables. Dedicated chains mean we never
-# flush or rewrite unrelated firewall/NAT rules.
-HAP_UDP_PRE_CHAIN="GRETUN_HAP_UDP_PRE"
-HAP_UDP_POST_CHAIN="GRETUN_HAP_UDP_POST"
-HAP_UDP_FWD_CHAIN="GRETUN_HAP_UDP_FWD"
-
-haproxy_udp_ensure_chains() {
-  command -v iptables >/dev/null 2>&1 || return 1
-
-  iptables -w 5 -t nat -N "$HAP_UDP_PRE_CHAIN" 2>/dev/null || true
-  iptables -w 5 -t nat -N "$HAP_UDP_POST_CHAIN" 2>/dev/null || true
-  iptables -w 5 -N "$HAP_UDP_FWD_CHAIN" 2>/dev/null || true
-
-  iptables -w 5 -t nat -C PREROUTING -p udp -j "$HAP_UDP_PRE_CHAIN" 2>/dev/null || \
-    iptables -w 5 -t nat -I PREROUTING 1 -p udp -j "$HAP_UDP_PRE_CHAIN"
-  iptables -w 5 -t nat -C POSTROUTING -p udp -j "$HAP_UDP_POST_CHAIN" 2>/dev/null || \
-    iptables -w 5 -t nat -I POSTROUTING 1 -p udp -j "$HAP_UDP_POST_CHAIN"
-  iptables -w 5 -C FORWARD -p udp -j "$HAP_UDP_FWD_CHAIN" 2>/dev/null || \
-    iptables -w 5 -I FORWARD 1 -p udp -j "$HAP_UDP_FWD_CHAIN"
-}
+# HAProxy itself forwards TCP/HTTP only. For TCP rows (e.g. Shadowsocks), UDP
+# on the same public port is forwarded at L3 with the exact direct DNAT/SNAT/
+# FORWARD rules that are known to work with GRE. v8.8.0 used intermediate
+# custom chains; some hosts/firewall stacks did not reliably traverse those
+# jumps. v8.8.1 writes only our own commented rules directly into the built-in
+# chains and removes only rules carrying the gretun-hap-udp-* marker.
+HAP_UDP_PRE_CHAIN="GRETUN_HAP_UDP_PRE"       # legacy v8.8.0 migration only
+HAP_UDP_POST_CHAIN="GRETUN_HAP_UDP_POST"     # legacy v8.8.0 migration only
+HAP_UDP_FWD_CHAIN="GRETUN_HAP_UDP_FWD"       # legacy v8.8.0 migration only
 
 # Resolve the tunnel/uplink interface and local source IP for a target.
-# Prefer the script inventory (works even when an interface has just been recreated),
-# then fall back to the kernel route lookup for manually entered IPs.
+# Prefer the saved tunnel inventory, then fall back to the kernel route lookup
+# so manually-entered target IPs continue to work exactly like before.
 haproxy_udp_resolve_path() {
   local target="$1" i inv_target route
   HAP_UDP_IFACE=""
@@ -4995,36 +4985,116 @@ haproxy_udp_resolve_path() {
   [ -n "$HAP_UDP_IFACE" ] && validate_ipv4 "$HAP_UDP_LOCAL_IP"
 }
 
+# Remove one exact rule repeatedly. This also adopts/removes an equivalent
+# un-commented rule that may have been added manually while troubleshooting.
+haproxy_udp_delete_exact_rule() {
+  local table="$1" chain="$2"
+  shift 2
+  if [ "$table" = "filter" ]; then
+    while iptables -w 5 -C "$chain" "$@" 2>/dev/null; do
+      iptables -w 5 -D "$chain" "$@" 2>/dev/null || break
+    done
+  else
+    while iptables -w 5 -t "$table" -C "$chain" "$@" 2>/dev/null; do
+      iptables -w 5 -t "$table" -D "$chain" "$@" 2>/dev/null || break
+    done
+  fi
+}
+
+# Remove only rules tagged by this script from a built-in chain. Deletion is
+# done by line number in descending order so unrelated rules keep their order.
+haproxy_udp_delete_commented_rules() {
+  local table="$1" chain="$2" marker="$3" n
+  local -a nums=()
+  if [ "$table" = "filter" ]; then
+    mapfile -t nums < <(iptables -w 5 -L "$chain" --line-numbers -n 2>/dev/null | awk -v m="$marker" 'index($0,m){print $1}' | sort -rn)
+    for n in "${nums[@]}"; do
+      [[ "$n" =~ ^[0-9]+$ ]] && iptables -w 5 -D "$chain" "$n" 2>/dev/null || true
+    done
+  else
+    mapfile -t nums < <(iptables -w 5 -t "$table" -L "$chain" --line-numbers -n 2>/dev/null | awk -v m="$marker" 'index($0,m){print $1}' | sort -rn)
+    for n in "${nums[@]}"; do
+      [[ "$n" =~ ^[0-9]+$ ]] && iptables -w 5 -t "$table" -D "$chain" "$n" 2>/dev/null || true
+    done
+  fi
+}
+
+# Clean the v8.8.0 custom-chain implementation. These chain names are private
+# to GRE-TUN, so deleting their jumps/chains does not touch user firewall rules.
+haproxy_udp_cleanup_legacy_chains() {
+  command -v iptables >/dev/null 2>&1 || return 0
+
+  while iptables -w 5 -t nat -C PREROUTING -p udp -j "$HAP_UDP_PRE_CHAIN" 2>/dev/null; do
+    iptables -w 5 -t nat -D PREROUTING -p udp -j "$HAP_UDP_PRE_CHAIN" 2>/dev/null || break
+  done
+  while iptables -w 5 -t nat -C POSTROUTING -p udp -j "$HAP_UDP_POST_CHAIN" 2>/dev/null; do
+    iptables -w 5 -t nat -D POSTROUTING -p udp -j "$HAP_UDP_POST_CHAIN" 2>/dev/null || break
+  done
+  while iptables -w 5 -C FORWARD -p udp -j "$HAP_UDP_FWD_CHAIN" 2>/dev/null; do
+    iptables -w 5 -D FORWARD -p udp -j "$HAP_UDP_FWD_CHAIN" 2>/dev/null || break
+  done
+
+  iptables -w 5 -t nat -F "$HAP_UDP_PRE_CHAIN" 2>/dev/null || true
+  iptables -w 5 -t nat -X "$HAP_UDP_PRE_CHAIN" 2>/dev/null || true
+  iptables -w 5 -t nat -F "$HAP_UDP_POST_CHAIN" 2>/dev/null || true
+  iptables -w 5 -t nat -X "$HAP_UDP_POST_CHAIN" 2>/dev/null || true
+  iptables -w 5 -F "$HAP_UDP_FWD_CHAIN" 2>/dev/null || true
+  iptables -w 5 -X "$HAP_UDP_FWD_CHAIN" 2>/dev/null || true
+}
+
+# Flush only GRE-TUN managed direct companion rules. No other DNAT/SNAT/FORWARD
+# entries are touched.
 haproxy_udp_flush_managed_rules() {
   command -v iptables >/dev/null 2>&1 || return 0
-  haproxy_udp_ensure_chains >/dev/null 2>&1 || return 0
-  iptables -w 5 -t nat -F "$HAP_UDP_PRE_CHAIN" 2>/dev/null || true
-  iptables -w 5 -t nat -F "$HAP_UDP_POST_CHAIN" 2>/dev/null || true
-  iptables -w 5 -F "$HAP_UDP_FWD_CHAIN" 2>/dev/null || true
+  haproxy_udp_cleanup_legacy_chains
+  haproxy_udp_delete_commented_rules nat PREROUTING  'gretun-hap-udp-pre-'
+  haproxy_udp_delete_commented_rules nat POSTROUTING 'gretun-hap-udp-post-'
+  haproxy_udp_delete_commented_rules filter FORWARD  'gretun-hap-udp-'
+}
+
+# Remove an exact companion set first. Besides preventing duplicates, this
+# migrates the same four un-commented rules that were previously added by hand.
+haproxy_udp_remove_equivalent_rules() {
+  local port="$1" target="$2" tport="$3" ifc="$4" local_ip="$5"
+
+  haproxy_udp_delete_exact_rule nat PREROUTING \
+    -p udp --dport "$port" \
+    -j DNAT --to-destination "$target:$tport"
+
+  haproxy_udp_delete_exact_rule nat POSTROUTING \
+    -o "$ifc" -p udp -d "$target" --dport "$tport" \
+    -j SNAT --to-source "$local_ip"
+
+  haproxy_udp_delete_exact_rule filter FORWARD \
+    -o "$ifc" -p udp -d "$target" --dport "$tport" \
+    -j ACCEPT
+
+  haproxy_udp_delete_exact_rule filter FORWARD \
+    -i "$ifc" -p udp -s "$target" --sport "$tport" \
+    -m conntrack --ctstate ESTABLISHED,RELATED \
+    -j ACCEPT
 }
 
 haproxy_udp_add_rule() {
   local port="$1" target="$2" tport="$3" ifc="$4" local_ip="$5"
 
-  # Incoming UDP on the public HAProxy port -> remote tunnel/server target.
-  iptables -w 5 -t nat -A "$HAP_UDP_PRE_CHAIN" \
+  # Use direct built-in-chain rules, matching the proven manual fix.
+  iptables -w 5 -t nat -I PREROUTING 1 \
     -p udp --dport "$port" \
     -m comment --comment "gretun-hap-udp-pre-$port" \
     -j DNAT --to-destination "$target:$tport"
 
-  # Force replies through the same tunnel/path by sourcing them from the local
-  # tunnel-side address. Conntrack reverses the DNAT/SNAT for the client.
-  iptables -w 5 -t nat -A "$HAP_UDP_POST_CHAIN" \
+  iptables -w 5 -t nat -I POSTROUTING 1 \
     -o "$ifc" -p udp -d "$target" --dport "$tport" \
     -m comment --comment "gretun-hap-udp-post-$port" \
     -j SNAT --to-source "$local_ip"
 
-  iptables -w 5 -A "$HAP_UDP_FWD_CHAIN" \
+  iptables -w 5 -I FORWARD 1 \
     -o "$ifc" -p udp -d "$target" --dport "$tport" \
     -m comment --comment "gretun-hap-udp-out-$port" \
     -j ACCEPT
 
-  iptables -w 5 -A "$HAP_UDP_FWD_CHAIN" \
+  iptables -w 5 -I FORWARD 1 \
     -i "$ifc" -p udp -s "$target" --sport "$tport" \
     -m conntrack --ctstate ESTABLISHED,RELATED \
     -m comment --comment "gretun-hap-udp-back-$port" \
@@ -5044,6 +5114,17 @@ haproxy_sync_udp_rules() {
   entries="$(haproxy_export_entries || true)"
   [ -n "$entries" ] || { info_msg "Managed HAProxy UDP rules: none"; return 0; }
 
+  # First remove an exact un-commented manual companion, if one exists for the
+  # current row/target. This lets v8.8.1 take ownership without duplicates.
+  while read -r port target tport proto; do
+    [ -n "${port:-}" ] || continue
+    if haproxy_udp_resolve_path "$target"; then
+      haproxy_udp_remove_equivalent_rules "$port" "$target" "$tport" "$HAP_UDP_IFACE" "$HAP_UDP_LOCAL_IP"
+    fi
+  done <<< "$entries"
+
+  # Then create companions only for TCP rows. HTTP rows therefore have no UDP
+  # rule; toggling TCP -> HTTP removes UDP automatically on this same sync.
   while read -r port target tport proto; do
     [ -n "${port:-}" ] || continue
     proto="$(haproxy_normalize_proto "${proto:-http}")"
@@ -5060,7 +5141,7 @@ haproxy_sync_udp_rules() {
   done <<< "$entries"
 
   if [ "$count" -gt 0 ]; then
-    ok_msg "Managed UDP forwarding synced for $count TCP HAProxy port(s)."
+    ok_msg "Managed UDP forwarding synced for $count TCP HAProxy port(s) using direct iptables rules."
   else
     info_msg "Managed HAProxy UDP rules: none (no TCP forwards)."
   fi
