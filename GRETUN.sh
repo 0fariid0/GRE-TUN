@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + WireGuard + Vira7 + ViraTCP + HAProxy multi-tunnel manager v8.7.0
+# GRE + WireGuard + Vira7 + ViraTCP + HAProxy multi-tunnel manager v8.8.2
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
@@ -16,8 +16,10 @@ set -euo pipefail
 # - v8.8.0 upgrades HAProxy forwarding with multi-port input, tunnel target picker, and automatic managed UDP companions for TCP rows
 # - v8.8.1 fixes UDP companion forwarding by installing the proven DNAT/SNAT/FORWARD rules directly in built-in iptables chains
 #   and migrates/cleans the v8.8.0 custom-chain implementation without touching unrelated firewall rules
+# - v8.8.2 adds an interactive UDP repair action that detects every HAProxy TCP row, resolves its tunnel path,
+#   rebuilds its UDP companion rules, and verifies DNAT/SNAT/FORWARD installation per port
 
-APP_VERSION="8.8.1"
+APP_VERSION="8.8.2"
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -4690,7 +4692,7 @@ reset_all_tunnels() {
 # -----------------------------
 # HAProxy port forward manager
 # -----------------------------
-# v8.8 additions:
+# v8.8.x HAProxy additions:
 # - add/update multiple ports in one step (comma or whitespace separated)
 # - choose a target from the unified tunnel inventory or enter a custom IPv4
 # - explicit HTTP vs TCP selection
@@ -5477,6 +5479,104 @@ haproxy_optimize_websocket_nolog() {
   ok_msg "HAProxy silent WebSocket optimization applied. Existing TCP rows keep automatic UDP companions; HTTP rows stay UDP-off."
 }
 
+# Rebuild UDP companions for every existing HAProxy TCP row without touching
+# HTTP rows or changing the HAProxy configuration itself. This is an operator-
+# initiated recovery action for cases where firewall/NAT state was lost or a
+# previous automatic sync did not take effect.
+haproxy_repair_udp() {
+  local entries tcp_entries port target tport proto
+  local resolved=0 unresolved=0 verified=0 failed=0
+
+  command -v iptables >/dev/null 2>&1 || {
+    err_msg "iptables is not available; UDP repair cannot continue."
+    return 1
+  }
+
+  entries="$(haproxy_export_entries || true)"
+  if [ -z "$entries" ]; then
+    warn_msg "No HAProxy forwarded ports were found."
+    return 0
+  fi
+
+  tcp_entries="$(awk '{p=$4; if(p=="") p="http"; if(tolower(p)=="tcp") print $0}' <<< "$entries")"
+  if [ -z "$tcp_entries" ]; then
+    warn_msg "No TCP HAProxy ports were found. HTTP rows intentionally have UDP disabled."
+    return 0
+  fi
+
+  echo -e "${C_BOLD}${C_WHITE}TCP ports detected for UDP repair:${C_RESET}"
+  printf "${C_DIM}%8s  %-15s %-12s %-10s %-15s %-10s${C_RESET}\n" \
+    "Port" "Target-IP" "Target-Port" "Interface" "Local-Tun-IP" "Status"
+  printf "${C_DIM}%s${C_RESET}\n" "-------------------------------------------------------------------------------"
+
+  while read -r port target tport proto; do
+    [ -n "${port:-}" ] || continue
+    if haproxy_udp_resolve_path "$target"; then
+      printf "%8s  %-15s %-12s %-10s %-15s ${C_GREEN}%-10s${C_RESET}\n" \
+        "$port" "$target" "$tport" "$HAP_UDP_IFACE" "$HAP_UDP_LOCAL_IP" "ready"
+      resolved=$((resolved + 1))
+    else
+      printf "%8s  %-15s %-12s %-10s %-15s ${C_RED}%-10s${C_RESET}\n" \
+        "$port" "$target" "$tport" "?" "?" "unresolved"
+      unresolved=$((unresolved + 1))
+    fi
+  done <<< "$tcp_entries"
+
+  echo
+  if [ "$resolved" -eq 0 ]; then
+    err_msg "None of the TCP targets could be mapped to a tunnel/route; no UDP rules were changed."
+    return 1
+  fi
+
+  info_msg "Repairing UDP companions: removing managed stale rules and rebuilding all TCP UDP forwards..."
+  haproxy_install_udp_service
+  haproxy_sync_udp_rules
+
+  echo
+  echo -e "${C_BOLD}${C_WHITE}UDP repair verification:${C_RESET}"
+  while read -r port target tport proto; do
+    [ -n "${port:-}" ] || continue
+    if ! haproxy_udp_resolve_path "$target"; then
+      warn_msg "UDP $port -> $target:$tport : skipped (route unresolved)"
+      failed=$((failed + 1))
+      continue
+    fi
+
+    if iptables -w 5 -t nat -C PREROUTING \
+         -p udp --dport "$port" \
+         -m comment --comment "gretun-hap-udp-pre-$port" \
+         -j DNAT --to-destination "$target:$tport" 2>/dev/null \
+       && iptables -w 5 -t nat -C POSTROUTING \
+         -o "$HAP_UDP_IFACE" -p udp -d "$target" --dport "$tport" \
+         -m comment --comment "gretun-hap-udp-post-$port" \
+         -j SNAT --to-source "$HAP_UDP_LOCAL_IP" 2>/dev/null \
+       && iptables -w 5 -C FORWARD \
+         -o "$HAP_UDP_IFACE" -p udp -d "$target" --dport "$tport" \
+         -m comment --comment "gretun-hap-udp-out-$port" \
+         -j ACCEPT 2>/dev/null \
+       && iptables -w 5 -C FORWARD \
+         -i "$HAP_UDP_IFACE" -p udp -s "$target" --sport "$tport" \
+         -m conntrack --ctstate ESTABLISHED,RELATED \
+         -m comment --comment "gretun-hap-udp-back-$port" \
+         -j ACCEPT 2>/dev/null; then
+      ok_msg "UDP $port -> $target:$tport via $HAP_UDP_IFACE ($HAP_UDP_LOCAL_IP) repaired"
+      verified=$((verified + 1))
+    else
+      err_msg "UDP $port -> $target:$tport verification failed"
+      failed=$((failed + 1))
+    fi
+  done <<< "$tcp_entries"
+
+  echo
+  if [ "$failed" -eq 0 ] && [ "$unresolved" -eq 0 ]; then
+    ok_msg "UDP repair complete: $verified TCP port(s) rebuilt and verified successfully."
+    return 0
+  fi
+
+  warn_msg "UDP repair finished with $verified verified, $failed failed, and $unresolved initially unresolved port(s)."
+  return 1
+}
+
 haproxy_run_action() {
   local rc
   set +e
@@ -5502,9 +5602,10 @@ haproxy_menu() {
     echo -e "  ${C_CYAN}5)${C_RESET} change target IP for one port"
     echo -e "  ${C_MAGENTA}6)${C_RESET} change protocol http/tcp ${C_DIM}(UDP auto-sync)${C_RESET}"
     echo -e "  ${C_CYAN}7)${C_RESET} optimize WebSocket / silent HAProxy no access-log"
+    echo -e "  ${C_GREEN}8)${C_RESET} repair UDP for all TCP ports ${C_DIM}(detect + rebuild + verify)${C_RESET}"
     echo -e "  ${C_DIM}00) Back to main menu${C_RESET}"
     echo
-    read -rp "Choose HAProxy option [1-7/00]: " HAP_CHOICE
+    read -rp "Choose HAProxy option [1-8/00]: " HAP_CHOICE
     case "$HAP_CHOICE" in
       1) haproxy_run_action haproxy_list_forwards || return 0 ;;
       2) haproxy_run_action haproxy_add_port || return 0 ;;
@@ -5513,6 +5614,7 @@ haproxy_menu() {
       5) haproxy_run_action haproxy_change_one_ip || return 0 ;;
       6) haproxy_run_action haproxy_change_protocol || return 0 ;;
       7) haproxy_run_action haproxy_optimize_websocket_nolog || return 0 ;;
+      8) haproxy_run_action haproxy_repair_udp || return 0 ;;
       00) return_main_msg; return 0 ;;
       *) err_msg "Invalid option"; sleep 1 ;;
     esac
