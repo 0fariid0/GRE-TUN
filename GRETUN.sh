@@ -13,8 +13,9 @@ set -euo pipefail
 # - v8.6.2 fixes GRE creation on kernels that reject fixed TTL together with nopmtudisc
 # - v8.6.3 displays the installed script version in the main menu header
 # - v8.7.0 adds encrypted self-healing TCP-TUN (type 4) for paths that throttle/block GRE or UDP
+# - v8.8.0 upgrades HAProxy forwarding with multi-port input, tunnel target picker, and automatic managed UDP companions for TCP rows
 
-APP_VERSION="8.7.0"
+APP_VERSION="8.8.0"
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -69,6 +70,8 @@ HAPROXY_CONFIG="/etc/haproxy/haproxy.cfg"
 HAPROXY_BACKUP_DIR="/etc/haproxy/gretun-backups"
 HAPROXY_MAXCONN=500000
 HAPROXY_NOFILE_LIMIT=1048576
+HAPROXY_UDP_SERVICE_NAME="gretun-haproxy-udp.service"
+HAPROXY_UDP_SERVICE_UNIT="/etc/systemd/system/${HAPROXY_UDP_SERVICE_NAME}"
 
 # Color/theme helpers
 if [ -t 1 ]; then
@@ -4685,6 +4688,14 @@ reset_all_tunnels() {
 # -----------------------------
 # HAProxy port forward manager
 # -----------------------------
+# v8.8 additions:
+# - add/update multiple ports in one step (comma or whitespace separated)
+# - choose a target from the unified tunnel inventory or enter a custom IPv4
+# - explicit HTTP vs TCP selection
+# - TCP forwards automatically receive matching UDP DNAT/SNAT/FORWARD rules
+# - UDP rules live in dedicated iptables chains and are rebuilt from HAProxy state
+# - changing TCP <-> HTTP, deleting a port, or changing its target automatically
+#   adds/removes/updates the managed UDP forwarding rules
 haproxy_base_header() {
   # Silent WebSocket-safe profile:
   # - no access logging by default, so HAProxy does not spam journald/syslog for every WS request
@@ -4793,18 +4804,6 @@ haproxy_ensure_maxconn_in_config() {
   fi
 }
 
-haproxy_ensure_ready() {
-  haproxy_install_package || return 1
-  haproxy_apply_high_limits
-  mkdir -p /etc/haproxy "$HAPROXY_BACKUP_DIR"
-  if [ ! -f "$HAPROXY_CONFIG" ]; then
-    haproxy_base_header > "$HAPROXY_CONFIG"
-  else
-    haproxy_ensure_maxconn_in_config
-  fi
-  systemctl restart haproxy >/dev/null 2>&1 || true
-}
-
 haproxy_normalize_proto() {
   local proto="${1:-http}"
   proto="$(printf '%s' "$proto" | tr '[:upper:]' '[:lower:]')"
@@ -4846,21 +4845,266 @@ haproxy_export_entries() {
   ' "$HAPROXY_CONFIG" | sort -n -k1,1 -u
 }
 
+# Convert "2086 443 2052" or "2086,443,2052" (or a mixture) into HAP_PORTS[].
+# Duplicate ports are removed while preserving the first occurrence.
+haproxy_parse_port_list() {
+  local raw="${1:-}" token
+  local -A seen=()
+  HAP_PORTS=()
+  raw="${raw//,/ }"
+  for token in $raw; do
+    validate_port "$token" || { err_msg "Invalid port: $token"; return 1; }
+    if [ -z "${seen[$token]+x}" ]; then
+      HAP_PORTS+=("$token")
+      seen[$token]=1
+    fi
+  done
+  [ "${#HAP_PORTS[@]}" -gt 0 ] || { err_msg "No valid port was entered."; return 1; }
+}
+
+haproxy_prompt_protocol() {
+  local input
+  echo -e "${C_BOLD}${C_WHITE}Forward protocol:${C_RESET}"
+  echo -e "  ${C_YELLOW}1)${C_RESET} TCP  ${C_DIM}(HAProxy TCP + automatic UDP forward; recommended for Shadowsocks/raw TCP)${C_RESET}"
+  echo -e "  ${C_CYAN}2)${C_RESET} HTTP ${C_DIM}(HAProxy HTTP/WebSocket only; managed UDP rules are removed)${C_RESET}"
+  echo
+  read -rp "Choose protocol [1=tcp, 2=http] (00=menu): " input
+  if is_main_menu_token "$input"; then return_main_msg; return 99; fi
+  case "$(printf '%s' "$input" | tr '[:upper:]' '[:lower:]')" in
+    1|tcp|t) HAP_SELECTED_PROTO="tcp" ;;
+    2|http|h) HAP_SELECTED_PROTO="http" ;;
+    *) err_msg "Invalid protocol selection."; return 1 ;;
+  esac
+}
+
+haproxy_target_inventory() {
+  build_tunnel_inventory
+  local count="${#INV_TYPE[@]}"
+  [ "$count" -gt 0 ] || return 1
+
+  echo -e "${C_BOLD}${C_WHITE}Available tunnel targets:${C_RESET}"
+  printf "${C_DIM}%4s  %-11s %-10s %-15s %-15s %-15s %-15s %-8s${C_RESET}\n" \
+    "No" "Type" "Interface" "Local-Tun" "Remote-Tun" "Local-Pub" "Remote-Pub" "State"
+  printf "${C_DIM}%s${C_RESET}\n" "------------------------------------------------------------------------------------------------------------------"
+
+  local i idx type ifc local_tun remote_tun local_pub remote_pub state color
+  for i in "${!INV_TYPE[@]}"; do
+    idx=$((i + 1))
+    type="${INV_TYPE[$i]}"
+    ifc="${INV_IFACE[$i]:-N/A}"
+    local_tun="${INV_LOCAL[$i]:-N/A}"; local_tun="${local_tun%%/*}"
+    remote_tun="${INV_TARGET[$i]:-N/A}"; remote_tun="${remote_tun%%/*}"
+    local_pub="${INV_LOCAL_PUBLIC[$i]:-N/A}"
+    remote_pub="${INV_REMOTE_PUBLIC[$i]:-N/A}"
+    state="${INV_STATE[$i]:-unknown}"
+    if [ "$state" = "active" ]; then color="$C_GREEN"; else color="$C_YELLOW"; fi
+    printf "%4s  %-11s %-10s %-15s %-15s %-15s %-15s ${color}%-8s${C_RESET}\n" \
+      "$idx" "$type" "$ifc" "$local_tun" "$remote_tun" "$local_pub" "$remote_pub" "$state"
+  done
+  echo
+}
+
+# Sets HAP_TARGET_IP. The operator may choose a numbered tunnel row or type any IPv4.
+haproxy_prompt_target_ip() {
+  local prompt_label="${1:-Select target tunnel number or enter target IPv4}"
+  local input idx count target
+
+  build_tunnel_inventory
+  count="${#INV_TYPE[@]}"
+  if [ "$count" -gt 0 ]; then
+    haproxy_target_inventory || true
+    echo "Choose a row number to use its Remote-Tun address, or type a custom IPv4 exactly as before."
+  else
+    warn_msg "No managed tunnel was found. You can still enter a target IPv4 manually."
+  fi
+
+  read -rp "$prompt_label (00=menu): " input
+  if is_main_menu_token "$input"; then return_main_msg; return 99; fi
+
+  if validate_ipv4 "$input"; then
+    HAP_TARGET_IP="$input"
+    return 0
+  fi
+
+  if [[ "$input" =~ ^[0-9]+$ ]] && [ "$input" -ge 1 ] && [ "$input" -le "$count" ]; then
+    idx=$((input - 1))
+    target="${INV_TARGET[$idx]:-}"
+    target="${target%%/*}"
+    if ! validate_ipv4 "$target"; then
+      err_msg "Selected tunnel does not have a valid remote tunnel IPv4."
+      return 1
+    fi
+    HAP_TARGET_IP="$target"
+    info_msg "Selected ${INV_TYPE[$idx]} ${INV_IFACE[$idx]} -> $HAP_TARGET_IP"
+    return 0
+  fi
+
+  err_msg "Invalid selection/IP: $input"
+  return 1
+}
+
+# -----------------------------
+# Managed UDP companion forwarding for TCP HAProxy rows
+# -----------------------------
+# HAProxy forwards TCP/HTTP. For TCP rows (e.g. Shadowsocks), UDP on the same
+# public port is forwarded at L3 with iptables. Dedicated chains mean we never
+# flush or rewrite unrelated firewall/NAT rules.
+HAP_UDP_PRE_CHAIN="GRETUN_HAP_UDP_PRE"
+HAP_UDP_POST_CHAIN="GRETUN_HAP_UDP_POST"
+HAP_UDP_FWD_CHAIN="GRETUN_HAP_UDP_FWD"
+
+haproxy_udp_ensure_chains() {
+  command -v iptables >/dev/null 2>&1 || return 1
+
+  iptables -w 5 -t nat -N "$HAP_UDP_PRE_CHAIN" 2>/dev/null || true
+  iptables -w 5 -t nat -N "$HAP_UDP_POST_CHAIN" 2>/dev/null || true
+  iptables -w 5 -N "$HAP_UDP_FWD_CHAIN" 2>/dev/null || true
+
+  iptables -w 5 -t nat -C PREROUTING -p udp -j "$HAP_UDP_PRE_CHAIN" 2>/dev/null || \
+    iptables -w 5 -t nat -I PREROUTING 1 -p udp -j "$HAP_UDP_PRE_CHAIN"
+  iptables -w 5 -t nat -C POSTROUTING -p udp -j "$HAP_UDP_POST_CHAIN" 2>/dev/null || \
+    iptables -w 5 -t nat -I POSTROUTING 1 -p udp -j "$HAP_UDP_POST_CHAIN"
+  iptables -w 5 -C FORWARD -p udp -j "$HAP_UDP_FWD_CHAIN" 2>/dev/null || \
+    iptables -w 5 -I FORWARD 1 -p udp -j "$HAP_UDP_FWD_CHAIN"
+}
+
+# Resolve the tunnel/uplink interface and local source IP for a target.
+# Prefer the script inventory (works even when an interface has just been recreated),
+# then fall back to the kernel route lookup for manually entered IPs.
+haproxy_udp_resolve_path() {
+  local target="$1" i inv_target route
+  HAP_UDP_IFACE=""
+  HAP_UDP_LOCAL_IP=""
+
+  build_tunnel_inventory
+  for i in "${!INV_TYPE[@]}"; do
+    inv_target="${INV_TARGET[$i]:-}"; inv_target="${inv_target%%/*}"
+    if [ "$inv_target" = "$target" ]; then
+      HAP_UDP_IFACE="${INV_IFACE[$i]:-}"
+      HAP_UDP_LOCAL_IP="${INV_LOCAL[$i]:-}"; HAP_UDP_LOCAL_IP="${HAP_UDP_LOCAL_IP%%/*}"
+      if [ -n "$HAP_UDP_IFACE" ] && validate_ipv4 "$HAP_UDP_LOCAL_IP"; then
+        return 0
+      fi
+    fi
+  done
+
+  route="$(ip -4 route get "$target" 2>/dev/null | head -n 1 || true)"
+  HAP_UDP_IFACE="$(awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}' <<< "$route")"
+  HAP_UDP_LOCAL_IP="$(awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}' <<< "$route")"
+
+  [ -n "$HAP_UDP_IFACE" ] && validate_ipv4 "$HAP_UDP_LOCAL_IP"
+}
+
+haproxy_udp_flush_managed_rules() {
+  command -v iptables >/dev/null 2>&1 || return 0
+  haproxy_udp_ensure_chains >/dev/null 2>&1 || return 0
+  iptables -w 5 -t nat -F "$HAP_UDP_PRE_CHAIN" 2>/dev/null || true
+  iptables -w 5 -t nat -F "$HAP_UDP_POST_CHAIN" 2>/dev/null || true
+  iptables -w 5 -F "$HAP_UDP_FWD_CHAIN" 2>/dev/null || true
+}
+
+haproxy_udp_add_rule() {
+  local port="$1" target="$2" tport="$3" ifc="$4" local_ip="$5"
+
+  # Incoming UDP on the public HAProxy port -> remote tunnel/server target.
+  iptables -w 5 -t nat -A "$HAP_UDP_PRE_CHAIN" \
+    -p udp --dport "$port" \
+    -m comment --comment "gretun-hap-udp-pre-$port" \
+    -j DNAT --to-destination "$target:$tport"
+
+  # Force replies through the same tunnel/path by sourcing them from the local
+  # tunnel-side address. Conntrack reverses the DNAT/SNAT for the client.
+  iptables -w 5 -t nat -A "$HAP_UDP_POST_CHAIN" \
+    -o "$ifc" -p udp -d "$target" --dport "$tport" \
+    -m comment --comment "gretun-hap-udp-post-$port" \
+    -j SNAT --to-source "$local_ip"
+
+  iptables -w 5 -A "$HAP_UDP_FWD_CHAIN" \
+    -o "$ifc" -p udp -d "$target" --dport "$tport" \
+    -m comment --comment "gretun-hap-udp-out-$port" \
+    -j ACCEPT
+
+  iptables -w 5 -A "$HAP_UDP_FWD_CHAIN" \
+    -i "$ifc" -p udp -s "$target" --sport "$tport" \
+    -m conntrack --ctstate ESTABLISHED,RELATED \
+    -m comment --comment "gretun-hap-udp-back-$port" \
+    -j ACCEPT
+}
+
+haproxy_sync_udp_rules() {
+  command -v iptables >/dev/null 2>&1 || {
+    warn_msg "iptables is not available; HAProxy TCP/HTTP works, but automatic UDP forwarding cannot be configured."
+    return 0
+  }
+
+  enable_ip_forward
+  haproxy_udp_flush_managed_rules
+
+  local entries port target tport proto count=0 skipped=0
+  entries="$(haproxy_export_entries || true)"
+  [ -n "$entries" ] || { info_msg "Managed HAProxy UDP rules: none"; return 0; }
+
+  while read -r port target tport proto; do
+    [ -n "${port:-}" ] || continue
+    proto="$(haproxy_normalize_proto "${proto:-http}")"
+    [ "$proto" = "tcp" ] || continue
+
+    if ! haproxy_udp_resolve_path "$target"; then
+      warn_msg "UDP companion skipped for port $port: cannot resolve route/local source for target $target."
+      skipped=$((skipped + 1))
+      continue
+    fi
+
+    haproxy_udp_add_rule "$port" "$target" "$tport" "$HAP_UDP_IFACE" "$HAP_UDP_LOCAL_IP"
+    count=$((count + 1))
+  done <<< "$entries"
+
+  if [ "$count" -gt 0 ]; then
+    ok_msg "Managed UDP forwarding synced for $count TCP HAProxy port(s)."
+  else
+    info_msg "Managed HAProxy UDP rules: none (no TCP forwards)."
+  fi
+  [ "$skipped" -eq 0 ] || warn_msg "$skipped UDP forward(s) were skipped because their route could not be resolved."
+}
+
+haproxy_install_udp_service() {
+  command -v systemctl >/dev/null 2>&1 || return 0
+  install_manager_binary >/dev/null 2>&1 || true
+  [ -s "$INSTALL_BIN" ] || return 0
+
+  cat > "$HAPROXY_UDP_SERVICE_UNIT" <<EOF_UDP_SERVICE
+[Unit]
+Description=GRE-TUN managed UDP companions for HAProxy TCP forwards
+After=network-online.target haproxy.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash $INSTALL_BIN --service haproxy-udp-sync
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF_UDP_SERVICE
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable "$HAPROXY_UDP_SERVICE_NAME" >/dev/null 2>&1 || true
+}
+
 haproxy_list_forwards() {
   echo -e "${C_BOLD}${C_WHITE}HAProxy forwarded ports:${C_RESET}"
-  local entries proto color
+  local entries proto color udp
   entries="$(haproxy_export_entries || true)"
   if [ -z "$entries" ]; then
     warn_msg "No forwarded ports found in $HAPROXY_CONFIG"
     return 0
   fi
-  printf "${C_DIM}%8s  %-15s %-12s %-8s${C_RESET}\n" "Port" "Target-IP" "Target-Port" "Protocol"
-  printf "${C_DIM}%s${C_RESET}\n" "-----------------------------------------------------"
+  printf "${C_DIM}%8s  %-15s %-12s %-8s %-6s${C_RESET}\n" "Port" "Target-IP" "Target-Port" "Protocol" "UDP"
+  printf "${C_DIM}%s${C_RESET}\n" "-------------------------------------------------------------"
   while read -r port ip tport proto; do
     [ -n "${port:-}" ] || continue
     proto="$(haproxy_normalize_proto "${proto:-http}")"
-    if [ "$proto" = "tcp" ]; then color="$C_YELLOW"; else color="$C_CYAN"; fi
-    printf "%8s  ${C_MAGENTA}%-15s${C_RESET} %-12s ${color}%-8s${C_RESET}\n" "$port" "$ip" "$tport" "$proto"
+    if [ "$proto" = "tcp" ]; then color="$C_YELLOW"; udp="AUTO"; else color="$C_CYAN"; udp="OFF"; fi
+    printf "%8s  ${C_MAGENTA}%-15s${C_RESET} %-12s ${color}%-8s${C_RESET} %-6s\n" "$port" "$ip" "$tport" "$proto" "$udp"
   done <<< "$entries"
 }
 
@@ -4949,7 +5193,13 @@ EOF_BLOCK
       haproxy_open_firewall_tcp "$port"
     done < <(sort -n -k1,1 -u "$entries_file")
   fi
-  haproxy_validate_and_restart "$tmp"
+
+  if haproxy_validate_and_restart "$tmp"; then
+    haproxy_install_udp_service
+    haproxy_sync_udp_rules
+    return 0
+  fi
+  return 1
 }
 
 haproxy_entries_tmp() {
@@ -4959,38 +5209,58 @@ haproxy_entries_tmp() {
   echo "$tmp"
 }
 
+haproxy_ensure_ready() {
+  haproxy_install_package || return 1
+  haproxy_apply_high_limits
+  mkdir -p /etc/haproxy "$HAPROXY_BACKUP_DIR"
+  if [ ! -f "$HAPROXY_CONFIG" ]; then
+    haproxy_base_header > "$HAPROXY_CONFIG"
+  else
+    haproxy_ensure_maxconn_in_config
+  fi
+  systemctl restart haproxy >/dev/null 2>&1 || true
+  haproxy_install_udp_service
+  haproxy_sync_udp_rules >/dev/null 2>&1 || true
+}
+
 haproxy_add_port() {
-  local port ip tmp existing_proto
+  local raw_ports tmp port
   echo "00) Back to main menu"
-  read -rp "Enter local port to forward (00=menu): " port
-  if is_main_menu_token "$port"; then return_main_msg; return 99; fi
-  validate_port "$port" || { err_msg "Invalid port."; return 1; }
-  read -rp "Enter target IP for port $port (00=menu): " ip
-  if is_main_menu_token "$ip"; then return_main_msg; return 99; fi
-  validate_ipv4 "$ip" || { err_msg "Invalid IPv4."; return 1; }
+  echo "Examples: 2044   |   2086 443 2052   |   2086,443,2052"
+  read -rp "Enter local port(s) to add/update (comma or space separated): " raw_ports
+  if is_main_menu_token "$raw_ports"; then return_main_msg; return 99; fi
+  haproxy_parse_port_list "$raw_ports" || return 1
+
+  echo
+  haproxy_prompt_target_ip "Select target tunnel number or enter target IPv4" || return $?
+  echo
+  haproxy_prompt_protocol || return $?
 
   tmp="$(haproxy_entries_tmp)"
-  existing_proto="$(awk -v p="$port" '$1==p{print $4; exit}' "$tmp")"
-  existing_proto="$(haproxy_normalize_proto "${existing_proto:-http}")"
-  if awk -v p="$port" '$1==p{found=1} END{exit found?0:1}' "$tmp"; then
-    warn_msg "Port $port already exists; replacing its target IP and keeping protocol: $existing_proto"
-  fi
-  awk -v p="$port" '$1!=p' "$tmp" > "$tmp.new" || true
-  printf '%s %s %s %s\n' "$port" "$ip" "$port" "$existing_proto" >> "$tmp.new"
-  mv -f "$tmp.new" "$tmp"
+  for port in "${HAP_PORTS[@]}"; do
+    if awk -v p="$port" '$1==p{found=1} END{exit found?0:1}' "$tmp"; then
+      warn_msg "Port $port already exists; replacing target/protocol."
+    fi
+    awk -v p="$port" '$1!=p' "$tmp" > "$tmp.new" || true
+    printf '%s %s %s %s\n' "$port" "$HAP_TARGET_IP" "$port" "$HAP_SELECTED_PROTO" >> "$tmp.new"
+    mv -f "$tmp.new" "$tmp"
+  done
+
   haproxy_write_entries_file "$tmp"
   rm -f "$tmp"
+  ok_msg "Applied ${#HAP_PORTS[@]} port(s) -> $HAP_TARGET_IP using $HAP_SELECTED_PROTO."
+  if [ "$HAP_SELECTED_PROTO" = "tcp" ]; then
+    info_msg "UDP companion forwarding was also synchronized automatically for these TCP port(s)."
+  fi
 }
 
 haproxy_change_all_ips() {
-  local ip tmp
+  local tmp
   tmp="$(haproxy_entries_tmp)"
   if [ ! -s "$tmp" ]; then warn_msg "No forwarded ports to update."; rm -f "$tmp"; return 0; fi
   echo "00) Back to main menu"
-  read -rp "Enter new target IP for ALL ports (00=menu): " ip
-  if is_main_menu_token "$ip"; then rm -f "$tmp"; return_main_msg; return 99; fi
-  validate_ipv4 "$ip" || { err_msg "Invalid IPv4."; rm -f "$tmp"; return 1; }
-  awk -v ip="$ip" '{proto=$4; if(proto=="") proto="http"; print $1, ip, $3, proto}' "$tmp" > "$tmp.new"
+  haproxy_prompt_target_ip "Select new target for ALL ports (number or IPv4)" || { local rc=$?; rm -f "$tmp"; return "$rc"; }
+  awk -v ip="$HAP_TARGET_IP" '{proto=$4; if(proto=="") proto="http"; print $1, ip, $3, proto}' "$tmp" > "$tmp.new"
   mv -f "$tmp.new" "$tmp"
   haproxy_write_entries_file "$tmp"
   rm -f "$tmp"
@@ -5013,10 +5283,11 @@ haproxy_delete_port() {
   mv -f "$tmp.new" "$tmp"
   haproxy_write_entries_file "$tmp"
   rm -f "$tmp"
+  ok_msg "Port $port removed. Any managed UDP companion rule for it was removed too."
 }
 
 haproxy_change_one_ip() {
-  local port ip tmp
+  local port tmp rc
   tmp="$(haproxy_entries_tmp)"
   if [ ! -s "$tmp" ]; then warn_msg "No forwarded ports to update."; rm -f "$tmp"; return 0; fi
   haproxy_list_forwards
@@ -5030,10 +5301,12 @@ haproxy_change_one_ip() {
     rm -f "$tmp"
     return 0
   fi
-  read -rp "Enter new target IP for port $port (00=menu): " ip
-  if is_main_menu_token "$ip"; then rm -f "$tmp"; return_main_msg; return 99; fi
-  validate_ipv4 "$ip" || { err_msg "Invalid IPv4."; rm -f "$tmp"; return 1; }
-  awk -v p="$port" -v ip="$ip" '{proto=$4; if(proto=="") proto="http"; if ($1==p) print $1, ip, $3, proto; else print $1, $2, $3, proto}' "$tmp" > "$tmp.new"
+
+  haproxy_prompt_target_ip "Select new target for port $port (number or IPv4)"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then rm -f "$tmp"; return "$rc"; fi
+
+  awk -v p="$port" -v ip="$HAP_TARGET_IP" '{proto=$4; if(proto=="") proto="http"; if ($1==p) print $1, ip, $3, proto; else print $1, $2, $3, proto}' "$tmp" > "$tmp.new"
   mv -f "$tmp.new" "$tmp"
   haproxy_write_entries_file "$tmp"
   rm -f "$tmp"
@@ -5041,15 +5314,15 @@ haproxy_change_one_ip() {
 
 haproxy_show_protocol_rows() {
   local entries="$1"
-  local n=0 proto color
-  printf "${C_DIM}%4s  %8s  %-15s %-12s %-8s${C_RESET}\n" "No" "Port" "Target-IP" "Target-Port" "Protocol"
-  printf "${C_DIM}%s${C_RESET}\n" "------------------------------------------------------------"
+  local n=0 proto color udp
+  printf "${C_DIM}%4s  %8s  %-15s %-12s %-8s %-6s${C_RESET}\n" "No" "Port" "Target-IP" "Target-Port" "Protocol" "UDP"
+  printf "${C_DIM}%s${C_RESET}\n" "-------------------------------------------------------------------"
   while read -r port ip tport proto; do
     [ -n "${port:-}" ] || continue
     n=$((n + 1))
     proto="$(haproxy_normalize_proto "${proto:-http}")"
-    if [ "$proto" = "tcp" ]; then color="$C_YELLOW"; else color="$C_CYAN"; fi
-    printf "%4s  %8s  ${C_MAGENTA}%-15s${C_RESET} %-12s ${color}%-8s${C_RESET}\n" "$n" "$port" "$ip" "$tport" "$proto"
+    if [ "$proto" = "tcp" ]; then color="$C_YELLOW"; udp="AUTO"; else color="$C_CYAN"; udp="OFF"; fi
+    printf "%4s  %8s  ${C_MAGENTA}%-15s${C_RESET} %-12s ${color}%-8s${C_RESET} %-6s\n" "$n" "$port" "$ip" "$tport" "$proto" "$udp"
   done <<< "$entries"
 }
 
@@ -5078,7 +5351,7 @@ haproxy_change_protocol() {
     mv -f "$tmp.new" "$tmp"
     haproxy_write_entries_file "$tmp"
     rm -f "$tmp"
-    ok_msg "Protocol toggled for all HAProxy ports."
+    ok_msg "Protocol toggled for all HAProxy ports; UDP companions were synchronized automatically."
     return 0
   fi
 
@@ -5099,9 +5372,13 @@ haproxy_change_protocol() {
   mv -f "$tmp.new" "$tmp"
   haproxy_write_entries_file "$tmp"
   rm -f "$tmp"
-  ok_msg "Port $port protocol changed: $old_proto -> $new_proto"
-}
 
+  if [ "$new_proto" = "tcp" ]; then
+    ok_msg "Port $port protocol changed: $old_proto -> $new_proto (UDP companion added)."
+  else
+    ok_msg "Port $port protocol changed: $old_proto -> $new_proto (managed UDP companion removed)."
+  fi
+}
 
 haproxy_optimize_websocket_nolog() {
   local tmp count
@@ -5116,7 +5393,7 @@ haproxy_optimize_websocket_nolog() {
   echo "This keeps the current protocol/IP/port unchanged; it disables HAProxy access logs and applies longer tunnel timeout + TCP keepalive."
   haproxy_write_entries_file "$tmp"
   rm -f "$tmp"
-  ok_msg "HAProxy silent WebSocket optimization applied. HTTP/WebSocket mode is preserved."
+  ok_msg "HAProxy silent WebSocket optimization applied. Existing TCP rows keep automatic UDP companions; HTTP rows stay UDP-off."
 }
 
 haproxy_run_action() {
@@ -5138,11 +5415,11 @@ haproxy_menu() {
     show_header "HAProxy Port Forward Manager"
     echo -e "${C_BOLD}${C_WHITE}HAProxy Menu${C_RESET}"
     echo -e "  ${C_GREEN}1)${C_RESET} list forwarded ports"
-    echo -e "  ${C_GREEN}2)${C_RESET} add/update port"
+    echo -e "  ${C_GREEN}2)${C_RESET} add/update port(s) ${C_DIM}(comma/space supported)${C_RESET}"
     echo -e "  ${C_YELLOW}3)${C_RESET} change ALL target IPs"
     echo -e "  ${C_RED}4)${C_RESET} delete port"
     echo -e "  ${C_CYAN}5)${C_RESET} change target IP for one port"
-    echo -e "  ${C_MAGENTA}6)${C_RESET} change protocol http/tcp"
+    echo -e "  ${C_MAGENTA}6)${C_RESET} change protocol http/tcp ${C_DIM}(UDP auto-sync)${C_RESET}"
     echo -e "  ${C_CYAN}7)${C_RESET} optimize WebSocket / silent HAProxy no access-log"
     echo -e "  ${C_DIM}00) Back to main menu${C_RESET}"
     echo
@@ -5231,8 +5508,13 @@ if [[ "${1:-}" == "--service" ]]; then
       viratcp_restart_one_tunnel "${3:-}"
       exit $?
       ;;
+    haproxy-udp-sync)
+      ensure_root
+      haproxy_sync_udp_rules
+      exit $?
+      ;;
     *)
-      echo "Unknown service command. Use --service supervise-gre <id> or health-check-all." >&2
+      echo "Unknown service command. Use --service supervise-gre <id>, health-check-all, or haproxy-udp-sync." >&2
       exit 1
       ;;
   esac
