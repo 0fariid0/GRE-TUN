@@ -18,8 +18,10 @@ set -euo pipefail
 #   and migrates/cleans the v8.8.0 custom-chain implementation without touching unrelated firewall rules
 # - v8.8.2 adds an interactive UDP repair action that detects every HAProxy TCP row, resolves its tunnel path,
 #   rebuilds its UDP companion rules, and verifies DNAT/SNAT/FORWARD installation per port
+# - v8.8.3 adds HAProxy UDP auto-heal: the existing 20s health monitor detects missing managed UDP rules
+#   and repairs them immediately, while an hourly systemd timer force-runs the same repair as HAProxy option 8
 
-APP_VERSION="8.8.2"
+APP_VERSION="8.8.3"
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -76,6 +78,10 @@ HAPROXY_MAXCONN=500000
 HAPROXY_NOFILE_LIMIT=1048576
 HAPROXY_UDP_SERVICE_NAME="gretun-haproxy-udp.service"
 HAPROXY_UDP_SERVICE_UNIT="/etc/systemd/system/${HAPROXY_UDP_SERVICE_NAME}"
+HAPROXY_UDP_REPAIR_SERVICE_NAME="gretun-haproxy-udp-repair.service"
+HAPROXY_UDP_REPAIR_SERVICE_UNIT="/etc/systemd/system/${HAPROXY_UDP_REPAIR_SERVICE_NAME}"
+HAPROXY_UDP_REPAIR_TIMER_NAME="gretun-haproxy-udp-repair.timer"
+HAPROXY_UDP_REPAIR_TIMER_UNIT="/etc/systemd/system/${HAPROXY_UDP_REPAIR_TIMER_NAME}"
 
 # Color/theme helpers
 if [ -t 1 ]; then
@@ -829,6 +835,11 @@ tunnel_health_check_all() {
       fi
     fi
   done <<< "$ids"
+
+  # HAProxy UDP companions are checked last. This is intentionally lightweight:
+  # when all four managed rules exist for every TCP row, nothing is changed.
+  # If firewall/NAT rules disappear, run the same rebuild+verify logic as menu option 8.
+  haproxy_udp_self_heal_check || true
 }
 
 bootstrap_runtime_repairs() {
@@ -855,6 +866,12 @@ bootstrap_runtime_repairs() {
       fi
     fi
   done <<< "$ids"
+
+  # Existing HAProxy users upgrading to v8.8.3 get the UDP repair timer
+  # automatically on the next manager launch; no need to enter the HAProxy menu.
+  if [ -f "$HAPROXY_CONFIG" ] && command -v haproxy >/dev/null 2>&1; then
+    haproxy_install_udp_service >/dev/null 2>&1 || true
+  fi
 }
 
 # -----------------------------
@@ -5155,6 +5172,7 @@ haproxy_install_udp_service() {
   install_manager_binary >/dev/null 2>&1 || true
   [ -s "$INSTALL_BIN" ] || return 0
 
+  # Boot-time sync service kept exactly as before.
   cat > "$HAPROXY_UDP_SERVICE_UNIT" <<EOF_UDP_SERVICE
 [Unit]
 Description=GRE-TUN managed UDP companions for HAProxy TCP forwards
@@ -5169,8 +5187,42 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF_UDP_SERVICE
+
+  # v8.8.3: non-interactive equivalent of HAProxy menu option 8.
+  # It uses the existing haproxy_repair_udp() function, so no HAProxy rows,
+  # target IPs, tunnel definitions, or unrelated firewall rules are modified.
+  cat > "$HAPROXY_UDP_REPAIR_SERVICE_UNIT" <<EOF_UDP_REPAIR_SERVICE
+[Unit]
+Description=GRE-TUN HAProxy UDP automatic repair (same as menu option 8)
+After=network-online.target haproxy.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash $INSTALL_BIN --service haproxy-udp-repair
+TimeoutStartSec=90
+EOF_UDP_REPAIR_SERVICE
+
+  # Force one full repair every hour. The 20-second health monitor below also
+  # repairs immediately when it detects that one of our managed rules vanished.
+  cat > "$HAPROXY_UDP_REPAIR_TIMER_UNIT" <<EOF_UDP_REPAIR_TIMER
+[Unit]
+Description=Run GRE-TUN HAProxy UDP repair hourly
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1h
+AccuracySec=20s
+Persistent=true
+Unit=$HAPROXY_UDP_REPAIR_SERVICE_NAME
+
+[Install]
+WantedBy=timers.target
+EOF_UDP_REPAIR_TIMER
+
   systemctl daemon-reload >/dev/null 2>&1 || true
   systemctl enable "$HAPROXY_UDP_SERVICE_NAME" >/dev/null 2>&1 || true
+  systemctl enable --now "$HAPROXY_UDP_REPAIR_TIMER_NAME" >/dev/null 2>&1 || true
 }
 
 haproxy_list_forwards() {
@@ -5479,6 +5531,83 @@ haproxy_optimize_websocket_nolog() {
   ok_msg "HAProxy silent WebSocket optimization applied. Existing TCP rows keep automatic UDP companions; HTTP rows stay UDP-off."
 }
 
+# Return success only when every HAProxy TCP row has all four managed UDP
+# companion rules installed for its currently resolved tunnel path. This check
+# never deletes/reorders firewall rules and is safe to call frequently.
+haproxy_udp_rules_healthy() {
+  command -v iptables >/dev/null 2>&1 || return 0
+  [ -f "$HAPROXY_CONFIG" ] || return 0
+
+  local entries tcp_entries port target tport proto
+  entries="$(haproxy_export_entries || true)"
+  [ -n "$entries" ] || return 0
+  tcp_entries="$(awk '{p=$4; if(p=="") p="http"; if(tolower(p)=="tcp") print $0}' <<< "$entries")"
+  [ -n "$tcp_entries" ] || return 0
+
+  while read -r port target tport proto; do
+    [ -n "${port:-}" ] || continue
+    haproxy_udp_resolve_path "$target" || return 1
+
+    iptables -w 5 -t nat -C PREROUTING \
+      -p udp --dport "$port" \
+      -m comment --comment "gretun-hap-udp-pre-$port" \
+      -j DNAT --to-destination "$target:$tport" 2>/dev/null || return 1
+
+    iptables -w 5 -t nat -C POSTROUTING \
+      -o "$HAP_UDP_IFACE" -p udp -d "$target" --dport "$tport" \
+      -m comment --comment "gretun-hap-udp-post-$port" \
+      -j SNAT --to-source "$HAP_UDP_LOCAL_IP" 2>/dev/null || return 1
+
+    iptables -w 5 -C FORWARD \
+      -o "$HAP_UDP_IFACE" -p udp -d "$target" --dport "$tport" \
+      -m comment --comment "gretun-hap-udp-out-$port" \
+      -j ACCEPT 2>/dev/null || return 1
+
+    iptables -w 5 -C FORWARD \
+      -i "$HAP_UDP_IFACE" -p udp -s "$target" --sport "$tport" \
+      -m conntrack --ctstate ESTABLISHED,RELATED \
+      -m comment --comment "gretun-hap-udp-back-$port" \
+      -j ACCEPT 2>/dev/null || return 1
+  done <<< "$tcp_entries"
+
+  return 0
+}
+
+# Called by the existing 20-second gretun health timer. It does nothing when
+# UDP rules are healthy; when any managed rule is missing it runs option-8
+# repair immediately. A lock prevents overlap with the hourly forced repair.
+haproxy_udp_self_heal_check() {
+  command -v haproxy >/dev/null 2>&1 || return 0
+  command -v iptables >/dev/null 2>&1 || return 0
+  [ -f "$HAPROXY_CONFIG" ] || return 0
+
+  if haproxy_udp_rules_healthy; then
+    return 0
+  fi
+
+  local lockdir="/run/gretun-haproxy-udp-repair.lock"
+  mkdir "$lockdir" 2>/dev/null || return 0
+  info_msg "HAProxy UDP self-heal detected missing/stale managed rules; running automatic repair..."
+  local rc=0
+  haproxy_repair_udp || rc=$?
+  rmdir "$lockdir" 2>/dev/null || true
+  return "$rc"
+}
+
+# Non-interactive hourly service wrapper. This intentionally force-runs the
+# exact same repair as menu option 8 even if the rules still look present.
+haproxy_periodic_udp_repair() {
+  command -v haproxy >/dev/null 2>&1 || return 0
+  [ -f "$HAPROXY_CONFIG" ] || return 0
+
+  local lockdir="/run/gretun-haproxy-udp-repair.lock"
+  mkdir "$lockdir" 2>/dev/null || return 0
+  local rc=0
+  haproxy_repair_udp || rc=$?
+  rmdir "$lockdir" 2>/dev/null || true
+  return "$rc"
+}
+
 # Rebuild UDP companions for every existing HAProxy TCP row without touching
 # HTTP rows or changing the HAProxy configuration itself. This is an operator-
 # initiated recovery action for cases where firewall/NAT state was lost or a
@@ -5696,8 +5825,13 @@ if [[ "${1:-}" == "--service" ]]; then
       haproxy_sync_udp_rules
       exit $?
       ;;
+    haproxy-udp-repair)
+      ensure_root
+      haproxy_periodic_udp_repair
+      exit $?
+      ;;
     *)
-      echo "Unknown service command. Use --service supervise-gre <id>, health-check-all, or haproxy-udp-sync." >&2
+      echo "Unknown service command. Use --service supervise-gre <id>, health-check-all, haproxy-udp-sync, or haproxy-udp-repair." >&2
       exit 1
       ;;
   esac
