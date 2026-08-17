@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + WireGuard + Vira7 + ViraTCP + HAProxy + Real-IP multi-tunnel manager v8.9.1
+# GRE + WireGuard + Vira7 + ViraTCP + HAProxy + Real-IP multi-tunnel manager v8.9.3
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
@@ -20,13 +20,16 @@ set -euo pipefail
 #   rebuilds its UDP companion rules, and verifies DNAT/SNAT/FORWARD installation per port
 # - v8.8.3 adds HAProxy UDP auto-heal: the existing 20s health monitor detects missing managed UDP rules
 #   and repairs them immediately, while an hourly systemd timer force-runs the same repair as HAProxy option 8
-# - v8.9.2 keeps Real-IP for TCP while restoring the proven legacy UDP DNAT+SNAT+FORWARD path
-#   for TCP rows, fixing UDP reliability without removing or changing the existing HAProxy engine.
+# - v8.9.3 makes the proven v8.8.x HAProxy UDP companion engine the ONLY UDP owner for both
+#   HAProxy-TCP rows and Real-IP TCP+UDP rows, removing duplicate/competing Real-IP UDP state.
+#   It also adds numbered/IP-aware switch selection, transactional HAProxy rollback, and an
+#   emergency restore-to-HAProxy action.
+# - v8.9.2 kept Real-IP for TCP while restoring the legacy UDP DNAT+SNAT+FORWARD shape.
 # - v8.9.0 adds a separate Real-IP L3 forwarding engine beside HAProxy. It uses DNAT without SNAT,
 #   preserves the original client source IP, has independent persistence/self-heal, one-time Kharej
 #   return-policy routing, and safe per-port switching HAProxy <-> Real-IP without removing HAProxy.
 
-APP_VERSION="8.9.2"
+APP_VERSION="8.9.3"
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -5168,9 +5171,32 @@ haproxy_udp_add_rule() {
     -j ACCEPT
 }
 
+# One UDP owner only: reuse the original/proven HAProxy UDP companion engine
+# for BOTH normal HAProxy TCP rows and Real-IP rows that request TCP+UDP.
+# This prevents two independent repair loops from deleting/replacing each other's rules.
+managed_udp_export_entries() {
+  local h r
+  h="$(haproxy_export_entries 2>/dev/null || true)"
+  if [ -n "$h" ]; then
+    awk '{p=$4; if(p=="") p="http"; if(tolower(p)=="tcp") print $1, $2, $3, "tcp"}' <<< "$h"
+  fi
+
+  if [ -f "$REALIP_FORWARDS_FILE" ]; then
+    r="$(realip_export_entries 2>/dev/null || true)"
+    if [ -n "$r" ]; then
+      # Real-IP column 4 = both/tcp. Only "both" needs the legacy UDP companion.
+      awk '{p=tolower($4); if(p=="both") print $1, $2, $3, "tcp"}' <<< "$r"
+    fi
+  fi
+}
+
+managed_udp_export_unique() {
+  managed_udp_export_entries | awk '!seen[$1]++'
+}
+
 haproxy_sync_udp_rules() {
   command -v iptables >/dev/null 2>&1 || {
-    warn_msg "iptables is not available; HAProxy TCP/HTTP works, but automatic UDP forwarding cannot be configured."
+    warn_msg "iptables is not available; managed UDP forwarding cannot be configured."
     return 0
   }
 
@@ -5178,11 +5204,10 @@ haproxy_sync_udp_rules() {
   haproxy_udp_flush_managed_rules
 
   local entries port target tport proto count=0 skipped=0
-  entries="$(haproxy_export_entries || true)"
-  [ -n "$entries" ] || { info_msg "Managed HAProxy UDP rules: none"; return 0; }
+  entries="$(managed_udp_export_unique || true)"
+  [ -n "$entries" ] || { info_msg "Managed UDP rules: none"; return 0; }
 
-  # First remove an exact un-commented manual companion, if one exists for the
-  # current row/target. This lets v8.8.1 take ownership without duplicates.
+  # Remove old equivalent un-commented rules first, exactly like the proven v8.8.x path.
   while read -r port target tport proto; do
     [ -n "${port:-}" ] || continue
     if haproxy_udp_resolve_path "$target"; then
@@ -5190,27 +5215,22 @@ haproxy_sync_udp_rules() {
     fi
   done <<< "$entries"
 
-  # Then create companions only for TCP rows. HTTP rows therefore have no UDP
-  # rule; toggling TCP -> HTTP removes UDP automatically on this same sync.
+  # Every row in managed_udp_export_unique is intentionally UDP-enabled.
   while read -r port target tport proto; do
     [ -n "${port:-}" ] || continue
-    proto="$(haproxy_normalize_proto "${proto:-http}")"
-    [ "$proto" = "tcp" ] || continue
-
     if ! haproxy_udp_resolve_path "$target"; then
       warn_msg "UDP companion skipped for port $port: cannot resolve route/local source for target $target."
       skipped=$((skipped + 1))
       continue
     fi
-
     haproxy_udp_add_rule "$port" "$target" "$tport" "$HAP_UDP_IFACE" "$HAP_UDP_LOCAL_IP"
     count=$((count + 1))
   done <<< "$entries"
 
   if [ "$count" -gt 0 ]; then
-    ok_msg "Managed UDP forwarding synced for $count TCP HAProxy port(s) using direct iptables rules."
+    ok_msg "Managed UDP forwarding synced for $count port(s) using the original HAProxy DNAT+SNAT+FORWARD engine."
   else
-    info_msg "Managed HAProxy UDP rules: none (no TCP forwards)."
+    info_msg "Managed UDP rules: none"
   fi
   [ "$skipped" -eq 0 ] || warn_msg "$skipped UDP forward(s) were skipped because their route could not be resolved."
 }
@@ -5305,27 +5325,47 @@ haproxy_open_firewall_tcp() {
 
 haproxy_validate_and_restart() {
   local tmp="$1"
-  # Validate quietly first so HAProxy NOTICE/WARNING lines do not confuse the menu output.
-  # If validation fails, run it again without -q to print the real error.
+  local rollback had_old=0
+  rollback="$(mktemp)"
+
+  # Validate quietly first so a bad generated config never replaces the working one.
   if ! haproxy -c -q -f "$tmp" >/dev/null 2>&1; then
     haproxy -c -f "$tmp" || true
     err_msg "HAProxy config validation failed. Nothing changed."
-    rm -f "$tmp"
+    rm -f "$tmp" "$rollback"
     return 1
   fi
+
   mkdir -p "$HAPROXY_BACKUP_DIR"
   if [ -f "$HAPROXY_CONFIG" ]; then
+    had_old=1
+    cp -f "$HAPROXY_CONFIG" "$rollback"
     cp -f "$HAPROXY_CONFIG" "$HAPROXY_BACKUP_DIR/haproxy.cfg.$(date +%Y%m%d-%H%M%S).bak" 2>/dev/null || true
   fi
+
   mv -f "$tmp" "$HAPROXY_CONFIG"
   haproxy_apply_high_limits
   haproxy_ensure_maxconn_in_config
   systemctl enable haproxy >/dev/null 2>&1 || true
   if systemctl restart haproxy; then
+    rm -f "$rollback"
     ok_msg "HAProxy restarted successfully."
     return 0
   fi
-  err_msg "HAProxy restart failed. Check: journalctl -u haproxy -n 50 --no-pager"
+
+  # Fail safe: restore the exact previously working HAProxy config if restart fails.
+  if [ "$had_old" -eq 1 ] && [ -s "$rollback" ]; then
+    cp -f "$rollback" "$HAPROXY_CONFIG"
+    if systemctl restart haproxy >/dev/null 2>&1; then
+      err_msg "HAProxy restart failed; previous working config was restored automatically."
+    else
+      err_msg "HAProxy restart failed and rollback restart also failed. Check journalctl -u haproxy -n 50 --no-pager"
+    fi
+  else
+    rm -f "$HAPROXY_CONFIG"
+    err_msg "HAProxy restart failed. No previous config existed to restore."
+  fi
+  rm -f "$rollback"
   return 1
 }
 
@@ -5584,13 +5624,10 @@ haproxy_optimize_websocket_nolog() {
 # never deletes/reorders firewall rules and is safe to call frequently.
 haproxy_udp_rules_healthy() {
   command -v iptables >/dev/null 2>&1 || return 0
-  [ -f "$HAPROXY_CONFIG" ] || return 0
 
-  local entries tcp_entries port target tport proto
-  entries="$(haproxy_export_entries || true)"
+  local entries port target tport proto
+  entries="$(managed_udp_export_unique || true)"
   [ -n "$entries" ] || return 0
-  tcp_entries="$(awk '{p=$4; if(p=="") p="http"; if(tolower(p)=="tcp") print $0}' <<< "$entries")"
-  [ -n "$tcp_entries" ] || return 0
 
   while read -r port target tport proto; do
     [ -n "${port:-}" ] || continue
@@ -5616,7 +5653,7 @@ haproxy_udp_rules_healthy() {
       -m conntrack --ctstate ESTABLISHED,RELATED \
       -m comment --comment "gretun-hap-udp-back-$port" \
       -j ACCEPT 2>/dev/null || return 1
-  done <<< "$tcp_entries"
+  done <<< "$entries"
 
   return 0
 }
@@ -5669,19 +5706,19 @@ haproxy_repair_udp() {
     return 1
   }
 
-  entries="$(haproxy_export_entries || true)"
+  entries="$(managed_udp_export_unique || true)"
   if [ -z "$entries" ]; then
-    warn_msg "No HAProxy forwarded ports were found."
+    warn_msg "No UDP-enabled HAProxy/Real-IP ports were found."
     return 0
   fi
 
-  tcp_entries="$(awk '{p=$4; if(p=="") p="http"; if(tolower(p)=="tcp") print $0}' <<< "$entries")"
+  tcp_entries="$entries"
   if [ -z "$tcp_entries" ]; then
-    warn_msg "No TCP HAProxy ports were found. HTTP rows intentionally have UDP disabled."
+    warn_msg "No UDP-enabled forwarding rows were found."
     return 0
   fi
 
-  echo -e "${C_BOLD}${C_WHITE}TCP ports detected for UDP repair:${C_RESET}"
+  echo -e "${C_BOLD}${C_WHITE}UDP-enabled ports detected for repair:${C_RESET}"
   printf "${C_DIM}%8s  %-15s %-12s %-10s %-15s %-10s${C_RESET}\n" \
     "Port" "Target-IP" "Target-Port" "Interface" "Local-Tun-IP" "Status"
   printf "${C_DIM}%s${C_RESET}\n" "-------------------------------------------------------------------------------"
@@ -5746,7 +5783,7 @@ haproxy_repair_udp() {
 
   echo
   if [ "$failed" -eq 0 ] && [ "$unresolved" -eq 0 ]; then
-    ok_msg "UDP repair complete: $verified TCP port(s) rebuilt and verified successfully."
+    ok_msg "UDP repair complete: $verified port(s) rebuilt and verified successfully."
     return 0
   fi
 
@@ -5780,7 +5817,7 @@ haproxy_menu() {
     echo -e "  ${C_MAGENTA}6)${C_RESET} change protocol http/tcp ${C_DIM}(UDP auto-sync)${C_RESET}"
     echo -e "  ${C_CYAN}7)${C_RESET} optimize WebSocket / silent HAProxy no access-log"
     echo -e "  ${C_GREEN}8)${C_RESET} repair UDP for all TCP ports ${C_DIM}(detect + rebuild + verify)${C_RESET}"
-    echo -e "  ${C_YELLOW}9)${C_RESET} switch HAProxy -> Real-IP ${C_DIM}(selected ports or ALL)${C_RESET}"
+    echo -e "  ${C_YELLOW}9)${C_RESET} switch HAProxy -> Real-IP ${C_DIM}(number / IP / port / ALL)${C_RESET}"
     echo -e "  ${C_DIM}00) Back to main menu${C_RESET}"
     echo
     read -rp "Choose HAProxy option [1-9/00]: " HAP_CHOICE
@@ -5957,33 +5994,23 @@ realip_flush_managed_rules() {
 
 realip_add_l4_rule() {
   local l4="$1" port="$2" target="$3" tport="$4" ifc="$5" local_ip="${6:-}"
+  [ "$l4" = "tcp" ] || { err_msg "Internal safety: Real-IP engine only owns TCP rules; UDP must use the legacy managed UDP engine."; return 1; }
 
-  # TCP Real-IP path: preserve the original client source address (NO SNAT).
-  # UDP compatibility path: use the exact proven HAProxy companion design
-  # (DNAT + tunnel-source SNAT + FORWARD). In this deployment UDP was reliable
-  # with that design, while pure no-SNAT UDP could return outside the tunnel.
+  # TCP Real-IP path only: preserve original client source address (NO SNAT).
   iptables -w 5 -t nat -I PREROUTING 1 \
-    -p "$l4" --dport "$port" \
-    -m comment --comment "$REALIP_RULE_PREFIX-$l4-pre-$port" \
+    -p tcp --dport "$port" \
+    -m comment --comment "$REALIP_RULE_PREFIX-tcp-pre-$port" \
     -j DNAT --to-destination "$target:$tport"
 
-  if [ "$l4" = "udp" ]; then
-    validate_ipv4 "$local_ip" || { err_msg "Real-IP UDP port $port: invalid tunnel source IP '$local_ip'."; return 1; }
-    iptables -w 5 -t nat -I POSTROUTING 1 \
-      -o "$ifc" -p udp -d "$target" --dport "$tport" \
-      -m comment --comment "$REALIP_RULE_PREFIX-udp-post-$port" \
-      -j SNAT --to-source "$local_ip"
-  fi
-
   iptables -w 5 -I FORWARD 1 \
-    -o "$ifc" -p "$l4" -d "$target" --dport "$tport" \
-    -m comment --comment "$REALIP_RULE_PREFIX-$l4-out-$port" \
+    -o "$ifc" -p tcp -d "$target" --dport "$tport" \
+    -m comment --comment "$REALIP_RULE_PREFIX-tcp-out-$port" \
     -j ACCEPT
 
   iptables -w 5 -I FORWARD 1 \
-    -i "$ifc" -p "$l4" -s "$target" --sport "$tport" \
+    -i "$ifc" -p tcp -s "$target" --sport "$tport" \
     -m conntrack --ctstate ESTABLISHED,RELATED \
-    -m comment --comment "$REALIP_RULE_PREFIX-$l4-back-$port" \
+    -m comment --comment "$REALIP_RULE_PREFIX-tcp-back-$port" \
     -j ACCEPT
 }
 
@@ -5991,59 +6018,55 @@ realip_sync_rules() {
   command -v iptables >/dev/null 2>&1 || { err_msg "iptables is required for Real-IP forwarding."; return 1; }
   enable_ip_forward
   apply_tunnel_sysctls
+
+  # This also removes stale v8.9.0-v8.9.2 Real-IP UDP rules. From v8.9.3 onward
+  # Real-IP owns TCP only and the original HAProxy UDP engine owns every UDP companion.
   realip_flush_managed_rules
 
   local entries port target tport proto restore count=0 skipped=0
   entries="$(realip_export_entries || true)"
-  [ -n "$entries" ] || return 0
+  if [ -n "$entries" ]; then
+    while read -r port target tport proto restore; do
+      [ -n "${port:-}" ] || continue
+      if ! realip_resolve_target "$target"; then
+        warn_msg "Real-IP port $port skipped: target $target is not a supported/active L3 tunnel path."
+        skipped=$((skipped + 1))
+        continue
+      fi
+      realip_add_l4_rule tcp "$port" "$target" "$tport" "$REALIP_IFACE" "$REALIP_LOCAL_IP" || {
+        skipped=$((skipped + 1))
+        continue
+      }
+      count=$((count + 1))
+    done <<< "$entries"
+  fi
 
-  while read -r port target tport proto restore; do
-    [ -n "${port:-}" ] || continue
-    if ! realip_resolve_target "$target"; then
-      warn_msg "Real-IP port $port skipped: target $target is not a supported/active L3 tunnel path."
-      skipped=$((skipped + 1))
-      continue
-    fi
-    realip_add_l4_rule tcp "$port" "$target" "$tport" "$REALIP_IFACE" "$REALIP_LOCAL_IP"
-    if [ "$(realip_normalize_proto "$proto")" = "both" ]; then
-      # Remove any old equivalent un-commented companion rule, then install
-      # our separately tagged stable UDP companion. HAProxy rules themselves
-      # are already removed by the engine switch and use a different marker.
-      haproxy_udp_remove_equivalent_rules "$port" "$target" "$tport" "$REALIP_IFACE" "$REALIP_LOCAL_IP"
-      realip_add_l4_rule udp "$port" "$target" "$tport" "$REALIP_IFACE" "$REALIP_LOCAL_IP"
-    fi
-    count=$((count + 1))
-  done <<< "$entries"
+  # Always rebuild UDP once, using ONE proven owner for both engines.
+  haproxy_sync_udp_rules || skipped=$((skipped + 1))
 
-  [ "$count" -eq 0 ] || ok_msg "Real-IP rules synchronized for $count port(s): TCP preserves client IP; UDP uses the proven stable tunnel-SNAT companion."
-  [ "$skipped" -eq 0 ] || warn_msg "$skipped Real-IP port(s) could not be synchronized."
+  [ "$count" -eq 0 ] || ok_msg "Real-IP TCP rules synchronized for $count port(s); client source IP preserved."
+  [ "$skipped" -eq 0 ] || warn_msg "$skipped Real-IP/UDP synchronization issue(s) detected."
   [ "$skipped" -eq 0 ]
 }
 
 realip_rule_exists_l4() {
   local l4="$1" port="$2" target="$3" tport="$4" ifc="$5" local_ip="${6:-}"
+  [ "$l4" = "tcp" ] || return 1
+
   iptables -w 5 -t nat -C PREROUTING \
-    -p "$l4" --dport "$port" \
-    -m comment --comment "$REALIP_RULE_PREFIX-$l4-pre-$port" \
+    -p tcp --dport "$port" \
+    -m comment --comment "$REALIP_RULE_PREFIX-tcp-pre-$port" \
     -j DNAT --to-destination "$target:$tport" 2>/dev/null || return 1
 
-  if [ "$l4" = "udp" ]; then
-    validate_ipv4 "$local_ip" || return 1
-    iptables -w 5 -t nat -C POSTROUTING \
-      -o "$ifc" -p udp -d "$target" --dport "$tport" \
-      -m comment --comment "$REALIP_RULE_PREFIX-udp-post-$port" \
-      -j SNAT --to-source "$local_ip" 2>/dev/null || return 1
-  fi
-
   iptables -w 5 -C FORWARD \
-    -o "$ifc" -p "$l4" -d "$target" --dport "$tport" \
-    -m comment --comment "$REALIP_RULE_PREFIX-$l4-out-$port" \
+    -o "$ifc" -p tcp -d "$target" --dport "$tport" \
+    -m comment --comment "$REALIP_RULE_PREFIX-tcp-out-$port" \
     -j ACCEPT 2>/dev/null || return 1
 
   iptables -w 5 -C FORWARD \
-    -i "$ifc" -p "$l4" -s "$target" --sport "$tport" \
+    -i "$ifc" -p tcp -s "$target" --sport "$tport" \
     -m conntrack --ctstate ESTABLISHED,RELATED \
-    -m comment --comment "$REALIP_RULE_PREFIX-$l4-back-$port" \
+    -m comment --comment "$REALIP_RULE_PREFIX-tcp-back-$port" \
     -j ACCEPT 2>/dev/null
 }
 
@@ -6056,9 +6079,6 @@ realip_rules_healthy() {
     [ -n "${port:-}" ] || continue
     realip_resolve_target "$target" >/dev/null 2>&1 || return 1
     realip_rule_exists_l4 tcp "$port" "$target" "$tport" "$REALIP_IFACE" "$REALIP_LOCAL_IP" || return 1
-    if [ "$(realip_normalize_proto "$proto")" = "both" ]; then
-      realip_rule_exists_l4 udp "$port" "$target" "$tport" "$REALIP_IFACE" "$REALIP_LOCAL_IP" || return 1
-    fi
   done <<< "$entries"
   return 0
 }
@@ -6280,7 +6300,7 @@ realip_self_heal_check() {
 }
 
 realip_list_forwards() {
-  echo -e "${C_BOLD}${C_WHITE}Real-IP forwarded ports (DNAT without SNAT):${C_RESET}"
+  echo -e "${C_BOLD}${C_WHITE}Real-IP forwarded ports (TCP direct / shared stable UDP):${C_RESET}"
   local entries proto restore
   entries="$(realip_export_entries || true)"
   if [ -z "$entries" ]; then warn_msg "No Real-IP forwarded ports configured."; return 0; fi
@@ -6332,7 +6352,7 @@ realip_add_port() {
   realip_write_entries_file "$tmp"; rm -f "$tmp"
   realip_install_service
   realip_sync_rules
-  ok_msg "Applied ${#HAP_PORTS[@]} Real-IP port(s) -> $REALIP_TARGET_IP. TCP client source IP is preserved; UDP uses stable tunnel-SNAT compatibility."
+  ok_msg "Applied ${#HAP_PORTS[@]} Real-IP port(s) -> $REALIP_TARGET_IP. TCP client source IP is preserved; UDP is handled by the original shared HAProxy companion engine."
 }
 
 realip_change_all_ips() {
@@ -6452,34 +6472,118 @@ realip_toggle_return_routing() {
   fi
 }
 
+# Smart switch selector.
+# Accepted input:
+#   1 / 2 / 3      = displayed row number(s)
+#   10.20.2.2      = every row targeting this IP
+#   p:443          = exact local port 443
+#   443            = row 443 when it exists; otherwise exact local port 443
+#   ALL or A        = all rows
+switch_choose_ports() {
+  local file="$1" label="$2" raw token count i p target tport proto extra matched
+  [ -s "$file" ] || return 1
+  count="$(wc -l < "$file" | tr -d ' ')"
+
+  echo -e "${C_BOLD}${C_WHITE}$label choices:${C_RESET}"
+  printf "${C_DIM}%5s  %8s  %-15s %-12s %-10s${C_RESET}\n" "No." "Port" "Target-IP" "Target-Port" "Mode"
+  printf "${C_DIM}%s${C_RESET}\n" "--------------------------------------------------------------"
+  i=0
+  while read -r p target tport proto extra; do
+    [ -n "${p:-}" ] || continue
+    i=$((i + 1))
+    printf "%5s) %8s  %-15s %-12s %-10s\n" "$i" "$p" "$target" "$tport" "${proto:-?}"
+  done < "$file"
+  echo
+  echo "Enter row number(s), target IP, p:PORT, or ALL. Examples: 1   |   1,3   |   10.20.2.2   |   p:443   |   ALL"
+  read -rp "$label selection [00=menu]: " raw
+  if is_main_menu_token "$raw"; then return_main_msg; return 99; fi
+  [ -n "${raw//[[:space:]]/}" ] || { err_msg "Empty selection."; return 1; }
+
+  SWITCH_PORTS=()
+  raw="${raw//,/ }"
+  for token in $raw; do
+    case "$(printf '%s' "$token" | tr '[:lower:]' '[:upper:]')" in
+      ALL|A)
+        mapfile -t SWITCH_PORTS < <(awk '{print $1}' "$file")
+        break
+        ;;
+    esac
+
+    if validate_ipv4 "$token"; then
+      matched=0
+      while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        SWITCH_PORTS+=("$p")
+        matched=1
+      done < <(awk -v ip="$token" '$2==ip{print $1}' "$file")
+      [ "$matched" -eq 1 ] || { err_msg "No row targets IP $token."; return 1; }
+      continue
+    fi
+
+    case "$token" in
+      p:*|P:*|port:*|PORT:*)
+        p="${token#*:}"
+        validate_port "$p" || { err_msg "Invalid port selector: $token"; return 1; }
+        awk -v p="$p" '$1==p{found=1} END{exit found?0:1}' "$file" || { err_msg "Port $p not found."; return 1; }
+        SWITCH_PORTS+=("$p")
+        continue
+        ;;
+    esac
+
+    if [[ "$token" =~ ^[0-9]+$ ]]; then
+      # Friendly priority: a small integer matching the visible list is a row number.
+      # If it is outside the row range, treat it as an exact local port.
+      if [ "$token" -ge 1 ] && [ "$token" -le "$count" ]; then
+        p="$(awk -v n="$token" 'NR==n{print $1; exit}' "$file")"
+        [ -n "$p" ] || { err_msg "Row $token not found."; return 1; }
+        SWITCH_PORTS+=("$p")
+      else
+        validate_port "$token" || { err_msg "Invalid row/port: $token"; return 1; }
+        awk -v p="$token" '$1==p{found=1} END{exit found?0:1}' "$file" || { err_msg "Neither row nor port $token exists."; return 1; }
+        SWITCH_PORTS+=("$token")
+      fi
+      continue
+    fi
+
+    err_msg "Cannot understand selector '$token'. Use row number, target IP, p:PORT, or ALL."
+    return 1
+  done
+
+  # De-duplicate while preserving user order.
+  mapfile -t SWITCH_PORTS < <(printf '%s\n' "${SWITCH_PORTS[@]}" | awk 'NF && !seen[$0]++')
+  [ "${#SWITCH_PORTS[@]}" -gt 0 ] || { err_msg "Nothing selected."; return 1; }
+  return 0
+}
+
 # Move one or many HAProxy rows into Real-IP without changing tunnel definitions.
 # Existing HAProxy functionality remains installed; only the selected ports move.
 switch_haproxy_to_realip() {
-  local hap_tmp real_tmp raw port target tport hp l3 selected_count=0
+  local hap_tmp real_tmp hap_before real_before port target tport hp l3 selected_count=0 rc
   hap_tmp="$(haproxy_entries_tmp)"; real_tmp="$(realip_entries_tmp)"
   if [ ! -s "$hap_tmp" ]; then warn_msg "No HAProxy ports are available to switch."; rm -f "$hap_tmp" "$real_tmp"; return 0; fi
-  haproxy_list_forwards; echo
-  echo "Enter port(s) separated by comma/space, or type ALL."
-  read -rp "HAProxy -> Real-IP [ports/ALL/00]: " raw
-  if is_main_menu_token "$raw"; then rm -f "$hap_tmp" "$real_tmp"; return_main_msg; return 99; fi
 
-  local -a ports=()
-  if [ "$(printf '%s' "$raw" | tr '[:lower:]' '[:upper:]')" = "ALL" ]; then
-    mapfile -t ports < <(awk '{print $1}' "$hap_tmp")
-  else
-    haproxy_parse_port_list "$raw" || { rm -f "$hap_tmp" "$real_tmp"; return 1; }
-    ports=("${HAP_PORTS[@]}")
-  fi
+  switch_choose_ports "$hap_tmp" "HAProxy -> Real-IP"; rc=$?
+  if [ "$rc" -eq 99 ]; then rm -f "$hap_tmp" "$real_tmp"; return 99; fi
+  [ "$rc" -eq 0 ] || { rm -f "$hap_tmp" "$real_tmp"; return 1; }
+  local -a ports=("${SWITCH_PORTS[@]}")
 
-  # Validate every selected row/path before changing either engine.
+  # Validate ALL selected paths before touching either engine.
   for port in "${ports[@]}"; do
     target="$(awk -v p="$port" '$1==p{print $2; exit}' "$hap_tmp")"
     [ -n "$target" ] || { err_msg "HAProxy port $port was not found."; rm -f "$hap_tmp" "$real_tmp"; return 1; }
     if ! realip_resolve_target "$target" >/dev/null 2>&1; then
-      err_msg "Port $port targets $target, which is not a supported/active GRE/WireGuard/Vira7/ViraTCP Real-IP path. Nothing was switched."
+      err_msg "Port $port -> $target cannot use Real-IP right now. Nothing was switched."
+      rm -f "$hap_tmp" "$real_tmp"; return 1
+    fi
+    # Do not switch onto a dead inner target.
+    if ! ping -n -c 1 -W 2 "$target" >/dev/null 2>&1; then
+      err_msg "Target $target for port $port is not reachable through the tunnel. Nothing was switched."
       rm -f "$hap_tmp" "$real_tmp"; return 1
     fi
   done
+
+  hap_before="$(mktemp)"; real_before="$(mktemp)"
+  cp -f "$hap_tmp" "$hap_before"; cp -f "$real_tmp" "$real_before"
 
   for port in "${ports[@]}"; do
     read -r _ target tport hp < <(awk -v p="$port" '$1==p{print; exit}' "$hap_tmp")
@@ -6493,41 +6597,48 @@ switch_haproxy_to_realip() {
     selected_count=$((selected_count + 1))
   done
 
-  # Remove HAProxy listeners/UDP companions first, then install independent Real-IP rules.
-  if ! haproxy_write_entries_file "$hap_tmp"; then
-    err_msg "HAProxy rewrite failed; Real-IP switch was cancelled."
-    rm -f "$hap_tmp" "$real_tmp"; return 1
-  fi
+  # Stage Real-IP first while HAProxy is still intact. If rule creation fails,
+  # restore Real-IP definitions and leave HAProxy completely unchanged.
   realip_write_entries_file "$real_tmp"
   realip_install_service
-  realip_sync_rules
-  rm -f "$hap_tmp" "$real_tmp"
+  if ! realip_sync_rules || ! realip_rules_healthy || ! haproxy_udp_rules_healthy; then
+    err_msg "Real-IP staging failed verification; rolling back before HAProxy is changed."
+    realip_write_entries_file "$real_before"
+    realip_sync_rules >/dev/null 2>&1 || true
+    rm -f "$hap_tmp" "$real_tmp" "$hap_before" "$real_before"
+    return 1
+  fi
+
+  if ! haproxy_write_entries_file "$hap_tmp"; then
+    err_msg "HAProxy rewrite failed; restoring previous Real-IP state."
+    realip_write_entries_file "$real_before"
+    realip_sync_rules >/dev/null 2>&1 || true
+    rm -f "$hap_tmp" "$real_tmp" "$hap_before" "$real_before"
+    return 1
+  fi
+
+  # One final shared UDP rebuild after both tables contain their final state.
+  haproxy_sync_udp_rules >/dev/null 2>&1 || true
+  rm -f "$hap_tmp" "$real_tmp" "$hap_before" "$real_before"
   ok_msg "Switched $selected_count port(s): HAProxy -> Real-IP."
-  info_msg "One-time requirement for TCP Real-IP: on the KHAREJ server open Real-IP Manager and enable 'Kharej return routing'. UDP compatibility does not depend on that return rule because it intentionally uses the proven tunnel-source SNAT path."
+  info_msg "TCP uses Real-IP/no-SNAT. UDP uses the exact original HAProxy UDP companion engine."
 }
 
 switch_realip_to_haproxy() {
-  local hap_tmp real_tmp raw port target tport l3 restore selected_count=0
+  local hap_tmp real_tmp port target tport l3 restore selected_count=0 rc
   haproxy_ensure_ready || return 1
   hap_tmp="$(haproxy_entries_tmp)"; real_tmp="$(realip_entries_tmp)"
   if [ ! -s "$real_tmp" ]; then warn_msg "No Real-IP ports are available to switch."; rm -f "$hap_tmp" "$real_tmp"; return 0; fi
-  realip_list_forwards; echo
-  echo "Enter port(s) separated by comma/space, or type ALL."
-  read -rp "Real-IP -> HAProxy [ports/ALL/00]: " raw
-  if is_main_menu_token "$raw"; then rm -f "$hap_tmp" "$real_tmp"; return_main_msg; return 99; fi
 
-  local -a ports=()
-  if [ "$(printf '%s' "$raw" | tr '[:lower:]' '[:upper:]')" = "ALL" ]; then
-    mapfile -t ports < <(awk '{print $1}' "$real_tmp")
-  else
-    haproxy_parse_port_list "$raw" || { rm -f "$hap_tmp" "$real_tmp"; return 1; }
-    ports=("${HAP_PORTS[@]}")
-  fi
+  switch_choose_ports "$real_tmp" "Real-IP -> HAProxy"; rc=$?
+  if [ "$rc" -eq 99 ]; then rm -f "$hap_tmp" "$real_tmp"; return 99; fi
+  [ "$rc" -eq 0 ] || { rm -f "$hap_tmp" "$real_tmp"; return 1; }
+  local -a ports=("${SWITCH_PORTS[@]}")
 
   for port in "${ports[@]}"; do
     awk -v p="$port" '$1==p{found=1} END{exit found?0:1}' "$real_tmp" || { err_msg "Real-IP port $port was not found."; rm -f "$hap_tmp" "$real_tmp"; return 1; }
     if awk -v p="$port" '$1==p{found=1} END{exit found?0:1}' "$hap_tmp"; then
-      err_msg "HAProxy already contains port $port. Resolve the duplicate manually; nothing was switched."
+      err_msg "HAProxy already contains port $port. Nothing was switched."
       rm -f "$hap_tmp" "$real_tmp"; return 1
     fi
   done
@@ -6541,30 +6652,53 @@ switch_realip_to_haproxy() {
     selected_count=$((selected_count + 1))
   done
 
-  # Start HAProxy first, then remove the Real-IP NAT rules. This avoids a gap if HAProxy validation fails.
+  # Transactional HAProxy writer rolls itself back on restart failure.
   if ! haproxy_write_entries_file "$hap_tmp"; then
     err_msg "HAProxy validation/restart failed; Real-IP configuration was kept unchanged."
-    rm -f "$hap_tmp" "$real_tmp"; return 1
+    rm -f "$hap_tmp" "$real_tmp"
+    return 1
   fi
+
   realip_write_entries_file "$real_tmp"
-  realip_sync_rules
+  realip_sync_rules || true
+  haproxy_sync_udp_rules >/dev/null 2>&1 || true
   rm -f "$hap_tmp" "$real_tmp"
-  ok_msg "Switched $selected_count port(s): Real-IP -> HAProxy. Original HAProxy protocol mode was restored."
+  ok_msg "Switched $selected_count port(s): Real-IP -> HAProxy. Original HTTP/TCP mode was restored."
+}
+
+realip_emergency_restore_all_to_haproxy() {
+  local real_tmp
+  real_tmp="$(realip_entries_tmp)"
+  if [ ! -s "$real_tmp" ]; then
+    warn_msg "There are no Real-IP ports to restore."
+    rm -f "$real_tmp"
+    realip_disable_return_routing >/dev/null 2>&1 || true
+    return 0
+  fi
+  rm -f "$real_tmp"
+
+  # Reuse the normal transactional switch, automatically selecting every row.
+  # Feed ALL non-interactively so this is a one-action rescue path.
+  switch_realip_to_haproxy <<< "ALL" || return 1
+  realip_disable_return_routing >/dev/null 2>&1 || true
+  ok_msg "Emergency restore complete: all possible ports are back on HAProxy and Kharej Real-IP return routing is disabled."
 }
 
 forward_switch_menu() {
   while true; do
     show_header "Switch Forwarding Engine"
-    echo -e "  ${C_GREEN}1)${C_RESET} HAProxy -> Real-IP ${C_DIM}(selected ports or ALL)${C_RESET}"
-    echo -e "  ${C_YELLOW}2)${C_RESET} Real-IP -> HAProxy ${C_DIM}(selected ports or ALL)${C_RESET}"
+    echo -e "  ${C_GREEN}1)${C_RESET} HAProxy -> Real-IP ${C_DIM}(choose row number / target IP / port / ALL)${C_RESET}"
+    echo -e "  ${C_YELLOW}2)${C_RESET} Real-IP -> HAProxy ${C_DIM}(choose row number / target IP / port / ALL)${C_RESET}"
     echo -e "  ${C_CYAN}3)${C_RESET} show both forwarding tables"
+    echo -e "  ${C_RED}4)${C_RESET} EMERGENCY: restore ALL Real-IP ports to HAProxy"
     echo -e "  ${C_DIM}00) Back${C_RESET}"
     echo
-    read -rp "Choose switch option [1-3/00]: " FWD_SWITCH_CHOICE
+    read -rp "Choose switch option [1-4/00]: " FWD_SWITCH_CHOICE
     case "$FWD_SWITCH_CHOICE" in
       1) haproxy_run_action switch_haproxy_to_realip || return 0 ;;
       2) haproxy_run_action switch_realip_to_haproxy || return 0 ;;
       3) haproxy_list_forwards; echo; realip_list_forwards; pause ;;
+      4) haproxy_run_action realip_emergency_restore_all_to_haproxy || return 0 ;;
       00) return_main_msg; return 0 ;;
       *) err_msg "Invalid option"; sleep 1 ;;
     esac
@@ -6575,7 +6709,7 @@ realip_menu() {
   mkdir -p "$REALIP_CONFIG_DIR"
   while true; do
     show_header "Real-IP Port Forward Manager"
-    echo -e "${C_BOLD}${C_WHITE}Real-IP Menu (TCP preserves IP + stable UDP companion)${C_RESET}"
+    echo -e "${C_BOLD}${C_WHITE}Real-IP Menu (TCP real IP + original shared UDP engine)${C_RESET}"
     echo -e "  ${C_GREEN}1)${C_RESET} list forwarded ports"
     echo -e "  ${C_GREEN}2)${C_RESET} add/update port(s) ${C_DIM}(comma/space supported)${C_RESET}"
     echo -e "  ${C_YELLOW}3)${C_RESET} change ALL target IPs"
@@ -6584,7 +6718,7 @@ realip_menu() {
     echo -e "  ${C_MAGENTA}6)${C_RESET} change protocol TCP / TCP+UDP"
     echo -e "  ${C_GREEN}7)${C_RESET} repair + verify Real-IP rules"
     echo -e "  ${C_BLUE}8)${C_RESET} toggle KHAREJ return routing ${C_DIM}(one-time backend setup)${C_RESET}"
-    echo -e "  ${C_YELLOW}9)${C_RESET} switch Real-IP -> HAProxy"
+    echo -e "  ${C_YELLOW}9)${C_RESET} switch Real-IP -> HAProxy ${C_DIM}(number / IP / port / ALL)${C_RESET}"
     echo -e "  ${C_DIM}00) Back to main menu${C_RESET}"
     echo
     read -rp "Choose Real-IP option [1-9/00]: " REALIP_CHOICE
@@ -6613,7 +6747,7 @@ show_menu() {
   echo -e "  ${C_CYAN}4)${C_RESET} ping test tunnels"
   echo -e "  ${C_MAGENTA}5)${C_RESET} haproxy port manager"
   echo -e "  ${C_BLUE}6)${C_RESET} optimize Vira7 CPU"
-  echo -e "  ${C_GREEN}7)${C_RESET} Real-IP port manager ${C_DIM}(TCP real IP + stable UDP)${C_RESET}"
+  echo -e "  ${C_GREEN}7)${C_RESET} Real-IP port manager ${C_DIM}(TCP real IP + original UDP engine)${C_RESET}"
   echo -e "  ${C_YELLOW}8)${C_RESET} switch forwarding engine ${C_DIM}(HAProxy <-> Real-IP)${C_RESET}"
   echo -e "  ${C_DIM}00) Main menu / back${C_RESET}"
   echo -e "  ${C_DIM}0) Exit${C_RESET}"
