@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + WireGuard + Vira7 + ViraTCP + HAProxy + Real-IP multi-tunnel manager v8.9.0
+# GRE + WireGuard + Vira7 + ViraTCP + HAProxy + Real-IP multi-tunnel manager v8.9.1
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
@@ -24,7 +24,7 @@ set -euo pipefail
 #   preserves the original client source IP, has independent persistence/self-heal, one-time Kharej
 #   return-policy routing, and safe per-port switching HAProxy <-> Real-IP without removing HAProxy.
 
-APP_VERSION="8.9.0"
+APP_VERSION="8.9.1"
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -1667,13 +1667,34 @@ wg_list_tunnels() {
   done <<< "$ids"
 }
 
+# WireGuard Real-IP mode is needed only on the KHAREJ receiver. The Iran side
+# still sends DNAT traffic to the peer inner /32, so its normal peer /32 is enough.
+# On Kharej, forwarded packets arrive with arbitrary real client source addresses;
+# WireGuard therefore needs to trust those source addresses for the Iran peer.
+# Table=off prevents AllowedIPs=0.0.0.0/0 from creating/changing the host default route.
+wg_realip_marker_file() {
+  echo "$REALIP_CONFIG_DIR/wireguard-$1.enabled"
+}
+
+wg_realip_mode_enabled() {
+  validate_tunnel_id "${1:-}" || return 1
+  [ -f "$(wg_realip_marker_file "$1")" ]
+}
+
 wg_write_config() {
   local id="$1"
-  local private_file conf allowed_ips private_key endpoint_ip endpoint_mode_note mtu_value
+  local private_file conf allowed_ips private_key endpoint_ip endpoint_mode_note mtu_value table_setting
   private_file="$(wg_private_key_file "$id")"
   conf="$(wg_config_file "$id")"
   private_key="$(cat "$private_file")"
   allowed_ips="$REMOTE_WG_IP/32"
+  table_setting=""
+  if wg_realip_mode_enabled "$id"; then
+    # KHAREJ Real-IP mode: accept arbitrary client source IPs from the trusted Iran peer
+    # and allow replies to any client destination through this WireGuard peer.
+    allowed_ips="0.0.0.0/0"
+    table_setting="Table = off"
+  fi
   endpoint_ip="$(wg_auto_endpoint_ip)"
   endpoint_mode_note="${WG_ENDPOINT_MODE:-public}"
   mtu_value="${WG_MTU:-1420}"
@@ -1684,7 +1705,7 @@ wg_write_config() {
     echo "WireGuard endpoint IP is empty. Cannot write config." >&2
     return 1
   fi
-  if [ -n "${EXTRA_ALLOWED_IPS:-}" ]; then
+  if ! wg_realip_mode_enabled "$id" && [ -n "${EXTRA_ALLOWED_IPS:-}" ]; then
     allowed_ips="$allowed_ips, $EXTRA_ALLOWED_IPS"
   fi
 
@@ -1697,6 +1718,7 @@ PrivateKey = $private_key
 Address = $LOCAL_WG_IP
 ListenPort = $LOCAL_WG_PORT
 MTU = $mtu_value
+$table_setting
 
 [Peer]
 PublicKey = $REMOTE_WG_PUBLIC_KEY
@@ -5778,7 +5800,7 @@ haproxy_menu() {
 
 
 # -----------------------------
-# Real-IP L3 port forward manager (v8.9.0)
+# Real-IP L3 port forward manager (v8.9.1)
 # -----------------------------
 # This is intentionally independent from HAProxy:
 #   HAProxy : local proxy connection + optional UDP DNAT/SNAT companion
@@ -5844,10 +5866,10 @@ realip_write_entries_file() {
   fi
 }
 
-# Resolve a Real-IP target to an L3 tunnel. The current WireGuard implementation
-# intentionally uses peer /32 AllowedIPs, so arbitrary Internet-destination
-# reply packets cannot be sent through it without changing WG semantics. For
-# safety, Real-IP therefore supports GRE, Vira7 and ViraTCP here.
+# Resolve a Real-IP target to any managed L3 tunnel. WireGuard is safe on the
+# Iran sender with its normal peer /32 because DNAT targets the peer inner IP.
+# The required broad peer acceptance/return selection is enabled only on KHAREJ
+# by the Real-IP return-routing toggle (AllowedIPs=0.0.0.0/0 + Table=off).
 realip_resolve_target() {
   local target="$1" i inv_target route ifc local_ip
   REALIP_IFACE=""; REALIP_LOCAL_IP=""; REALIP_TYPE=""; REALIP_ID=""
@@ -5857,16 +5879,12 @@ realip_resolve_target() {
     inv_target="${INV_TARGET[$i]:-}"; inv_target="${inv_target%%/*}"
     [ "$inv_target" = "$target" ] || continue
     case "${INV_TYPE[$i]:-}" in
-      gre|vira7|viratcp)
+      gre|wireguard|vira7|viratcp)
         REALIP_IFACE="${INV_IFACE[$i]:-}"
         REALIP_LOCAL_IP="${INV_LOCAL[$i]:-}"; REALIP_LOCAL_IP="${REALIP_LOCAL_IP%%/*}"
         REALIP_TYPE="${INV_TYPE[$i]}"
         REALIP_ID="${INV_ID[$i]}"
         [ -n "$REALIP_IFACE" ] && validate_ipv4 "$REALIP_LOCAL_IP" && return 0
-        ;;
-      wireguard)
-        err_msg "Real-IP target $target is WireGuard. This script keeps WireGuard AllowedIPs at peer /32, so Real-IP return traffic is not enabled for WireGuard. Use GRE, Vira7 or ViraTCP."
-        return 1
         ;;
     esac
   done
@@ -5878,6 +5896,7 @@ realip_resolve_target() {
   local_ip="$(awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}' <<< "$route")"
   case "$ifc" in
     gre*) REALIP_TYPE="gre"; REALIP_ID="${ifc#gre}" ;;
+    wgtun*) REALIP_TYPE="wireguard"; REALIP_ID="${ifc#wgtun}" ;;
     vira7*) REALIP_TYPE="vira7"; REALIP_ID="${ifc#vira7}" ;;
     viratcp*) REALIP_TYPE="viratcp"; REALIP_ID="${ifc#viratcp}" ;;
     *) return 1 ;;
@@ -5889,7 +5908,7 @@ realip_resolve_target() {
 realip_prompt_target_ip() {
   haproxy_prompt_target_ip "Select Real-IP target tunnel number or enter tunnel IPv4" || return $?
   if ! realip_resolve_target "$HAP_TARGET_IP"; then
-    err_msg "Selected target cannot be used by the Real-IP engine. Pick a GRE, Vira7 or ViraTCP remote tunnel IP."
+    err_msg "Selected target cannot be used by the Real-IP engine. Pick a GRE, WireGuard, Vira7 or ViraTCP remote tunnel IP."
     return 1
   fi
   REALIP_TARGET_IP="$HAP_TARGET_IP"
@@ -6043,6 +6062,7 @@ realip_route_numbers() {
     gre) basep=25000; baset=51000 ;;
     vira7) basep=25300; baset=52000 ;;
     viratcp) basep=25600; baset=53000 ;;
+    wireguard) basep=25900; baset=54000 ;;
     *) return 1 ;;
   esac
   REALIP_ROUTE_PRIO=$((basep + id))
@@ -6059,13 +6079,70 @@ realip_cleanup_return_routing() {
     [[ "$table" =~ ^[0-9]+$ ]] || continue
     if { [ "$prio" -ge 25001 ] && [ "$prio" -le 25254 ] && [ "$table" -ge 51001 ] && [ "$table" -le 51254 ]; } \
        || { [ "$prio" -ge 25301 ] && [ "$prio" -le 25554 ] && [ "$table" -ge 52001 ] && [ "$table" -le 52254 ]; } \
-       || { [ "$prio" -ge 25601 ] && [ "$prio" -le 25854 ] && [ "$table" -ge 53001 ] && [ "$table" -le 53254 ]; }; then
+       || { [ "$prio" -ge 25601 ] && [ "$prio" -le 25854 ] && [ "$table" -ge 53001 ] && [ "$table" -le 53254 ]; } \
+       || { [ "$prio" -ge 25901 ] && [ "$prio" -le 26154 ] && [ "$table" -ge 54001 ] && [ "$table" -le 54254 ]; }; then
       # Delete only the matching reserved priority/table pair; do not sweep any
       # unrelated rule that might coincidentally share the same priority.
       ip rule del priority "$prio" lookup "$table" 2>/dev/null || true
       ip route flush table "$table" 2>/dev/null || true
     fi
   done < <(ip -4 rule show 2>/dev/null)
+}
+
+# Enable the minimum WireGuard change needed for Real-IP on KHAREJ.
+# This does NOT alter the Iran peer, public endpoint, keys, ports, or transport.
+realip_wg_enable_kharej_mode() {
+  local id="$1" ifc marker peer
+  validate_tunnel_id "$id" || return 1
+  wg_load_meta "$id" || return 1
+  [ "${ROLE:-}" = "2" ] || return 1
+  peer="${REMOTE_WG_PUBLIC_KEY:-}"
+  [ -n "$peer" ] || { warn_msg "WireGuard $id is pending a peer key; Real-IP WG mode skipped."; return 1; }
+  marker="$(wg_realip_marker_file "$id")"
+  mkdir -p "$REALIP_CONFIG_DIR"
+  printf 'enabled\n' > "$marker"
+  chmod 600 "$marker"
+
+  # Persist Table=off + AllowedIPs=0/0 for future wg-quick restarts.
+  wg_write_config "$id" >/dev/null || return 1
+  ifc="$(wg_iface_name "$id")"
+
+  # Apply the AllowedIPs change live without bouncing the tunnel. Existing routes
+  # are left untouched; Table=off is already persisted for the next restart.
+  if command -v wg >/dev/null 2>&1 && ip link show "$ifc" >/dev/null 2>&1; then
+    wg set "$ifc" peer "$peer" allowed-ips 0.0.0.0/0 >/dev/null 2>&1 || {
+      warn_msg "Could not apply WireGuard $id Real-IP AllowedIPs live; restarting only $ifc."
+      wg_restart_one_tunnel "$id" >/dev/null || return 1
+    }
+  fi
+  return 0
+}
+
+realip_wg_disable_kharej_mode() {
+  local id="$1" ifc marker peer remote_inner
+  validate_tunnel_id "$id" || return 1
+  wg_load_meta "$id" || return 1
+  [ "${ROLE:-}" = "2" ] || return 0
+  peer="${REMOTE_WG_PUBLIC_KEY:-}"
+  remote_inner="${REMOTE_WG_IP:-}"; remote_inner="${remote_inner%%/*}"
+  marker="$(wg_realip_marker_file "$id")"
+  rm -f "$marker"
+  wg_write_config "$id" >/dev/null || true
+  ifc="$(wg_iface_name "$id")"
+  if command -v wg >/dev/null 2>&1 && [ -n "$peer" ] && validate_ipv4 "$remote_inner" && ip link show "$ifc" >/dev/null 2>&1; then
+    wg set "$ifc" peer "$peer" allowed-ips "$remote_inner/32" >/dev/null 2>&1 || true
+  fi
+}
+
+realip_wg_disable_all_kharej_modes() {
+  local ids id
+  ids="$(wg_collect_ids 2>/dev/null || true)"
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    if wg_load_meta "$id" 2>/dev/null && [ "${ROLE:-}" = "2" ]; then
+      realip_wg_disable_kharej_mode "$id" || true
+    fi
+  done <<< "$ids"
 }
 
 realip_apply_return_routing() {
@@ -6078,9 +6155,12 @@ realip_apply_return_routing() {
   local i type id role ifc local_ip remote_ip applied=0
   for i in "${!INV_TYPE[@]}"; do
     type="${INV_TYPE[$i]:-}"; id="${INV_ID[$i]:-}"
-    case "$type" in gre|vira7|viratcp) ;; *) continue ;; esac
+    case "$type" in gre|wireguard|vira7|viratcp) ;; *) continue ;; esac
     role="$(realip_saved_role_for_item "$type" "$id" 2>/dev/null || true)"
     [ "$role" = "2" ] || continue
+    if [ "$type" = "wireguard" ]; then
+      realip_wg_enable_kharej_mode "$id" || { warn_msg "Return route skipped for WireGuard$id: Real-IP peer mode could not be enabled."; continue; }
+    fi
     ifc="${INV_IFACE[$i]:-}"
     local_ip="${INV_LOCAL[$i]:-}"; local_ip="${local_ip%%/*}"
     remote_ip="${INV_TARGET[$i]:-}"; remote_ip="${remote_ip%%/*}"
@@ -6097,7 +6177,7 @@ realip_apply_return_routing() {
     applied=$((applied + 1))
   done
   ip route flush cache 2>/dev/null || true
-  [ "$applied" -gt 0 ] || { warn_msg "Real-IP return routing is enabled, but no Kharej-role GRE/Vira7/ViraTCP tunnel was available."; return 1; }
+  [ "$applied" -gt 0 ] || { warn_msg "Real-IP return routing is enabled, but no Kharej-role GRE/WireGuard/Vira7/ViraTCP tunnel was available."; return 1; }
   return 0
 }
 
@@ -6107,10 +6187,17 @@ realip_return_routing_healthy() {
   local i type id role ifc local_ip found=0
   for i in "${!INV_TYPE[@]}"; do
     type="${INV_TYPE[$i]:-}"; id="${INV_ID[$i]:-}"
-    case "$type" in gre|vira7|viratcp) ;; *) continue ;; esac
+    case "$type" in gre|wireguard|vira7|viratcp) ;; *) continue ;; esac
     role="$(realip_saved_role_for_item "$type" "$id" 2>/dev/null || true)"
     [ "$role" = "2" ] || continue
     found=1
+    if [ "$type" = "wireguard" ]; then
+      wg_realip_mode_enabled "$id" || return 1
+      grep -Eq '^[[:space:]]*Table[[:space:]]*=[[:space:]]*off[[:space:]]*$' "$(wg_config_file "$id")" 2>/dev/null || return 1
+      if command -v wg >/dev/null 2>&1 && ip link show "$(wg_iface_name "$id")" >/dev/null 2>&1; then
+        wg show "$(wg_iface_name "$id")" allowed-ips 2>/dev/null | grep -Eq '(^|[[:space:]])0\.0\.0\.0/0([[:space:]]|$)' || return 1
+      fi
+    fi
     ifc="${INV_IFACE[$i]:-}"
     local_ip="${INV_LOCAL[$i]:-}"; local_ip="${local_ip%%/*}"
     realip_route_numbers "$type" "$id" || return 1
@@ -6305,12 +6392,12 @@ realip_enable_return_routing() {
   local i type id role found=0
   for i in "${!INV_TYPE[@]}"; do
     type="${INV_TYPE[$i]:-}"; id="${INV_ID[$i]:-}"
-    case "$type" in gre|vira7|viratcp) ;; *) continue ;; esac
+    case "$type" in gre|wireguard|vira7|viratcp) ;; *) continue ;; esac
     role="$(realip_saved_role_for_item "$type" "$id" 2>/dev/null || true)"
     [ "$role" = "2" ] && { found=1; break; }
   done
   if [ "$found" -ne 1 ]; then
-    err_msg "No Kharej-role GRE/Vira7/ViraTCP tunnel was detected on this server. Enable return routing on the KHAREJ server, not the Iran entry server."
+    err_msg "No Kharej-role GRE/WireGuard/Vira7/ViraTCP tunnel was detected on this server. Enable return routing on the KHAREJ server, not the Iran entry server."
     return 1
   fi
   mkdir -p "$REALIP_CONFIG_DIR"
@@ -6318,12 +6405,13 @@ realip_enable_return_routing() {
   chmod 600 "$REALIP_RETURN_MARKER"
   realip_install_service
   realip_apply_return_routing
-  ok_msg "Kharej Real-IP return routing ENABLED. Future health checks will keep it repaired."
+  ok_msg "Kharej Real-IP return routing ENABLED for GRE/WireGuard/Vira7/ViraTCP. WireGuard uses AllowedIPs=0.0.0.0/0 with Table=off only on this Kharej side."
 }
 
 realip_disable_return_routing() {
   rm -f "$REALIP_RETURN_MARKER"
   realip_cleanup_return_routing
+  realip_wg_disable_all_kharej_modes
   ok_msg "Kharej Real-IP return routing DISABLED on this server. Real-IP port definitions were not deleted."
 }
 
@@ -6359,7 +6447,7 @@ switch_haproxy_to_realip() {
     target="$(awk -v p="$port" '$1==p{print $2; exit}' "$hap_tmp")"
     [ -n "$target" ] || { err_msg "HAProxy port $port was not found."; rm -f "$hap_tmp" "$real_tmp"; return 1; }
     if ! realip_resolve_target "$target" >/dev/null 2>&1; then
-      err_msg "Port $port targets $target, which is not a supported GRE/Vira7/ViraTCP Real-IP path. Nothing was switched."
+      err_msg "Port $port targets $target, which is not a supported/active GRE/WireGuard/Vira7/ViraTCP Real-IP path. Nothing was switched."
       rm -f "$hap_tmp" "$real_tmp"; return 1
     fi
   done
@@ -6386,7 +6474,7 @@ switch_haproxy_to_realip() {
   realip_sync_rules
   rm -f "$hap_tmp" "$real_tmp"
   ok_msg "Switched $selected_count port(s): HAProxy -> Real-IP."
-  info_msg "One-time requirement: on the KHAREJ server open Real-IP Manager and enable 'Kharej return routing'. After that, future switches are done only here."
+  info_msg "One-time requirement: on the KHAREJ server open Real-IP Manager and enable 'Kharej return routing'. WireGuard, if present, is prepared automatically there with Table=off. After that, future switches are done only here."
 }
 
 switch_realip_to_haproxy() {
