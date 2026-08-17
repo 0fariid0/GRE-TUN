@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + WireGuard + Vira7 + ViraTCP + HAProxy + Real-IP multi-tunnel manager v8.9.3
+# GRE + WireGuard + Vira7 + ViraTCP + HAProxy + Real-IP multi-tunnel manager v8.9.4
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
@@ -20,16 +20,18 @@ set -euo pipefail
 #   rebuilds its UDP companion rules, and verifies DNAT/SNAT/FORWARD installation per port
 # - v8.8.3 adds HAProxy UDP auto-heal: the existing 20s health monitor detects missing managed UDP rules
 #   and repairs them immediately, while an hourly systemd timer force-runs the same repair as HAProxy option 8
-# - v8.9.3 makes the proven v8.8.x HAProxy UDP companion engine the ONLY UDP owner for both
-#   HAProxy-TCP rows and Real-IP TCP+UDP rows, removing duplicate/competing Real-IP UDP state.
-#   It also adds numbered/IP-aware switch selection, transactional HAProxy rollback, and an
+# - v8.9.4 makes Real-IP truly source-preserving for BOTH TCP and UDP (no SNAT on either).
+#   Kharej return traffic is pinned to the exact ingress tunnel with CONNMARK/FWMARK policy routing,
+#   which avoids the source-address assumption that caused UDP loss and tunnel-IP observations.
+#   HAProxy keeps its original proven UDP DNAT/SNAT companion engine only for ports still in HAProxy.
+# - v8.9.3 added numbered/IP-aware switch selection, transactional HAProxy rollback, and an
 #   emergency restore-to-HAProxy action.
 # - v8.9.2 kept Real-IP for TCP while restoring the legacy UDP DNAT+SNAT+FORWARD shape.
 # - v8.9.0 adds a separate Real-IP L3 forwarding engine beside HAProxy. It uses DNAT without SNAT,
 #   preserves the original client source IP, has independent persistence/self-heal, one-time Kharej
 #   return-policy routing, and safe per-port switching HAProxy <-> Real-IP without removing HAProxy.
 
-APP_VERSION="8.9.3"
+APP_VERSION="8.9.4"
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -5171,22 +5173,14 @@ haproxy_udp_add_rule() {
     -j ACCEPT
 }
 
-# One UDP owner only: reuse the original/proven HAProxy UDP companion engine
-# for BOTH normal HAProxy TCP rows and Real-IP rows that request TCP+UDP.
-# This prevents two independent repair loops from deleting/replacing each other's rules.
+# The legacy/proven UDP companion engine belongs ONLY to ports that still live
+# in HAProxy. Real-IP has its own source-preserving UDP DNAT/FORWARD rules and
+# must never be SNATed, otherwise Xray/3x-ui sees the tunnel IP instead of the client.
 managed_udp_export_entries() {
-  local h r
+  local h
   h="$(haproxy_export_entries 2>/dev/null || true)"
   if [ -n "$h" ]; then
     awk '{p=$4; if(p=="") p="http"; if(tolower(p)=="tcp") print $1, $2, $3, "tcp"}' <<< "$h"
-  fi
-
-  if [ -f "$REALIP_FORWARDS_FILE" ]; then
-    r="$(realip_export_entries 2>/dev/null || true)"
-    if [ -n "$r" ]; then
-      # Real-IP column 4 = both/tcp. Only "both" needs the legacy UDP companion.
-      awk '{p=tolower($4); if(p=="both") print $1, $2, $3, "tcp"}' <<< "$r"
-    fi
   fi
 }
 
@@ -5228,7 +5222,7 @@ haproxy_sync_udp_rules() {
   done <<< "$entries"
 
   if [ "$count" -gt 0 ]; then
-    ok_msg "Managed UDP forwarding synced for $count port(s) using the original HAProxy DNAT+SNAT+FORWARD engine."
+    ok_msg "Managed HAProxy UDP forwarding synced for $count HAProxy port(s) using the original DNAT+SNAT+FORWARD engine."
   else
     info_msg "Managed UDP rules: none"
   fi
@@ -5708,7 +5702,7 @@ haproxy_repair_udp() {
 
   entries="$(managed_udp_export_unique || true)"
   if [ -z "$entries" ]; then
-    warn_msg "No UDP-enabled HAProxy/Real-IP ports were found."
+    warn_msg "No UDP-enabled HAProxy ports were found."
     return 0
   fi
 
@@ -5994,23 +5988,24 @@ realip_flush_managed_rules() {
 
 realip_add_l4_rule() {
   local l4="$1" port="$2" target="$3" tport="$4" ifc="$5" local_ip="${6:-}"
-  [ "$l4" = "tcp" ] || { err_msg "Internal safety: Real-IP engine only owns TCP rules; UDP must use the legacy managed UDP engine."; return 1; }
+  case "$l4" in tcp|udp) ;; *) err_msg "Internal safety: unsupported Real-IP protocol: $l4"; return 1 ;; esac
 
-  # TCP Real-IP path only: preserve original client source address (NO SNAT).
+  # Source-preserving L3 forward for BOTH TCP and UDP. There is intentionally
+  # NO POSTROUTING/SNAT rule here. Kharej CONNMARK return routing provides symmetry.
   iptables -w 5 -t nat -I PREROUTING 1 \
-    -p tcp --dport "$port" \
-    -m comment --comment "$REALIP_RULE_PREFIX-tcp-pre-$port" \
+    -p "$l4" --dport "$port" \
+    -m comment --comment "$REALIP_RULE_PREFIX-$l4-pre-$port" \
     -j DNAT --to-destination "$target:$tport"
 
   iptables -w 5 -I FORWARD 1 \
-    -o "$ifc" -p tcp -d "$target" --dport "$tport" \
-    -m comment --comment "$REALIP_RULE_PREFIX-tcp-out-$port" \
+    -o "$ifc" -p "$l4" -d "$target" --dport "$tport" \
+    -m comment --comment "$REALIP_RULE_PREFIX-$l4-out-$port" \
     -j ACCEPT
 
   iptables -w 5 -I FORWARD 1 \
-    -i "$ifc" -p tcp -s "$target" --sport "$tport" \
+    -i "$ifc" -p "$l4" -s "$target" --sport "$tport" \
     -m conntrack --ctstate ESTABLISHED,RELATED \
-    -m comment --comment "$REALIP_RULE_PREFIX-tcp-back-$port" \
+    -m comment --comment "$REALIP_RULE_PREFIX-$l4-back-$port" \
     -j ACCEPT
 }
 
@@ -6019,11 +6014,12 @@ realip_sync_rules() {
   enable_ip_forward
   apply_tunnel_sysctls
 
-  # This also removes stale v8.9.0-v8.9.2 Real-IP UDP rules. From v8.9.3 onward
-  # Real-IP owns TCP only and the original HAProxy UDP engine owns every UDP companion.
+  # Remove stale Real-IP rules from every previous 8.9.x implementation first.
+  # HAProxy's own UDP rules are rebuilt separately and remain untouched for HAProxy rows.
   realip_flush_managed_rules
+  haproxy_sync_udp_rules || true
 
-  local entries port target tport proto restore count=0 skipped=0
+  local entries port target tport proto restore count=0 udp_count=0 skipped=0
   entries="$(realip_export_entries || true)"
   if [ -n "$entries" ]; then
     while read -r port target tport proto restore; do
@@ -6034,39 +6030,43 @@ realip_sync_rules() {
         continue
       fi
       realip_add_l4_rule tcp "$port" "$target" "$tport" "$REALIP_IFACE" "$REALIP_LOCAL_IP" || {
-        skipped=$((skipped + 1))
-        continue
+        skipped=$((skipped + 1)); continue;
       }
+      if [ "$(realip_normalize_proto "$proto")" = "both" ]; then
+        if realip_add_l4_rule udp "$port" "$target" "$tport" "$REALIP_IFACE" "$REALIP_LOCAL_IP"; then
+          udp_count=$((udp_count + 1))
+        else
+          skipped=$((skipped + 1))
+        fi
+      fi
       count=$((count + 1))
     done <<< "$entries"
   fi
 
-  # Always rebuild UDP once, using ONE proven owner for both engines.
-  haproxy_sync_udp_rules || skipped=$((skipped + 1))
-
-  [ "$count" -eq 0 ] || ok_msg "Real-IP TCP rules synchronized for $count port(s); client source IP preserved."
-  [ "$skipped" -eq 0 ] || warn_msg "$skipped Real-IP/UDP synchronization issue(s) detected."
+  [ "$count" -eq 0 ] || ok_msg "Real-IP TCP rules synchronized for $count port(s); no SNAT."
+  [ "$udp_count" -eq 0 ] || ok_msg "Real-IP UDP rules synchronized for $udp_count port(s); no SNAT."
+  [ "$skipped" -eq 0 ] || warn_msg "$skipped Real-IP synchronization issue(s) detected."
   [ "$skipped" -eq 0 ]
 }
 
 realip_rule_exists_l4() {
   local l4="$1" port="$2" target="$3" tport="$4" ifc="$5" local_ip="${6:-}"
-  [ "$l4" = "tcp" ] || return 1
+  case "$l4" in tcp|udp) ;; *) return 1 ;; esac
 
   iptables -w 5 -t nat -C PREROUTING \
-    -p tcp --dport "$port" \
-    -m comment --comment "$REALIP_RULE_PREFIX-tcp-pre-$port" \
+    -p "$l4" --dport "$port" \
+    -m comment --comment "$REALIP_RULE_PREFIX-$l4-pre-$port" \
     -j DNAT --to-destination "$target:$tport" 2>/dev/null || return 1
 
   iptables -w 5 -C FORWARD \
-    -o "$ifc" -p tcp -d "$target" --dport "$tport" \
-    -m comment --comment "$REALIP_RULE_PREFIX-tcp-out-$port" \
+    -o "$ifc" -p "$l4" -d "$target" --dport "$tport" \
+    -m comment --comment "$REALIP_RULE_PREFIX-$l4-out-$port" \
     -j ACCEPT 2>/dev/null || return 1
 
   iptables -w 5 -C FORWARD \
-    -i "$ifc" -p tcp -s "$target" --sport "$tport" \
+    -i "$ifc" -p "$l4" -s "$target" --sport "$tport" \
     -m conntrack --ctstate ESTABLISHED,RELATED \
-    -m comment --comment "$REALIP_RULE_PREFIX-tcp-back-$port" \
+    -m comment --comment "$REALIP_RULE_PREFIX-$l4-back-$port" \
     -j ACCEPT 2>/dev/null
 }
 
@@ -6079,8 +6079,32 @@ realip_rules_healthy() {
     [ -n "${port:-}" ] || continue
     realip_resolve_target "$target" >/dev/null 2>&1 || return 1
     realip_rule_exists_l4 tcp "$port" "$target" "$tport" "$REALIP_IFACE" "$REALIP_LOCAL_IP" || return 1
+    if [ "$(realip_normalize_proto "$proto")" = "both" ]; then
+      realip_rule_exists_l4 udp "$port" "$target" "$tport" "$REALIP_IFACE" "$REALIP_LOCAL_IP" || return 1
+    fi
   done <<< "$entries"
   return 0
+}
+
+# NAT/conntrack decisions are sticky for an existing flow. When a port moves
+# from HAProxy/SNAT to Real-IP/no-SNAT, delete only that port's existing flows
+# when conntrack-tools is available so the very next connection uses new rules.
+realip_flush_conntrack_ports() {
+  command -v conntrack >/dev/null 2>&1 || return 0
+  local ports="${1:-}" p
+  for p in $ports; do
+    validate_port "$p" || continue
+    conntrack -D -p tcp --dport "$p" >/dev/null 2>&1 || true
+    conntrack -D -p udp --dport "$p" >/dev/null 2>&1 || true
+  done
+}
+
+realip_flush_all_conntrack() {
+  local entries ports
+  entries="$(realip_export_entries || true)"
+  [ -n "$entries" ] || return 0
+  ports="$(awk '{print $1}' <<< "$entries" | tr '\n' ' ')"
+  realip_flush_conntrack_ports "$ports"
 }
 
 realip_config_file_for_item() {
@@ -6106,16 +6130,17 @@ realip_saved_role_for_item() {
 # Reserve only three narrow priority bands and matching private table bands.
 # A rule is considered ours only when BOTH its priority and lookup table match.
 realip_route_numbers() {
-  local type="$1" id="$2" basep baset
+  local type="$1" id="$2" basep baset markoff
   case "$type" in
-    gre) basep=25000; baset=51000 ;;
-    vira7) basep=25300; baset=52000 ;;
-    viratcp) basep=25600; baset=53000 ;;
-    wireguard) basep=25900; baset=54000 ;;
+    gre) basep=25000; baset=51000; markoff=$((0x0000)) ;;
+    vira7) basep=25300; baset=52000; markoff=$((0x0100)) ;;
+    viratcp) basep=25600; baset=53000; markoff=$((0x0200)) ;;
+    wireguard) basep=25900; baset=54000; markoff=$((0x0300)) ;;
     *) return 1 ;;
   esac
   REALIP_ROUTE_PRIO=$((basep + id))
   REALIP_ROUTE_TABLE=$((baset + id))
+  REALIP_ROUTE_MARK=$((0x470000 + markoff + id))
 }
 
 realip_cleanup_return_routing() {
@@ -6136,6 +6161,13 @@ realip_cleanup_return_routing() {
       ip route flush table "$table" 2>/dev/null || true
     fi
   done < <(ip -4 rule show 2>/dev/null)
+
+  # Remove only our connection-mark routing hooks. These comments are private
+  # to GRE-TUN Real-IP and do not touch unrelated mangle rules.
+  if command -v iptables >/dev/null 2>&1; then
+    realip_delete_commented_rules mangle PREROUTING "$REALIP_RULE_PREFIX-ret-"
+    realip_delete_commented_rules mangle OUTPUT "$REALIP_RULE_PREFIX-ret-"
+  fi
 }
 
 # Enable the minimum WireGuard change needed for Real-IP on KHAREJ.
@@ -6218,11 +6250,30 @@ realip_apply_return_routing() {
     tunnel_iface_is_up "$ifc" || { warn_msg "Return route skipped for $type$id: $ifc is down."; continue; }
     realip_route_numbers "$type" "$id" || continue
 
-    # The peer /32 keeps the tunnel peer reachable inside the dedicated table;
-    # arbitrary client destinations are then sent back through the same L3 tunnel.
+    # Connection-symmetric return routing: mark tracked connections when they enter
+    # Kharej from this tunnel, copy the connection mark onto locally-generated
+    # replies, and route that mark back through the exact same tunnel. This works
+    # even when Xray chooses a source address other than the tunnel inner IP.
+    modprobe nf_conntrack >/dev/null 2>&1 || true
+    modprobe xt_connmark >/dev/null 2>&1 || true
+    modprobe xt_mark >/dev/null 2>&1 || true
+
+    iptables -w 5 -t mangle -I PREROUTING 1 \
+      -i "$ifc" -m conntrack --ctstate NEW,ESTABLISHED,RELATED \
+      -m comment --comment "$REALIP_RULE_PREFIX-ret-in-$type-$id" \
+      -j CONNMARK --set-xmark "$REALIP_ROUTE_MARK/0xffffffff"
+
+    iptables -w 5 -t mangle -I OUTPUT 1 \
+      -m connmark --mark "$REALIP_ROUTE_MARK/0xffffffff" \
+      -m comment --comment "$REALIP_RULE_PREFIX-ret-out-$type-$id" \
+      -j MARK --set-xmark "$REALIP_ROUTE_MARK/0xffffffff"
+
+    # Keep the inner peer reachable and send only packets carrying this tunnel's
+    # connection mark through the dedicated table. Normal Kharej traffic keeps
+    # using the server's ordinary default route.
     ip route replace "$remote_ip/32" dev "$ifc" scope link table "$REALIP_ROUTE_TABLE"
     ip route replace default dev "$ifc" table "$REALIP_ROUTE_TABLE"
-    ip rule add priority "$REALIP_ROUTE_PRIO" from "$local_ip/32" lookup "$REALIP_ROUTE_TABLE"
+    ip rule add priority "$REALIP_ROUTE_PRIO" fwmark "$REALIP_ROUTE_MARK/0xffffffff" lookup "$REALIP_ROUTE_TABLE"
     applied=$((applied + 1))
   done
   ip route flush cache 2>/dev/null || true
@@ -6250,8 +6301,16 @@ realip_return_routing_healthy() {
     ifc="${INV_IFACE[$i]:-}"
     local_ip="${INV_LOCAL[$i]:-}"; local_ip="${local_ip%%/*}"
     realip_route_numbers "$type" "$id" || return 1
-    ip -4 rule show 2>/dev/null | grep -Eq "^${REALIP_ROUTE_PRIO}:.*from ${local_ip}([ /]|$).*lookup ${REALIP_ROUTE_TABLE}([[:space:]]|$)" || return 1
+    ip -4 rule show 2>/dev/null | grep -Eqi "^${REALIP_ROUTE_PRIO}:.*fwmark (0x)?$(printf '%x' "$REALIP_ROUTE_MARK").*lookup ${REALIP_ROUTE_TABLE}([[:space:]]|$)" || return 1
     ip -4 route show table "$REALIP_ROUTE_TABLE" 2>/dev/null | grep -Eq "^default .*dev ${ifc}([[:space:]]|$)" || return 1
+    iptables -w 5 -t mangle -C PREROUTING \
+      -i "$ifc" -m conntrack --ctstate NEW,ESTABLISHED,RELATED \
+      -m comment --comment "$REALIP_RULE_PREFIX-ret-in-$type-$id" \
+      -j CONNMARK --set-xmark "$REALIP_ROUTE_MARK/0xffffffff" 2>/dev/null || return 1
+    iptables -w 5 -t mangle -C OUTPUT \
+      -m connmark --mark "$REALIP_ROUTE_MARK/0xffffffff" \
+      -m comment --comment "$REALIP_RULE_PREFIX-ret-out-$type-$id" \
+      -j MARK --set-xmark "$REALIP_ROUTE_MARK/0xffffffff" 2>/dev/null || return 1
   done
   [ "$found" -eq 1 ]
 }
@@ -6300,7 +6359,7 @@ realip_self_heal_check() {
 }
 
 realip_list_forwards() {
-  echo -e "${C_BOLD}${C_WHITE}Real-IP forwarded ports (TCP direct / shared stable UDP):${C_RESET}"
+  echo -e "${C_BOLD}${C_WHITE}Real-IP forwarded ports (TCP/UDP direct, source-preserving):${C_RESET}"
   local entries proto restore
   entries="$(realip_export_entries || true)"
   if [ -z "$entries" ]; then warn_msg "No Real-IP forwarded ports configured."; return 0; fi
@@ -6352,7 +6411,7 @@ realip_add_port() {
   realip_write_entries_file "$tmp"; rm -f "$tmp"
   realip_install_service
   realip_sync_rules
-  ok_msg "Applied ${#HAP_PORTS[@]} Real-IP port(s) -> $REALIP_TARGET_IP. TCP client source IP is preserved; UDP is handled by the original shared HAProxy companion engine."
+  ok_msg "Applied ${#HAP_PORTS[@]} Real-IP port(s) -> $REALIP_TARGET_IP. TCP/UDP client source IP is preserved; Kharej CONNMARK return routing is required."
 }
 
 realip_change_all_ips() {
@@ -6428,6 +6487,7 @@ realip_change_protocol() {
 realip_repair() {
   realip_install_service
   realip_sync_all
+  realip_flush_all_conntrack
   if realip_rules_healthy && realip_return_routing_healthy; then
     ok_msg "Real-IP repair/verification completed successfully."
   else
@@ -6617,11 +6677,13 @@ switch_haproxy_to_realip() {
     return 1
   fi
 
-  # One final shared UDP rebuild after both tables contain their final state.
+  # Finalize HAProxy UDP state after selected rows left HAProxy, then drop stale
+  # conntrack entries so old SNAT mappings cannot survive the engine switch.
   haproxy_sync_udp_rules >/dev/null 2>&1 || true
+  realip_flush_conntrack_ports "${ports[*]}"
   rm -f "$hap_tmp" "$real_tmp" "$hap_before" "$real_before"
   ok_msg "Switched $selected_count port(s): HAProxy -> Real-IP."
-  info_msg "TCP uses Real-IP/no-SNAT. UDP uses the exact original HAProxy UDP companion engine."
+  info_msg "TCP and UDP use Real-IP DNAT/FORWARD with NO SNAT; Kharej CONNMARK routing must be enabled."
 }
 
 switch_realip_to_haproxy() {
@@ -6709,7 +6771,7 @@ realip_menu() {
   mkdir -p "$REALIP_CONFIG_DIR"
   while true; do
     show_header "Real-IP Port Forward Manager"
-    echo -e "${C_BOLD}${C_WHITE}Real-IP Menu (TCP real IP + original shared UDP engine)${C_RESET}"
+    echo -e "${C_BOLD}${C_WHITE}Real-IP Menu (TCP + UDP real client IP / no SNAT)${C_RESET}"
     echo -e "  ${C_GREEN}1)${C_RESET} list forwarded ports"
     echo -e "  ${C_GREEN}2)${C_RESET} add/update port(s) ${C_DIM}(comma/space supported)${C_RESET}"
     echo -e "  ${C_YELLOW}3)${C_RESET} change ALL target IPs"
@@ -6747,7 +6809,7 @@ show_menu() {
   echo -e "  ${C_CYAN}4)${C_RESET} ping test tunnels"
   echo -e "  ${C_MAGENTA}5)${C_RESET} haproxy port manager"
   echo -e "  ${C_BLUE}6)${C_RESET} optimize Vira7 CPU"
-  echo -e "  ${C_GREEN}7)${C_RESET} Real-IP port manager ${C_DIM}(TCP real IP + original UDP engine)${C_RESET}"
+  echo -e "  ${C_GREEN}7)${C_RESET} Real-IP port manager ${C_DIM}(TCP + UDP real IP / no SNAT)${C_RESET}"
   echo -e "  ${C_YELLOW}8)${C_RESET} switch forwarding engine ${C_DIM}(HAProxy <-> Real-IP)${C_RESET}"
   echo -e "  ${C_DIM}00) Main menu / back${C_RESET}"
   echo -e "  ${C_DIM}0) Exit${C_RESET}"
