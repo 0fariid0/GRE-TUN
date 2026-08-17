@@ -20,11 +20,13 @@ set -euo pipefail
 #   rebuilds its UDP companion rules, and verifies DNAT/SNAT/FORWARD installation per port
 # - v8.8.3 adds HAProxy UDP auto-heal: the existing 20s health monitor detects missing managed UDP rules
 #   and repairs them immediately, while an hourly systemd timer force-runs the same repair as HAProxy option 8
+# - v8.9.2 keeps Real-IP for TCP while restoring the proven legacy UDP DNAT+SNAT+FORWARD path
+#   for TCP rows, fixing UDP reliability without removing or changing the existing HAProxy engine.
 # - v8.9.0 adds a separate Real-IP L3 forwarding engine beside HAProxy. It uses DNAT without SNAT,
 #   preserves the original client source IP, has independent persistence/self-heal, one-time Kharej
 #   return-policy routing, and safe per-port switching HAProxy <-> Real-IP without removing HAProxy.
 
-APP_VERSION="8.9.1"
+APP_VERSION="8.9.2"
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -5949,16 +5951,29 @@ realip_delete_commented_rules() {
 realip_flush_managed_rules() {
   command -v iptables >/dev/null 2>&1 || return 0
   realip_delete_commented_rules nat PREROUTING "$REALIP_RULE_PREFIX-"
+  realip_delete_commented_rules nat POSTROUTING "$REALIP_RULE_PREFIX-"
   realip_delete_commented_rules filter FORWARD "$REALIP_RULE_PREFIX-"
 }
 
 realip_add_l4_rule() {
-  local l4="$1" port="$2" target="$3" tport="$4" ifc="$5"
-  # IMPORTANT: there is deliberately no POSTROUTING SNAT rule here.
+  local l4="$1" port="$2" target="$3" tport="$4" ifc="$5" local_ip="${6:-}"
+
+  # TCP Real-IP path: preserve the original client source address (NO SNAT).
+  # UDP compatibility path: use the exact proven HAProxy companion design
+  # (DNAT + tunnel-source SNAT + FORWARD). In this deployment UDP was reliable
+  # with that design, while pure no-SNAT UDP could return outside the tunnel.
   iptables -w 5 -t nat -I PREROUTING 1 \
     -p "$l4" --dport "$port" \
     -m comment --comment "$REALIP_RULE_PREFIX-$l4-pre-$port" \
     -j DNAT --to-destination "$target:$tport"
+
+  if [ "$l4" = "udp" ]; then
+    validate_ipv4 "$local_ip" || { err_msg "Real-IP UDP port $port: invalid tunnel source IP '$local_ip'."; return 1; }
+    iptables -w 5 -t nat -I POSTROUTING 1 \
+      -o "$ifc" -p udp -d "$target" --dport "$tport" \
+      -m comment --comment "$REALIP_RULE_PREFIX-udp-post-$port" \
+      -j SNAT --to-source "$local_ip"
+  fi
 
   iptables -w 5 -I FORWARD 1 \
     -o "$ifc" -p "$l4" -d "$target" --dport "$tport" \
@@ -5989,29 +6004,43 @@ realip_sync_rules() {
       skipped=$((skipped + 1))
       continue
     fi
-    realip_add_l4_rule tcp "$port" "$target" "$tport" "$REALIP_IFACE"
+    realip_add_l4_rule tcp "$port" "$target" "$tport" "$REALIP_IFACE" "$REALIP_LOCAL_IP"
     if [ "$(realip_normalize_proto "$proto")" = "both" ]; then
-      realip_add_l4_rule udp "$port" "$target" "$tport" "$REALIP_IFACE"
+      # Remove any old equivalent un-commented companion rule, then install
+      # our separately tagged stable UDP companion. HAProxy rules themselves
+      # are already removed by the engine switch and use a different marker.
+      haproxy_udp_remove_equivalent_rules "$port" "$target" "$tport" "$REALIP_IFACE" "$REALIP_LOCAL_IP"
+      realip_add_l4_rule udp "$port" "$target" "$tport" "$REALIP_IFACE" "$REALIP_LOCAL_IP"
     fi
     count=$((count + 1))
   done <<< "$entries"
 
-  [ "$count" -eq 0 ] || ok_msg "Real-IP rules synchronized for $count port(s); source IP preservation is ON and no SNAT rule was added."
+  [ "$count" -eq 0 ] || ok_msg "Real-IP rules synchronized for $count port(s): TCP preserves client IP; UDP uses the proven stable tunnel-SNAT companion."
   [ "$skipped" -eq 0 ] || warn_msg "$skipped Real-IP port(s) could not be synchronized."
   [ "$skipped" -eq 0 ]
 }
 
 realip_rule_exists_l4() {
-  local l4="$1" port="$2" target="$3" tport="$4" ifc="$5"
+  local l4="$1" port="$2" target="$3" tport="$4" ifc="$5" local_ip="${6:-}"
   iptables -w 5 -t nat -C PREROUTING \
     -p "$l4" --dport "$port" \
     -m comment --comment "$REALIP_RULE_PREFIX-$l4-pre-$port" \
-    -j DNAT --to-destination "$target:$tport" 2>/dev/null \
-  && iptables -w 5 -C FORWARD \
+    -j DNAT --to-destination "$target:$tport" 2>/dev/null || return 1
+
+  if [ "$l4" = "udp" ]; then
+    validate_ipv4 "$local_ip" || return 1
+    iptables -w 5 -t nat -C POSTROUTING \
+      -o "$ifc" -p udp -d "$target" --dport "$tport" \
+      -m comment --comment "$REALIP_RULE_PREFIX-udp-post-$port" \
+      -j SNAT --to-source "$local_ip" 2>/dev/null || return 1
+  fi
+
+  iptables -w 5 -C FORWARD \
     -o "$ifc" -p "$l4" -d "$target" --dport "$tport" \
     -m comment --comment "$REALIP_RULE_PREFIX-$l4-out-$port" \
-    -j ACCEPT 2>/dev/null \
-  && iptables -w 5 -C FORWARD \
+    -j ACCEPT 2>/dev/null || return 1
+
+  iptables -w 5 -C FORWARD \
     -i "$ifc" -p "$l4" -s "$target" --sport "$tport" \
     -m conntrack --ctstate ESTABLISHED,RELATED \
     -m comment --comment "$REALIP_RULE_PREFIX-$l4-back-$port" \
@@ -6026,9 +6055,9 @@ realip_rules_healthy() {
   while read -r port target tport proto restore; do
     [ -n "${port:-}" ] || continue
     realip_resolve_target "$target" >/dev/null 2>&1 || return 1
-    realip_rule_exists_l4 tcp "$port" "$target" "$tport" "$REALIP_IFACE" || return 1
+    realip_rule_exists_l4 tcp "$port" "$target" "$tport" "$REALIP_IFACE" "$REALIP_LOCAL_IP" || return 1
     if [ "$(realip_normalize_proto "$proto")" = "both" ]; then
-      realip_rule_exists_l4 udp "$port" "$target" "$tport" "$REALIP_IFACE" || return 1
+      realip_rule_exists_l4 udp "$port" "$target" "$tport" "$REALIP_IFACE" "$REALIP_LOCAL_IP" || return 1
     fi
   done <<< "$entries"
   return 0
@@ -6303,7 +6332,7 @@ realip_add_port() {
   realip_write_entries_file "$tmp"; rm -f "$tmp"
   realip_install_service
   realip_sync_rules
-  ok_msg "Applied ${#HAP_PORTS[@]} Real-IP port(s) -> $REALIP_TARGET_IP. Client source IP is preserved."
+  ok_msg "Applied ${#HAP_PORTS[@]} Real-IP port(s) -> $REALIP_TARGET_IP. TCP client source IP is preserved; UDP uses stable tunnel-SNAT compatibility."
 }
 
 realip_change_all_ips() {
@@ -6474,7 +6503,7 @@ switch_haproxy_to_realip() {
   realip_sync_rules
   rm -f "$hap_tmp" "$real_tmp"
   ok_msg "Switched $selected_count port(s): HAProxy -> Real-IP."
-  info_msg "One-time requirement: on the KHAREJ server open Real-IP Manager and enable 'Kharej return routing'. WireGuard, if present, is prepared automatically there with Table=off. After that, future switches are done only here."
+  info_msg "One-time requirement for TCP Real-IP: on the KHAREJ server open Real-IP Manager and enable 'Kharej return routing'. UDP compatibility does not depend on that return rule because it intentionally uses the proven tunnel-source SNAT path."
 }
 
 switch_realip_to_haproxy() {
@@ -6546,7 +6575,7 @@ realip_menu() {
   mkdir -p "$REALIP_CONFIG_DIR"
   while true; do
     show_header "Real-IP Port Forward Manager"
-    echo -e "${C_BOLD}${C_WHITE}Real-IP Menu (DNAT without SNAT)${C_RESET}"
+    echo -e "${C_BOLD}${C_WHITE}Real-IP Menu (TCP preserves IP + stable UDP companion)${C_RESET}"
     echo -e "  ${C_GREEN}1)${C_RESET} list forwarded ports"
     echo -e "  ${C_GREEN}2)${C_RESET} add/update port(s) ${C_DIM}(comma/space supported)${C_RESET}"
     echo -e "  ${C_YELLOW}3)${C_RESET} change ALL target IPs"
@@ -6584,7 +6613,7 @@ show_menu() {
   echo -e "  ${C_CYAN}4)${C_RESET} ping test tunnels"
   echo -e "  ${C_MAGENTA}5)${C_RESET} haproxy port manager"
   echo -e "  ${C_BLUE}6)${C_RESET} optimize Vira7 CPU"
-  echo -e "  ${C_GREEN}7)${C_RESET} Real-IP port manager ${C_DIM}(DNAT without SNAT)${C_RESET}"
+  echo -e "  ${C_GREEN}7)${C_RESET} Real-IP port manager ${C_DIM}(TCP real IP + stable UDP)${C_RESET}"
   echo -e "  ${C_YELLOW}8)${C_RESET} switch forwarding engine ${C_DIM}(HAProxy <-> Real-IP)${C_RESET}"
   echo -e "  ${C_DIM}00) Main menu / back${C_RESET}"
   echo -e "  ${C_DIM}0) Exit${C_RESET}"
