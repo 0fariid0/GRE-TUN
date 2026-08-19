@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + WireGuard + Vira7 + ViraTCP + HAProxy + Real-IP multi-tunnel manager v8.9.2
+# GRE + WireGuard + Vira7 + ViraTCP + HAProxy + Real-IP multi-tunnel manager v8.9.3
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
@@ -27,8 +27,12 @@ set -euo pipefail
 #   UDP is explicit/optional, Switch uses numbered ALL selection, and Real-IP menus are grouped more clearly.
 # - v8.9.2 fixes Real-IP handshake spikes by adding automatic TCP MSS clamping
 #   on DNAT-forwarded paths and MTU-aware Kharej return routes.
+# - v8.9.3 fixes GRE false-positive self-heal resets: an UP GRE is no longer
+#   deleted/recreated merely because the peer does not answer inner ICMP.
+#   Live interface traffic is treated as positive health, while destructive
+#   recreation is reserved for a missing/down GRE interface.
 
-APP_VERSION="8.9.2"
+APP_VERSION="8.9.3"
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -605,6 +609,21 @@ quick_tunnel_ping() {
   ping -n -I "$ifc" -c 1 -W 2 "$target" >/dev/null 2>&1
 }
 
+# Read kernel byte counters without resetting or touching the interface.
+# GRE itself has no handshake/state like WireGuard; an inner ICMP failure is
+# therefore not enough evidence to destroy an otherwise UP interface.
+gre_iface_byte_counters() {
+  local ifc="${1:-}" rx_file tx_file rx tx
+  [ -n "$ifc" ] || return 1
+  rx_file="/sys/class/net/$ifc/statistics/rx_bytes"
+  tx_file="/sys/class/net/$ifc/statistics/tx_bytes"
+  [ -r "$rx_file" ] && [ -r "$tx_file" ] || return 1
+  rx="$(cat "$rx_file" 2>/dev/null)" || return 1
+  tx="$(cat "$tx_file" 2>/dev/null)" || return 1
+  [[ "$rx" =~ ^[0-9]+$ && "$tx" =~ ^[0-9]+$ ]] || return 1
+  printf '%s %s\n' "$rx" "$tx"
+}
+
 health_counter_reset() {
   local kind="$1" id="$2"
   rm -f "$HEALTH_STATE_DIR/${kind}-${id}.fail" 2>/dev/null || true
@@ -680,10 +699,11 @@ EOF_HEALTH_TIMER
 
 # GRE uses a persistent supervisor instead of a oneshot service. A oneshot unit
 # can remain "active" after the kernel interface has disappeared, which prevents
-# systemd from repairing it. The supervisor verifies both interface presence and
-# inner reachability, then recreates only this GRE and restarts dependent WG.
+# systemd from repairing it. Inner ICMP is treated only as a soft health signal:
+# GRE is destructively recreated only when the kernel interface is missing/down.
 gre_supervisor() {
-  local id="${1:-}" ifc target failures=0
+  local id="${1:-}" ifc target failures=0 warned=0
+  local last_rx="" last_tx="" rx="" tx="" traffic_seen=0
   validate_tunnel_id "$id" || return 1
   trap 'exit 0' TERM INT HUP
 
@@ -697,25 +717,57 @@ gre_supervisor() {
     apply_tunnel_sysctls
     ensure_public_endpoint_route "${REMOTE_PUBLIC_IP:-}" "${LOCAL_PUBLIC_IP:-}"
 
+    # Hard failure: the kernel interface is actually missing or administratively down.
+    # This is the only condition where the supervisor performs a destructive rebuild.
     if ! tunnel_iface_is_up "$ifc"; then
       echo "GRE supervisor: $ifc is missing/down; recreating tunnel $id" >&2
       if gre_create_tunnel 0; then
         failures=0
+        warned=0
+        last_rx=""
+        last_tx=""
         restart_wg_dependents_for_transport gre "$id"
       else
         sleep "$GRE_SUPERVISOR_INTERVAL"
         continue
       fi
-    elif quick_tunnel_ping "$ifc" "$target"; then
-      failures=0
     else
-      failures=$((failures + 1))
-      if [ "$failures" -ge "$GRE_SUPERVISOR_FAIL_LIMIT" ]; then
-        echo "GRE supervisor: tunnel $id failed $failures health checks; recreating" >&2
-        if gre_create_tunnel 0; then
-          restart_wg_dependents_for_transport gre "$id"
+      rx=""; tx=""; traffic_seen=0
+      if read -r rx tx < <(gre_iface_byte_counters "$ifc" 2>/dev/null); then
+        if [[ "$last_rx" =~ ^[0-9]+$ && "$last_tx" =~ ^[0-9]+$ ]]; then
+          # A rising RX or TX counter proves that the interface is carrying traffic.
+          # Also tolerate an external counter reset/recreation without triggering a
+          # second rebuild from this supervisor.
+          if [ "$rx" -gt "$last_rx" ] || [ "$tx" -gt "$last_tx" ]; then
+            traffic_seen=1
+          elif [ "$rx" -lt "$last_rx" ] || [ "$tx" -lt "$last_tx" ]; then
+            echo "GRE supervisor: $ifc counters reset externally; keeping current UP interface" >&2
+            failures=0
+            warned=0
+          fi
         fi
+      fi
+
+      if quick_tunnel_ping "$ifc" "$target"; then
         failures=0
+        warned=0
+      elif [ "$traffic_seen" -eq 1 ]; then
+        # The peer may intentionally block ICMP. Real GRE traffic is a stronger
+        # health signal than a failed ping, so never flap the interface here.
+        failures=0
+        warned=0
+      else
+        failures=$((failures + 1))
+        if [ "$failures" -ge "$GRE_SUPERVISOR_FAIL_LIMIT" ] && [ "$warned" -eq 0 ]; then
+          echo "GRE supervisor: tunnel $id has no inner ICMP reply for $failures checks, but $ifc is UP; keeping it (ICMP may be blocked/idle)" >&2
+          echo "GRE supervisor: destructive recreate is reserved for a missing/down interface to avoid traffic-counter resets and tunnel flapping" >&2
+          warned=1
+        fi
+      fi
+
+      if [[ "$rx" =~ ^[0-9]+$ && "$tx" =~ ^[0-9]+$ ]]; then
+        last_rx="$rx"
+        last_tx="$tx"
       fi
     fi
 
@@ -1253,7 +1305,7 @@ gre_check_one_tunnel() {
         echo "GRE inner tunnel is UP"
       else
         cat /tmp/gre_ping_$$.log
-        echo "GRE inner tunnel seems DOWN"
+        echo "No GRE inner ICMP reply (not conclusive: the peer may block ping while GRE traffic still works)"
       fi
       rm -f /tmp/gre_ping_$$.log
     else
