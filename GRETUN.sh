@@ -27,12 +27,12 @@ set -euo pipefail
 #   UDP is explicit/optional, Switch uses numbered ALL selection, and Real-IP menus are grouped more clearly.
 # - v8.9.2 fixes Real-IP handshake spikes by adding automatic TCP MSS clamping
 #   on DNAT-forwarded paths and MTU-aware Kharej return routes.
-# - v8.9.3 fixes GRE false-positive self-heal resets: an UP GRE is no longer
-#   deleted/recreated merely because the peer does not answer inner ICMP.
-#   Live interface traffic is treated as positive health, while destructive
-#   recreation is reserved for a missing/down GRE interface.
-
-APP_VERSION="8.9.3"
+# - v8.9.3 prevents GRE flapping when inner ICMP is blocked by treating traffic as a stronger health signal.
+# - v8.9.4 hardens GRE lifecycle: avoids health-timer/supervisor races, stops supervisors before reset/update,
+#   and safely restores the old saved tunnel if an interactive update fails.
+# - v8.9.5 adds a PID-based maintenance guard so the 20s health timer cannot restart GRE services
+#   in the middle of an intentional reset/update; stale guards self-clean if the manager exits unexpectedly.
+APP_VERSION="8.9.5"
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -45,6 +45,7 @@ HEALTH_SERVICE_UNIT="/etc/systemd/system/gretun-health.service"
 HEALTH_TIMER_UNIT="/etc/systemd/system/gretun-health.timer"
 HEALTH_STATE_DIR="/run/gretun-health"
 HEALTH_FAIL_LIMIT=3
+MAINTENANCE_PID_FILE="/run/gretun-maintenance.pid"
 SELF_RAW_URL="https://raw.githubusercontent.com/0fariid0/GRE-TUN/refs/heads/main/GRETUN.sh"
 
 WG_META_DIR="/etc/wgtun-tunnels"
@@ -640,6 +641,29 @@ health_counter_fail() {
   printf '%s\n' "$count"
 }
 
+gretun_maintenance_active() {
+  local pid=""
+  [ -r "$MAINTENANCE_PID_FILE" ] || return 1
+  pid="$(cat "$MAINTENANCE_PID_FILE" 2>/dev/null || true)"
+  if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$MAINTENANCE_PID_FILE" 2>/dev/null || true
+  return 1
+}
+
+gretun_maintenance_begin() {
+  printf '%s\n' "$$" > "$MAINTENANCE_PID_FILE" 2>/dev/null || true
+}
+
+gretun_maintenance_end() {
+  local pid=""
+  pid="$(cat "$MAINTENANCE_PID_FILE" 2>/dev/null || true)"
+  if [ "$pid" = "$$" ]; then
+    rm -f "$MAINTENANCE_PID_FILE" 2>/dev/null || true
+  fi
+}
+
 restart_wg_dependents_for_transport() {
   local transport_type="$1" transport_id="$2"
   local ids wg_id svc
@@ -797,6 +821,11 @@ EOF_SERVICE
 }
 
 tunnel_health_check_all() {
+  # Do not fight an intentional reset/update. The guard contains the manager
+  # PID, so a stale file is automatically removed if that process no longer exists.
+  if gretun_maintenance_active; then
+    return 0
+  fi
   local lockdir="/run/gretun-health.lock"
   mkdir "$lockdir" 2>/dev/null || return 0
   trap 'rmdir /run/gretun-health.lock 2>/dev/null || true' EXIT
@@ -812,7 +841,11 @@ tunnel_health_check_all() {
     svc="$(gre_service_name "$id")"
     if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
       ifc="$(gre_iface "$id")"
-      if ! systemctl is-active --quiet "$svc" 2>/dev/null || ! tunnel_iface_is_up "$ifc"; then
+      # The persistent GRE supervisor owns interface repair. Restarting an
+      # already-active service merely because the interface is momentarily
+      # missing races with the supervisor's own gre_create_tunnel() and can
+      # leave a tunnel flapping. Only revive a service that is actually down.
+      if ! systemctl is-active --quiet "$svc" 2>/dev/null; then
         systemctl restart "$svc" >/dev/null 2>&1 || true
       fi
     fi
@@ -1275,7 +1308,28 @@ gre_menu_config_tunnel() {
   prompt_remote_public_ip "$existing_remote_ip" || return
 
   echo
-  gre_create_tunnel 1 || echo "GRE tunnel creation failed"
+  # Updating an existing GRE while its persistent supervisor is running creates
+  # a race: gre_create_tunnel() deletes/re-adds the interface while the
+  # supervisor may simultaneously try to heal it. Stop only this tunnel's
+  # supervisor for the short update window. The old saved config is still on
+  # disk until gre_create_tunnel(1) succeeds and saves the new values, so a
+  # failed update can safely restore the previous tunnel.
+  local update_svc update_was_active=0
+  gretun_maintenance_begin
+  update_svc="$(gre_service_name "$TUNNEL_ID")"
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$update_svc" 2>/dev/null; then
+    update_was_active=1
+    systemctl stop "$update_svc" 2>/dev/null || true
+  fi
+
+  if ! gre_create_tunnel 1; then
+    echo "GRE tunnel creation failed"
+    if [ "$update_was_active" -eq 1 ] && command -v systemctl >/dev/null 2>&1; then
+      warn_msg "Update failed; restoring tunnel $TUNNEL_ID from its previous saved config."
+      systemctl restart "$update_svc" 2>/dev/null || true
+    fi
+  fi
+  gretun_maintenance_end
 }
 
 gre_check_one_tunnel() {
@@ -4697,9 +4751,13 @@ reset_all_tunnels() {
     return
   fi
 
+  # Block the periodic health job from reviving an enabled GRE service while
+  # this function intentionally has it stopped for reset.
+  gretun_maintenance_begin
+
   echo
   echo "Stopping WireGuard, Vira7, and ViraTCP first..."
-  local ids id
+  local ids id gre_ids
 
   ids="$(wg_collect_ids || true)"
   while IFS= read -r id; do
@@ -4724,17 +4782,26 @@ reset_all_tunnels() {
   done <<< "$ids"
 
   echo "Stopping GRE tunnels..."
-  ids="$(gre_collect_ids || true)"
+  # Capture IDs before touching interfaces. Most importantly, stop each
+  # persistent supervisor before deleting its GRE interface. The old reset path
+  # deleted greN while gre-tunnel@N.service was still running, so the supervisor
+  # could recreate the interface in parallel with this reset and cause random
+  # File-exists failures / inactive tunnels.
+  gre_ids="$(gre_collect_ids || true)"
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    systemctl stop "$(gre_service_name "$id")" 2>/dev/null || true
+  done <<< "$gre_ids"
+
   while IFS= read -r id; do
     [ -n "$id" ] || continue
     ip link set dev "$(gre_iface "$id")" down 2>/dev/null || true
     ip tunnel del "$(gre_iface "$id")" 2>/dev/null || true
     ip link delete "$(gre_iface "$id")" 2>/dev/null || true
-  done <<< "$ids"
+  done <<< "$gre_ids"
 
   echo
   echo "Starting GRE tunnels..."
-  ids="$(gre_collect_ids || true)"
   while IFS= read -r id; do
     [ -n "$id" ] || continue
     if gre_load_config "$id"; then
@@ -4742,9 +4809,13 @@ reset_all_tunnels() {
         echo "[OK] GRE tunnel $id reset"
       else
         echo "[WARN] GRE tunnel $id reset failed"
+        # Do not leave a previously enabled tunnel silently down. The service
+        # uses the saved config and will keep retrying if the network is not ready.
+        systemctl enable "$(gre_service_name "$id")" >/dev/null 2>&1 || true
+        systemctl restart "$(gre_service_name "$id")" >/dev/null 2>&1 || true
       fi
     fi
-  done <<< "$ids"
+  done <<< "$gre_ids"
 
   echo
   echo "Starting Vira7 tunnels..."
@@ -4787,6 +4858,7 @@ reset_all_tunnels() {
   done <<< "$ids"
 
   echo
+  gretun_maintenance_end
   echo "[OK] Reset all finished."
 }
 
