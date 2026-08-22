@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + WireGuard + Vira7 + ViraTCP + HAProxy multi-tunnel manager v8.8.2
+# GRE + WireGuard + Vira7 + Reverse ViraTCP + HAProxy + Kernel Real-IP manager v9.0.0
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
@@ -20,8 +20,21 @@ set -euo pipefail
 #   rebuilds its UDP companion rules, and verifies DNAT/SNAT/FORWARD installation per port
 # - v8.8.3 adds HAProxy UDP auto-heal: the existing 20s health monitor detects missing managed UDP rules
 #   and repairs them immediately, while an hourly systemd timer force-runs the same repair as HAProxy option 8
+# - v8.9.0 adds a separate Real-IP L3 forwarding engine beside HAProxy. It uses DNAT without SNAT,
+#   preserves the original client source IP, has independent persistence/self-heal, one-time Kharej
+#   return-policy routing, and safe per-port switching HAProxy <-> Real-IP without removing HAProxy.
+# - v8.9.1 makes Real-IP safer for handshake-sensitive setups: TCP-only is now the default,
+#   UDP is explicit/optional, Switch uses numbered ALL selection, and Real-IP menus are grouped more clearly.
+# - v8.9.2 fixes Real-IP handshake spikes by adding automatic TCP MSS clamping
+#   on DNAT-forwarded paths and MTU-aware Kharej return routes.
+# - v9.0.0 makes Real-IP the low-CPU, no-PROXY-protocol path for 3x-ui/Xray,
+#   adds transactional HAProxy <-> Real-IP switching with verified rollback,
+#   hardens tunnel listeners to the configured peer, removes the unused Vira7
+#   CPU menu, and exposes ViraTCP as a reverse L3 tunnel that carries TCP+UDP.
+# - v9.0.0 also removes the static ViraTCP wire magic so a session no longer
+#   starts every encrypted frame with a fixed, easily fingerprinted marker.
 
-APP_VERSION="8.8.3"
+APP_VERSION="9.0.0"
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -51,10 +64,8 @@ VIRA7_DEFAULT_PORT_BASE=5571
 VIRA7_DEFAULT_KEEPALIVE=5
 VIRA7_DEFAULT_BUFFER_SIZE=2097152
 VIRA7_DEFAULT_QUEUE_LEN=1000
-# Vira7 CPU optimization defaults:
-# checksum=1 keeps packet format compatible with older engines.
-# verify_checksum=0 trusts UDP checksum and skips expensive userspace checksum validation on receive.
-# batch=128 drains packet bursts per select() wakeup and reduces syscall/loop overhead.
+# Vira7 runtime defaults are fixed at creation time; there is no separate CPU
+# tuning menu in v9.0.0. These values preserve the existing packet format.
 VIRA7_DEFAULT_CHECKSUM=1
 VIRA7_DEFAULT_VERIFY_CHECKSUM=0
 VIRA7_DEFAULT_BATCH=128
@@ -82,6 +93,20 @@ HAPROXY_UDP_REPAIR_SERVICE_NAME="gretun-haproxy-udp-repair.service"
 HAPROXY_UDP_REPAIR_SERVICE_UNIT="/etc/systemd/system/${HAPROXY_UDP_REPAIR_SERVICE_NAME}"
 HAPROXY_UDP_REPAIR_TIMER_NAME="gretun-haproxy-udp-repair.timer"
 HAPROXY_UDP_REPAIR_TIMER_UNIT="/etc/systemd/system/${HAPROXY_UDP_REPAIR_TIMER_NAME}"
+
+# Real-IP forwarding is a completely separate forwarding engine. It never
+# replaces HAProxy globally: each local port can live in HAProxy or Real-IP.
+# Real-IP keeps the client source address by doing DNAT + FORWARD only (no SNAT).
+# Because Real-IP no longer terminates TCP like HAProxy, it must clamp MSS on
+# GRE/TUN paths to avoid fragmented TLS/WS handshakes and repeated retries.
+REALIP_CONFIG_DIR="/etc/gretun-realip"
+REALIP_FORWARDS_FILE="$REALIP_CONFIG_DIR/forwards.conf"
+REALIP_BACKUP_DIR="$REALIP_CONFIG_DIR/backups"
+REALIP_RETURN_MARKER="$REALIP_CONFIG_DIR/return-routing.enabled"
+REALIP_SERVICE_NAME="gretun-realip.service"
+REALIP_SERVICE_UNIT="/etc/systemd/system/${REALIP_SERVICE_NAME}"
+REALIP_RULE_PREFIX="gretun-realip"
+FORWARD_SWITCH_LOCK="/run/gretun-forward-switch.lock"
 
 # Color/theme helpers
 if [ -t 1 ]; then
@@ -250,7 +275,7 @@ ask_tunnel_type() {
   echo "1) Normal GRE tunnel"
   echo "2) WireGuard tunnel"
   echo "3) Vira7 UDP-TUN tunnel"
-  echo "4) ViraTCP encrypted TCP-TUN (anti UDP/GRE filtering)"
+  echo "4) Reverse ViraTCP encrypted TCP-TUN (Iran dials out; carries TCP + UDP)"
   echo
   read -rp "Choose [1-4] (00=menu): " TUNNEL_TYPE_CHOICE
   if is_main_menu_token "$TUNNEL_TYPE_CHOICE"; then return_main_msg; return 99; fi
@@ -298,7 +323,7 @@ write_var() {
 # a complete regular-file copy instead; for normal file execution copy locally.
 install_manager_binary() {
   local source_path="${BASH_SOURCE[0]:-$0}"
-  local target_dir tmp
+  local target_dir tmp candidate_version
   target_dir="$(dirname "$INSTALL_BIN")"
   tmp="${INSTALL_BIN}.tmp.$$"
 
@@ -323,6 +348,12 @@ install_manager_binary() {
 
   [ -s "$tmp" ] || { rm -f "$tmp"; return 1; }
   bash -n "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; return 1; }
+  candidate_version="$(sed -n 's/^APP_VERSION="\([^"]*\)"/\1/p' "$tmp" | head -n1)"
+  if [ "$candidate_version" != "$APP_VERSION" ]; then
+    err_msg "Persistent manager version mismatch: running $APP_VERSION but downloaded ${candidate_version:-UNKNOWN}. Upload v$APP_VERSION to the configured raw URL first, or run this script from a local file."
+    rm -f "$tmp"
+    return 1
+  fi
   chmod 755 "$tmp" || { rm -f "$tmp"; return 1; }
   mv -f "$tmp" "$INSTALL_BIN"
 }
@@ -416,13 +447,13 @@ firewall_allow_udp_port_and_ip() {
   local ifc="${5:-}"
 
   if command -v iptables >/dev/null 2>&1; then
-    iptables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || iptables -A INPUT -p udp --dport "$port" -j ACCEPT || true
     if [ -n "$peer_ip" ] && validate_ipv4 "$peer_ip"; then
-      iptables -C INPUT -s "$peer_ip" -p udp --dport "$port" -j ACCEPT 2>/dev/null || iptables -A INPUT -s "$peer_ip" -p udp --dport "$port" -j ACCEPT || true
+      iptables -C INPUT -s "$peer_ip" -p udp --dport "$port" -m comment --comment "gretun-peer-udp-$port" -j ACCEPT 2>/dev/null \
+        || iptables -A INPUT -s "$peer_ip" -p udp --dport "$port" -m comment --comment "gretun-peer-udp-$port" -j ACCEPT || true
       iptables -C OUTPUT -d "$peer_ip" -p udp --dport "$peer_port" -j ACCEPT 2>/dev/null || iptables -A OUTPUT -d "$peer_ip" -p udp --dport "$peer_port" -j ACCEPT || true
-      # Also allow the peer IP generally, because some providers/firewalls filter before interface rules.
-      iptables -C INPUT -s "$peer_ip" -j ACCEPT 2>/dev/null || iptables -A INPUT -s "$peer_ip" -j ACCEPT || true
-      iptables -C OUTPUT -d "$peer_ip" -j ACCEPT 2>/dev/null || iptables -A OUTPUT -d "$peer_ip" -j ACCEPT || true
+    else
+      iptables -C INPUT -p udp --dport "$port" -m comment --comment "gretun-any-udp-$port" -j ACCEPT 2>/dev/null \
+        || iptables -A INPUT -p udp --dport "$port" -m comment --comment "gretun-any-udp-$port" -j ACCEPT || true
     fi
     if [ -n "$ifc" ]; then
       iptables -C INPUT -i "$ifc" -j ACCEPT 2>/dev/null || iptables -A INPUT -i "$ifc" -j ACCEPT || true
@@ -433,10 +464,11 @@ firewall_allow_udp_port_and_ip() {
   fi
 
   if command -v ufw >/dev/null 2>&1; then
-    ufw allow "$port/udp" >/dev/null 2>&1 || true
     if [ -n "$peer_ip" ] && validate_ipv4 "$peer_ip"; then
-      ufw allow from "$peer_ip" >/dev/null 2>&1 || true
+      ufw allow from "$peer_ip" to any port "$port" proto udp >/dev/null 2>&1 || true
       ufw allow out to "$peer_ip" port "$peer_port" proto udp >/dev/null 2>&1 || true
+    else
+      ufw allow "$port/udp" >/dev/null 2>&1 || true
     fi
     if [ -n "$ifc" ]; then
       ufw allow in on "$ifc" >/dev/null 2>&1 || true
@@ -455,13 +487,16 @@ firewall_allow_tcp_port_and_ip() {
 
   if command -v iptables >/dev/null 2>&1; then
     if [ "$listen_mode" = "1" ]; then
-      iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || iptables -A INPUT -p tcp --dport "$port" -j ACCEPT || true
+      if [ -n "$peer_ip" ] && validate_ipv4 "$peer_ip"; then
+        iptables -C INPUT -s "$peer_ip" -p tcp --dport "$port" -m comment --comment "gretun-peer-tcp-$port" -j ACCEPT 2>/dev/null \
+          || iptables -A INPUT -s "$peer_ip" -p tcp --dport "$port" -m comment --comment "gretun-peer-tcp-$port" -j ACCEPT || true
+      else
+        iptables -C INPUT -p tcp --dport "$port" -m comment --comment "gretun-any-tcp-$port" -j ACCEPT 2>/dev/null \
+          || iptables -A INPUT -p tcp --dport "$port" -m comment --comment "gretun-any-tcp-$port" -j ACCEPT || true
+      fi
     fi
     if [ -n "$peer_ip" ] && validate_ipv4 "$peer_ip"; then
       iptables -C OUTPUT -d "$peer_ip" -p tcp --dport "$port" -j ACCEPT 2>/dev/null || iptables -A OUTPUT -d "$peer_ip" -p tcp --dport "$port" -j ACCEPT || true
-      if [ "$listen_mode" = "1" ]; then
-        iptables -C INPUT -s "$peer_ip" -p tcp --dport "$port" -j ACCEPT 2>/dev/null || iptables -A INPUT -s "$peer_ip" -p tcp --dport "$port" -j ACCEPT || true
-      fi
     fi
     if [ -n "$ifc" ]; then
       iptables -C INPUT -i "$ifc" -j ACCEPT 2>/dev/null || iptables -A INPUT -i "$ifc" -j ACCEPT || true
@@ -472,10 +507,11 @@ firewall_allow_tcp_port_and_ip() {
   fi
 
   if command -v ufw >/dev/null 2>&1; then
-    if [ "$listen_mode" = "1" ]; then ufw allow "$port/tcp" >/dev/null 2>&1 || true; fi
     if [ -n "$peer_ip" ] && validate_ipv4 "$peer_ip"; then
       ufw allow out to "$peer_ip" port "$port" proto tcp >/dev/null 2>&1 || true
       if [ "$listen_mode" = "1" ]; then ufw allow from "$peer_ip" to any port "$port" proto tcp >/dev/null 2>&1 || true; fi
+    elif [ "$listen_mode" = "1" ]; then
+      ufw allow "$port/tcp" >/dev/null 2>&1 || true
     fi
     if [ -n "$ifc" ]; then ufw allow in on "$ifc" >/dev/null 2>&1 || true; fi
   fi
@@ -530,6 +566,7 @@ net.ipv4.ip_forward=1
 net.ipv4.conf.all.rp_filter=0
 net.ipv4.conf.default.rp_filter=0
 net.ipv4.conf.all.src_valid_mark=1
+net.ipv4.tcp_mtu_probing=1
 EOF_SYSCTL
   fi
 
@@ -537,6 +574,7 @@ EOF_SYSCTL
   sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true
   sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true
   sysctl -w net.ipv4.conf.all.src_valid_mark=1 >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.tcp_mtu_probing=1 >/dev/null 2>&1 || true
 
   local rp
   for rp in /proc/sys/net/ipv4/conf/*/rp_filter; do
@@ -840,6 +878,10 @@ tunnel_health_check_all() {
   # when all four managed rules exist for every TCP row, nothing is changed.
   # If firewall/NAT rules disappear, run the same rebuild+verify logic as menu option 8.
   haproxy_udp_self_heal_check || true
+
+  # Real-IP has its own rule namespace and health check. When configured, repair
+  # its DNAT/FORWARD rules and (on Kharej) the source-policy return route.
+  realip_self_heal_check || true
 }
 
 bootstrap_runtime_repairs() {
@@ -871,6 +913,13 @@ bootstrap_runtime_repairs() {
   # automatically on the next manager launch; no need to enter the HAProxy menu.
   if [ -f "$HAPROXY_CONFIG" ] && command -v haproxy >/dev/null 2>&1; then
     haproxy_install_udp_service >/dev/null 2>&1 || true
+  fi
+
+  # Restore Real-IP forwarding/return-routing after upgrades or reboot only if
+  # the operator has configured this separate engine.
+  if [ -s "$REALIP_FORWARDS_FILE" ] || [ -f "$REALIP_RETURN_MARKER" ]; then
+    realip_install_service >/dev/null 2>&1 || true
+    realip_sync_all >/dev/null 2>&1 || true
   fi
 }
 
@@ -1886,7 +1935,7 @@ wg_choose_auto_endpoint() {
 wg_menu_config_tunnel() {
   show_header "Configure WireGuard Tunnel"
   prompt_role || return
-  local selected_role existing_local_ip existing_remote_ip existing_peer_key remote_ip_input
+  local selected_role existing_local_ip existing_remote_ip existing_peer_key
   selected_role="$ROLE"
   echo
   prompt_tunnel_id "Enter WireGuard tunnel number before IP [1-254]: " || return
@@ -1894,7 +1943,7 @@ wg_menu_config_tunnel() {
   existing_local_ip=""
   existing_remote_ip=""
   existing_peer_key=""
-  local previous_endpoint_mode previous_endpoint_ip previous_transport_iface gre_saved_remote vira_saved_remote
+  local previous_endpoint_mode previous_endpoint_ip previous_transport_iface gre_saved_remote vira_saved_remote gre_cfg vira_cfg
   previous_endpoint_mode=""
   previous_endpoint_ip=""
   previous_transport_iface=""
@@ -1915,9 +1964,18 @@ wg_menu_config_tunnel() {
   REMOTE_WG_PUBLIC_KEY="$existing_peer_key"
 
   # Try to reuse the remote public IP saved by same-number GRE or Vira7 tunnel.
-  # Run these in subshells so tunnel variables do not overwrite the selected WireGuard role.
-  gre_saved_remote="$(bash -c 'set -e; f="'"$GRE_CONFIG_DIR""'/tunnel-'"$TUNNEL_ID""'.conf"; [ -f "$f" ] && . "$f" && printf "%s" "${REMOTE_PUBLIC_IP:-}"' 2>/dev/null || true)"
-  vira_saved_remote="$(bash -c 'set -e; f="'"$VIRA7_CONFIG_DIR""'/tunnel-'"$TUNNEL_ID""'.conf"; [ -f "$f" ] && . "$f" && printf "%s" "${REMOTE_PUBLIC_IP:-${remote_ip:-}}"' 2>/dev/null || true)"
+  # Source a fixed validated path in a subshell so config variables cannot leak
+  # into the selected WireGuard role and no shell command is assembled as text.
+  gre_cfg="$GRE_CONFIG_DIR/tunnel-$TUNNEL_ID.conf"
+  vira_cfg="$VIRA7_CONFIG_DIR/tunnel-$TUNNEL_ID.conf"
+  if [ -f "$gre_cfg" ]; then
+    # shellcheck disable=SC1090
+    gre_saved_remote="$(unset REMOTE_PUBLIC_IP; source "$gre_cfg"; printf '%s' "${REMOTE_PUBLIC_IP:-}")"
+  fi
+  if [ -f "$vira_cfg" ]; then
+    # shellcheck disable=SC1090
+    vira_saved_remote="$(unset REMOTE_PUBLIC_IP remote_ip; source "$vira_cfg"; printf '%s' "${REMOTE_PUBLIC_IP:-${remote_ip:-}}")"
+  fi
   if [ -z "$existing_remote_ip" ] && [ -n "$gre_saved_remote" ]; then
     existing_remote_ip="$gre_saved_remote"
   fi
@@ -2700,7 +2758,7 @@ static int tun_alloc_named(const char *dev) {
 static void cleanup_iface(const char *iface) {
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "ip link del %s 2>/dev/null", iface);
-    system(cmd);
+    int rc = system(cmd); (void)rc;
 }
 
 static int configure_tun(const v7_config_t *c) {
@@ -2779,8 +2837,8 @@ int main(int argc, char **argv) {
     signal(SIGTERM, on_signal);
     signal(SIGPIPE, SIG_IGN);
     mkdir("/dev/net", 0755);
-    if (access(TUN_DEVICE, F_OK) != 0) system("mknod /dev/net/tun c 10 200 2>/dev/null || true");
-    system("modprobe tun 2>/dev/null || true");
+    if (access(TUN_DEVICE, F_OK) != 0) { int rc = system("mknod /dev/net/tun c 10 200 2>/dev/null || true"); (void)rc; }
+    { int rc = system("modprobe tun 2>/dev/null || true"); (void)rc; }
     cleanup_iface(cfg.iface);
     int tun_fd = tun_alloc_named(cfg.iface);
     if (tun_fd < 0) return 1;
@@ -2851,7 +2909,10 @@ int main(int argc, char **argv) {
                     memcpy(&remote, &sender, sizeof(remote));
                     remote_known = 1;
                 }
-                if (type == PKT_DATA && len > 0) write(tun_fd, payload, len);
+                if (type == PKT_DATA && len > 0) {
+                    ssize_t written = write(tun_fd, payload, len);
+                    if (written != (ssize_t)len) continue;
+                }
                 else if (type == PKT_KEEPALIVE && remote_known) send_v7(udp_fd, &remote, PKT_ACK, NULL, 0);
             }
         }
@@ -3202,82 +3263,6 @@ vira7_restart_one_tunnel() {
 }
 
 
-set_config_kv() {
-  local file="$1" key="$2" value="$3"
-  [ -f "$file" ] || return 1
-  if grep -q "^${key}=" "$file" 2>/dev/null; then
-    sed -i "s|^${key}=.*|${key}=${value}|" "$file"
-  else
-    printf '%s=%s\n' "$key" "$value" >> "$file"
-  fi
-}
-
-vira7_optimize_cpu_one() {
-  local id="$1" mode="${2:-safe}" file svc
-  validate_tunnel_id "$id" || { echo "Invalid Vira7 tunnel number." >&2; return 1; }
-  file="$(vira7_config_file "$id")"
-  svc="$(vira7_service_name "$id")"
-  [ -f "$file" ] || { echo "No Vira7 config found: $file" >&2; return 1; }
-
-  # Always safe: skip userspace receive checksum verification and batch packets.
-  # Fast mode additionally disables checksum generation; use it only when BOTH sides run this optimized engine.
-  set_config_kv "$file" verify_checksum 0
-  set_config_kv "$file" batch 128
-  if [ "$mode" = "fast" ]; then
-    set_config_kv "$file" checksum 0
-  else
-    set_config_kv "$file" checksum 1
-  fi
-
-  echo "Recompiling optimized Vira7 engine..."
-  vira7_compile_engine || return 1
-  enable_ip_forward
-  vira7_apply_firewall_rules "$id" || true
-  systemctl daemon-reload 2>/dev/null || true
-  systemctl enable "$svc" >/dev/null 2>&1 || true
-  if systemctl restart "$svc"; then
-    echo "[OK] Vira7 tunnel $id optimized and restarted. mode=$mode"
-    echo "Current CPU settings:"
-    grep -E '^(checksum|verify_checksum|batch|mtu|port)=' "$file" || true
-    return 0
-  fi
-  echo "[WARN] Restart failed. Last logs:" >&2
-  systemctl status "$svc" --no-pager -l 2>/dev/null || true
-  journalctl -u "$svc" -n 40 --no-pager 2>/dev/null || true
-  return 1
-}
-
-vira7_optimize_cpu_menu() {
-  show_header "Optimize Vira7 CPU"
-  vira7_list_tunnels
-  echo
-  local id mode_choice mode
-  read -rp "Enter Vira7 tunnel number to optimize, 0=all, 00=menu: " id
-  if is_main_menu_token "$id"; then return_main_msg; return 99; fi
-  echo
-  echo "1) Safe low CPU mode (compatible, recommended first)"
-  echo "2) Fast low CPU mode (must be applied on BOTH servers for this Vira7 tunnel)"
-  echo "00) Back to main menu"
-  read -rp "Choose CPU mode [1-2/00]: " mode_choice
-  if is_main_menu_token "$mode_choice"; then return_main_msg; return 99; fi
-  case "$mode_choice" in
-    1) mode="safe" ;;
-    2) mode="fast" ;;
-    *) echo "Invalid mode."; return 1 ;;
-  esac
-  if [ "$id" = "0" ]; then
-    local ids one
-    ids="$(vira7_collect_ids || true)"
-    [ -n "$ids" ] || { echo "No Vira7 tunnels found."; return 0; }
-    while IFS= read -r one; do
-      [ -n "$one" ] && vira7_optimize_cpu_one "$one" "$mode" || true
-    done <<< "$ids"
-  else
-    vira7_optimize_cpu_one "$id" "$mode"
-  fi
-}
-
-
 # -----------------------------
 # ViraTCP encrypted TCP-TUN helpers (tunnel type 4)
 # -----------------------------
@@ -3361,7 +3346,7 @@ viratcp_compile_engine() {
 
 #define TUN_DEVICE "/dev/net/tun"
 #define VT_MAGIC 0x56544350U
-#define VT_VERSION 1U
+#define VT_VERSION 2U
 #define VT_DATA 1U
 #define VT_PING 2U
 #define VT_PONG 3U
@@ -3390,6 +3375,7 @@ typedef struct {
     unsigned char rx_key[32];
     unsigned char tx_nonce_prefix[4];
     unsigned char rx_nonce_prefix[4];
+    unsigned char header_mask[8];
     uint64_t tx_seq;
     uint64_t rx_seq;
 } crypto_state_t;
@@ -3476,13 +3462,15 @@ static void derive_session_value(const unsigned char psk[32], const unsigned cha
 
 static int crypto_init_state(const vt_config_t *cfg, const unsigned char client_nonce[32],
                              const unsigned char server_nonce[32], crypto_state_t *st) {
-    unsigned char psk[32], c2s[32], s2c[32], nc2s[32], ns2c[32];
+    unsigned char psk[32], c2s[32], s2c[32], nc2s[32], ns2c[32], hmask[32];
     if (hex_to_bytes(cfg->psk_hex, psk, sizeof(psk)) != 0) return -1;
     derive_session_value(psk, client_nonce, server_nonce, "viratcp-c2s-key-v1", c2s);
     derive_session_value(psk, client_nonce, server_nonce, "viratcp-s2c-key-v1", s2c);
     derive_session_value(psk, client_nonce, server_nonce, "viratcp-c2s-nonce-v1", nc2s);
     derive_session_value(psk, client_nonce, server_nonce, "viratcp-s2c-nonce-v1", ns2c);
+    derive_session_value(psk, client_nonce, server_nonce, "viratcp-header-mask-v2", hmask);
     memset(st, 0, sizeof(*st)); st->tx_seq = 1; st->rx_seq = 0;
+    memcpy(st->header_mask, hmask, sizeof(st->header_mask));
     if (!strcmp(cfg->mode, "client")) {
         memcpy(st->tx_key, c2s, 32); memcpy(st->rx_key, s2c, 32);
         memcpy(st->tx_nonce_prefix, nc2s, 4); memcpy(st->rx_nonce_prefix, ns2c, 4);
@@ -3492,6 +3480,7 @@ static int crypto_init_state(const vt_config_t *cfg, const unsigned char client_
     }
     OPENSSL_cleanse(psk, sizeof(psk)); OPENSSL_cleanse(c2s, sizeof(c2s)); OPENSSL_cleanse(s2c, sizeof(s2c));
     OPENSSL_cleanse(nc2s, sizeof(nc2s)); OPENSSL_cleanse(ns2c, sizeof(ns2c));
+    OPENSSL_cleanse(hmask, sizeof(hmask));
     return 0;
 }
 
@@ -3504,7 +3493,8 @@ static int tun_alloc_named(const char *dev) {
 }
 
 static void cleanup_iface(const char *iface) {
-    char cmd[256]; snprintf(cmd, sizeof(cmd), "ip link del %s 2>/dev/null", iface); system(cmd);
+    char cmd[256]; snprintf(cmd, sizeof(cmd), "ip link del %s 2>/dev/null", iface);
+    int rc = system(cmd); (void)rc;
 }
 
 static int configure_tun(const vt_config_t *c) {
@@ -3625,6 +3615,10 @@ static int send_frame(int fd, crypto_state_t *st, uint8_t type, const unsigned c
     uint64_t seq = st->tx_seq++;
     put_u32(hdr, VT_MAGIC); hdr[4] = VT_VERSION; hdr[5] = type; hdr[6] = hdr[7] = 0;
     put_u64(hdr + 8, seq); put_u32(hdr + 16, len); make_nonce(st->tx_nonce_prefix, seq, nonce);
+    /* Hide the fixed magic/version/type bytes with a per-session PSK-derived mask.
+       Sequence and length remain readable for bounded TCP framing; the static VTCP
+       marker is never sent on the wire. The masked header is authenticated as AAD. */
+    for (size_t i = 0; i < 8; i++) hdr[i] ^= st->header_mask[i];
     if (aead_encrypt(st->tx_key, nonce, hdr, HEADER_LEN, payload, (int)len, cipher, tag) != 0) { free(cipher); return -1; }
     int rc = write_full(fd, hdr, HEADER_LEN);
     if (rc == 0 && len) rc = write_full(fd, cipher, len);
@@ -3633,8 +3627,10 @@ static int send_frame(int fd, crypto_state_t *st, uint8_t type, const unsigned c
 }
 
 static int recv_frame(int fd, crypto_state_t *st, uint8_t *type, unsigned char **payload, uint32_t *len) {
-    unsigned char hdr[HEADER_LEN], nonce[12], tag[TAG_LEN];
+    unsigned char hdr[HEADER_LEN], wire_hdr[HEADER_LEN], nonce[12], tag[TAG_LEN];
     ssize_t n = read_full(fd, hdr, HEADER_LEN); if (n <= 0) return -1;
+    memcpy(wire_hdr, hdr, HEADER_LEN);
+    for (size_t i = 0; i < 8; i++) hdr[i] ^= st->header_mask[i];
     if (get_u32(hdr) != VT_MAGIC || hdr[4] != VT_VERSION) return -1;
     uint64_t seq = get_u64(hdr + 8); uint32_t plen = get_u32(hdr + 16);
     if (plen > MAX_PACKET || seq <= st->rx_seq) return -1;
@@ -3643,7 +3639,7 @@ static int recv_frame(int fd, crypto_state_t *st, uint8_t *type, unsigned char *
     if (plen && read_full(fd, cipher, plen) != (ssize_t)plen) { free(cipher); free(plain); return -1; }
     if (read_full(fd, tag, TAG_LEN) != TAG_LEN) { free(cipher); free(plain); return -1; }
     make_nonce(st->rx_nonce_prefix, seq, nonce);
-    if (aead_decrypt(st->rx_key, nonce, hdr, HEADER_LEN, cipher, (int)plen, tag, plain) != 0) { free(cipher); free(plain); return -1; }
+    if (aead_decrypt(st->rx_key, nonce, wire_hdr, HEADER_LEN, cipher, (int)plen, tag, plain) != 0) { free(cipher); free(plain); return -1; }
     free(cipher); st->rx_seq = seq; *type = hdr[5]; *payload = plain; *len = plen; return 0;
 }
 
@@ -3698,8 +3694,10 @@ int main(int argc, char **argv) {
     if (argc < 2 || getuid() != 0) return 1;
     vt_config_t cfg; if (load_config(argv[1], &cfg) != 0) { fprintf(stderr, "invalid ViraTCP config\n"); return 1; }
     signal(SIGINT, on_signal); signal(SIGTERM, on_signal); signal(SIGPIPE, SIG_IGN);
-    mkdir("/dev/net", 0755); if (access(TUN_DEVICE, F_OK) != 0) system("mknod /dev/net/tun c 10 200 2>/dev/null || true");
-    system("modprobe tun 2>/dev/null || true"); cleanup_iface(cfg.iface);
+    mkdir("/dev/net", 0755);
+    if (access(TUN_DEVICE, F_OK) != 0) { int rc = system("mknod /dev/net/tun c 10 200 2>/dev/null || true"); (void)rc; }
+    { int rc = system("modprobe tun 2>/dev/null || true"); (void)rc; }
+    cleanup_iface(cfg.iface);
     int tun_fd = tun_alloc_named(cfg.iface); if (tun_fd < 0 || configure_tun(&cfg) != 0) { cleanup_iface(cfg.iface); if (tun_fd >= 0) close(tun_fd); return 1; }
     int listener = -1;
     if (!strcmp(cfg.mode, "server")) {
@@ -3883,8 +3881,10 @@ viratcp_create_tunnel() {
 }
 
 viratcp_menu_config_tunnel() {
-  show_header "Configure ViraTCP Encrypted TCP-TUN"
-  echo "Iran role opens an outbound TCP connection; Kharej role listens on the selected TCP port."
+  show_header "Configure Reverse ViraTCP Encrypted TCP-TUN"
+  echo "Iran opens one persistent outbound TCP tunnel; Kharej listens on the selected TCP port."
+  echo "The L3 tunnel carries both TCP and UDP payloads without a per-forwarder handshake."
+  echo "ViraTCP wire format v2 requires GRE-TUN v9.0.0 on BOTH servers."
   echo "Use the exact same port and 64-character PSK on both servers."
   echo
   prompt_role || return
@@ -5257,6 +5257,7 @@ haproxy_open_firewall_tcp() {
 
 haproxy_validate_and_restart() {
   local tmp="$1"
+  local previous had_previous=0 backup_file
   # Validate quietly first so HAProxy NOTICE/WARNING lines do not confuse the menu output.
   # If validation fails, run it again without -q to print the real error.
   if ! haproxy -c -q -f "$tmp" >/dev/null 2>&1; then
@@ -5266,18 +5267,35 @@ haproxy_validate_and_restart() {
     return 1
   fi
   mkdir -p "$HAPROXY_BACKUP_DIR"
+  previous="$(mktemp)"
   if [ -f "$HAPROXY_CONFIG" ]; then
-    cp -f "$HAPROXY_CONFIG" "$HAPROXY_BACKUP_DIR/haproxy.cfg.$(date +%Y%m%d-%H%M%S).bak" 2>/dev/null || true
+    had_previous=1
+    cp -f "$HAPROXY_CONFIG" "$previous"
+    backup_file="$HAPROXY_BACKUP_DIR/haproxy.cfg.$(date +%Y%m%d-%H%M%S).bak"
+    cp -f "$HAPROXY_CONFIG" "$backup_file" 2>/dev/null || true
   fi
   mv -f "$tmp" "$HAPROXY_CONFIG"
   haproxy_apply_high_limits
   haproxy_ensure_maxconn_in_config
   systemctl enable haproxy >/dev/null 2>&1 || true
   if systemctl restart haproxy; then
+    rm -f "$previous"
     ok_msg "HAProxy restarted successfully."
     return 0
   fi
-  err_msg "HAProxy restart failed. Check: journalctl -u haproxy -n 50 --no-pager"
+
+  err_msg "HAProxy restart failed; restoring the last working configuration."
+  if [ "$had_previous" -eq 1 ]; then
+    cp -f "$previous" "$HAPROXY_CONFIG"
+    if haproxy -c -q -f "$HAPROXY_CONFIG" >/dev/null 2>&1 && systemctl restart haproxy; then
+      warn_msg "Rollback succeeded; previous HAProxy service is running."
+    else
+      err_msg "HAProxy rollback also failed. Check: journalctl -u haproxy -n 50 --no-pager"
+    fi
+  else
+    rm -f "$HAPROXY_CONFIG"
+  fi
+  rm -f "$previous"
   return 1
 }
 
@@ -5474,7 +5492,7 @@ haproxy_change_protocol() {
   echo -e "${C_BOLD}${C_WHITE}Change HAProxy protocol:${C_RESET}"
   haproxy_show_protocol_rows "$entries"
   echo
-  echo -e "${C_GREEN}0)${C_RESET} toggle protocol for ALL ports"
+  echo -e "${C_GREEN}0)${C_RESET} ALL ports - toggle TCP <-> TCP+UDP"
   echo -e "${C_DIM}00) Back to main menu${C_RESET}"
   echo
   read -rp "Choose row number to toggle protocol [number/0/00]: " selected
@@ -5732,9 +5750,10 @@ haproxy_menu() {
     echo -e "  ${C_MAGENTA}6)${C_RESET} change protocol http/tcp ${C_DIM}(UDP auto-sync)${C_RESET}"
     echo -e "  ${C_CYAN}7)${C_RESET} optimize WebSocket / silent HAProxy no access-log"
     echo -e "  ${C_GREEN}8)${C_RESET} repair UDP for all TCP ports ${C_DIM}(detect + rebuild + verify)${C_RESET}"
+    echo -e "  ${C_YELLOW}9)${C_RESET} switch HAProxy -> Real-IP ${C_DIM}(0 = ALL; TCP-only default)${C_RESET}"
     echo -e "  ${C_DIM}00) Back to main menu${C_RESET}"
     echo
-    read -rp "Choose HAProxy option [1-8/00]: " HAP_CHOICE
+    read -rp "Choose HAProxy option [1-9/00]: " HAP_CHOICE
     case "$HAP_CHOICE" in
       1) haproxy_run_action haproxy_list_forwards || return 0 ;;
       2) haproxy_run_action haproxy_add_port || return 0 ;;
@@ -5744,6 +5763,993 @@ haproxy_menu() {
       6) haproxy_run_action haproxy_change_protocol || return 0 ;;
       7) haproxy_run_action haproxy_optimize_websocket_nolog || return 0 ;;
       8) haproxy_run_action haproxy_repair_udp || return 0 ;;
+      9) haproxy_run_action switch_haproxy_to_realip || return 0 ;;
+      00) return_main_msg; return 0 ;;
+      *) err_msg "Invalid option"; sleep 1 ;;
+    esac
+  done
+}
+
+
+# -----------------------------
+# Real-IP L3 port forward manager (v8.9.1)
+# -----------------------------
+# This is intentionally independent from HAProxy:
+#   HAProxy : local proxy connection + optional UDP DNAT/SNAT companion
+#   Real-IP : direct TCP/UDP DNAT through an L3 tunnel WITHOUT SNAT
+#
+# Real-IP config format:
+#   local_port target_ip target_port l3_protocol haproxy_restore_protocol
+# l3_protocol: tcp | both
+# restore protocol is kept so a switched port can return to the same HAProxy
+# HTTP/TCP mode with one action.
+
+realip_normalize_proto() {
+  case "$(printf '%s' "${1:-both}" | tr '[:upper:]' '[:lower:]')" in
+    tcp) echo "tcp" ;;
+    *) echo "both" ;;
+  esac
+}
+
+realip_proto_label() {
+  if [ "$(realip_normalize_proto "${1:-both}")" = "tcp" ]; then
+    echo "TCP"
+  else
+    echo "TCP+UDP"
+  fi
+}
+
+realip_restore_proto_for_l3() {
+  if [ "$(realip_normalize_proto "${1:-both}")" = "tcp" ]; then
+    echo "http"
+  else
+    echo "tcp"
+  fi
+}
+
+realip_export_entries() {
+  [ -f "$REALIP_FORWARDS_FILE" ] || return 0
+  awk '
+    NF >= 3 && $1 ~ /^[0-9]+$/ {
+      p=$1; ip=$2; tp=$3; l3=$4; hp=$5;
+      if (l3 != "tcp") l3="both";
+      if (hp != "http" && hp != "tcp") hp=(l3=="both" ? "tcp" : "http");
+      print p, ip, tp, l3, hp;
+    }
+  ' "$REALIP_FORWARDS_FILE" | sort -n -k1,1 -u
+}
+
+realip_entries_tmp() {
+  local tmp
+  tmp="$(mktemp)"
+  realip_export_entries > "$tmp" || true
+  echo "$tmp"
+}
+
+realip_write_entries_file() {
+  local src="$1"
+  local staged
+  mkdir -p "$REALIP_CONFIG_DIR"
+  staged="$(mktemp "$REALIP_CONFIG_DIR/.forwards.XXXXXX")"
+  if [ -s "$src" ]; then
+    awk '!seen[$1]++ {print $1, $2, $3, $4, $5}' "$src" | sort -n -k1,1 > "$staged"
+  else
+    : > "$staged"
+  fi
+  chmod 600 "$staged"
+  mv -f "$staged" "$REALIP_FORWARDS_FILE"
+}
+
+# Validate the complete candidate before touching either the saved state or the
+# running firewall. An inactive or unsupported tunnel is rejected here instead
+# of silently leaving only part of the selected ports online.
+realip_validate_entries_file() {
+  local src="$1" port target tport proto restore
+  local -A seen=()
+  [ -s "$src" ] || return 0
+  while read -r port target tport proto restore; do
+    [ -n "${port:-}" ] || continue
+    validate_port "$port" || { err_msg "Real-IP candidate has invalid local port: $port"; return 1; }
+    validate_ipv4 "$target" || { err_msg "Real-IP candidate has invalid target: $target"; return 1; }
+    validate_port "$tport" || { err_msg "Real-IP candidate has invalid target port: $tport"; return 1; }
+    [ -z "${seen[$port]+x}" ] || { err_msg "Real-IP candidate contains duplicate port: $port"; return 1; }
+    seen[$port]=1
+    case "$(realip_normalize_proto "$proto")" in tcp|both) ;; *) return 1 ;; esac
+    if ! realip_resolve_target "$target" >/dev/null 2>&1 || ! tunnel_iface_is_up "$REALIP_IFACE"; then
+      err_msg "Real-IP candidate rejected: $target is not on an active GRE/Vira7/Reverse-ViraTCP path."
+      return 1
+    fi
+  done < "$src"
+}
+
+# Commit a complete Real-IP table and verify every generated rule. If anything
+# fails, restore the previous table and rebuild its rules automatically.
+realip_commit_entries_file() {
+  local candidate="$1" previous had_previous=0 backup_file
+  previous="$(mktemp)"
+  if [ -f "$REALIP_FORWARDS_FILE" ]; then
+    had_previous=1
+    cp -f "$REALIP_FORWARDS_FILE" "$previous"
+  fi
+
+  if ! realip_validate_entries_file "$candidate"; then
+    rm -f "$previous"
+    return 1
+  fi
+
+  mkdir -p "$REALIP_BACKUP_DIR"
+  if [ "$had_previous" -eq 1 ]; then
+    backup_file="$REALIP_BACKUP_DIR/forwards.$(date +%Y%m%d-%H%M%S)-$RANDOM.bak"
+    cp -f "$previous" "$backup_file" 2>/dev/null || true
+  fi
+
+  realip_write_entries_file "$candidate"
+  realip_install_service
+  if realip_sync_rules && realip_rules_healthy; then
+    rm -f "$previous"
+    return 0
+  fi
+
+  err_msg "Real-IP apply/verification failed; rolling back to the previous forwarding table."
+  if [ "$had_previous" -eq 1 ]; then
+    realip_write_entries_file "$previous"
+  else
+    : > "$previous"
+    realip_write_entries_file "$previous"
+  fi
+  realip_sync_rules >/dev/null 2>&1 || true
+  rm -f "$previous"
+  return 1
+}
+
+# Resolve a Real-IP target to an L3 tunnel. The current WireGuard implementation
+# intentionally uses peer /32 AllowedIPs, so arbitrary Internet-destination
+# reply packets cannot be sent through it without changing WG semantics. For
+# safety, Real-IP therefore supports GRE, Vira7 and ViraTCP here.
+realip_resolve_target() {
+  local target="$1" i inv_target route ifc local_ip
+  REALIP_IFACE=""; REALIP_LOCAL_IP=""; REALIP_TYPE=""; REALIP_ID=""
+  build_tunnel_inventory
+
+  for i in "${!INV_TYPE[@]}"; do
+    inv_target="${INV_TARGET[$i]:-}"; inv_target="${inv_target%%/*}"
+    [ "$inv_target" = "$target" ] || continue
+    case "${INV_TYPE[$i]:-}" in
+      gre|vira7|viratcp)
+        REALIP_IFACE="${INV_IFACE[$i]:-}"
+        REALIP_LOCAL_IP="${INV_LOCAL[$i]:-}"; REALIP_LOCAL_IP="${REALIP_LOCAL_IP%%/*}"
+        REALIP_TYPE="${INV_TYPE[$i]}"
+        REALIP_ID="${INV_ID[$i]}"
+        [ -n "$REALIP_IFACE" ] && validate_ipv4 "$REALIP_LOCAL_IP" && return 0
+        ;;
+      wireguard)
+        err_msg "Real-IP target $target is WireGuard. This script keeps WireGuard AllowedIPs at peer /32, so Real-IP return traffic is not enabled for WireGuard. Use GRE, Vira7 or ViraTCP."
+        return 1
+        ;;
+    esac
+  done
+
+  # Keep custom tunnel IPv4 support when the kernel route clearly points to one
+  # of the compatible L3 interfaces.
+  route="$(ip -4 route get "$target" 2>/dev/null | head -n 1 || true)"
+  ifc="$(awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}' <<< "$route")"
+  local_ip="$(awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}' <<< "$route")"
+  case "$ifc" in
+    gre*) REALIP_TYPE="gre"; REALIP_ID="${ifc#gre}" ;;
+    vira7*) REALIP_TYPE="vira7"; REALIP_ID="${ifc#vira7}" ;;
+    viratcp*) REALIP_TYPE="viratcp"; REALIP_ID="${ifc#viratcp}" ;;
+    *) return 1 ;;
+  esac
+  REALIP_IFACE="$ifc"; REALIP_LOCAL_IP="$local_ip"
+  [ -n "$REALIP_IFACE" ] && validate_ipv4 "$REALIP_LOCAL_IP"
+}
+
+realip_prompt_target_ip() {
+  haproxy_prompt_target_ip "Select Real-IP target tunnel number or enter tunnel IPv4" || return $?
+  if ! realip_resolve_target "$HAP_TARGET_IP"; then
+    err_msg "Selected target cannot be used by the Real-IP engine. Pick a GRE, Vira7 or ViraTCP remote tunnel IP."
+    return 1
+  fi
+  REALIP_TARGET_IP="$HAP_TARGET_IP"
+  info_msg "Real-IP path: ${REALIP_TYPE}${REALIP_ID:+$REALIP_ID} $REALIP_IFACE ($REALIP_LOCAL_IP -> $REALIP_TARGET_IP)"
+}
+
+realip_prompt_protocol() {
+  local input
+  echo -e "${C_BOLD}${C_WHITE}Real-IP protocol mode:${C_RESET}"
+  echo -e "  ${C_GREEN}1)${C_RESET} TCP only ${C_DIM}(recommended/default; lighter handshakes, best for VLESS/VMess/TLS/WebSocket)${C_RESET}"
+  echo -e "  ${C_YELLOW}2)${C_RESET} TCP + UDP ${C_DIM}(enable only when this inbound really needs UDP, e.g. Shadowsocks UDP/QUIC/gaming)${C_RESET}"
+  echo
+  read -rp "Choose protocol [1=TCP default, 2=TCP+UDP, 00=menu]: " input
+  if is_main_menu_token "$input"; then return_main_msg; return 99; fi
+  input="${input:-1}"
+  case "$(printf '%s' "$input" | tr '[:upper:]' '[:lower:]')" in
+    1|tcp|t) REALIP_SELECTED_PROTO="tcp" ;;
+    2|both|udp|tcpudp|tcp+udp) REALIP_SELECTED_PROTO="both" ;;
+    *) err_msg "Invalid protocol selection."; return 1 ;;
+  esac
+}
+
+realip_prompt_switch_protocol() {
+  local input
+  echo -e "${C_BOLD}${C_WHITE}Real-IP protocol for switched port(s):${C_RESET}"
+  echo -e "  ${C_GREEN}1)${C_RESET} TCP only ${C_DIM}(recommended/default; avoids extra UDP traffic and lower handshake pressure)${C_RESET}"
+  echo -e "  ${C_CYAN}2)${C_RESET} keep HAProxy mode ${C_DIM}(HAProxy TCP -> TCP+UDP, HAProxy HTTP -> TCP only)${C_RESET}"
+  echo -e "  ${C_YELLOW}3)${C_RESET} force TCP + UDP ${C_DIM}(only if the inbound really needs UDP)${C_RESET}"
+  echo
+  read -rp "Choose switch protocol [1/2/3, 00=menu]: " input
+  if is_main_menu_token "$input"; then return_main_msg; return 99; fi
+  input="${input:-1}"
+  case "$input" in
+    1) REALIP_SWITCH_PROTO_MODE="tcp" ;;
+    2) REALIP_SWITCH_PROTO_MODE="keep" ;;
+    3) REALIP_SWITCH_PROTO_MODE="both" ;;
+    *) err_msg "Invalid protocol selection."; return 1 ;;
+  esac
+}
+
+select_ports_from_tmp() {
+  local engine_name="$1" tmp="$2" raw manual
+  SELECTED_PORTS=()
+  echo -e "${C_BOLD}${C_WHITE}$engine_name port selection:${C_RESET}"
+  echo -e "  ${C_GREEN}0)${C_RESET} ALL ports"
+  echo -e "  ${C_CYAN}1)${C_RESET} choose specific port(s)"
+  echo -e "  ${C_DIM}00) Back${C_RESET}"
+  echo
+  read -rp "Choose [0=ALL, 1=specific, 00=menu]: " raw
+  if is_main_menu_token "$raw"; then return_main_msg; return 99; fi
+  case "$raw" in
+    0)
+      mapfile -t SELECTED_PORTS < <(awk '{print $1}' "$tmp")
+      ;;
+    1)
+      echo "Examples: 443   |   443 8443 2053   |   443,8443,2053"
+      read -rp "Enter port(s): " manual
+      if is_main_menu_token "$manual"; then return_main_msg; return 99; fi
+      haproxy_parse_port_list "$manual" || return 1
+      SELECTED_PORTS=("${HAP_PORTS[@]}")
+      ;;
+    *)
+      err_msg "Invalid selection. Use 0 for ALL or 1 for selected ports."
+      return 1
+      ;;
+  esac
+  [ "${#SELECTED_PORTS[@]}" -gt 0 ] || { warn_msg "No ports selected."; return 1; }
+}
+
+realip_delete_commented_rules() {
+  local table="$1" chain="$2" marker="$3" n
+  local -a nums=()
+  if [ "$table" = "filter" ]; then
+    mapfile -t nums < <(iptables -w 5 -L "$chain" --line-numbers -n 2>/dev/null | awk -v m="$marker" 'index($0,m){print $1}' | sort -rn)
+    for n in "${nums[@]}"; do
+      [[ "$n" =~ ^[0-9]+$ ]] && iptables -w 5 -D "$chain" "$n" 2>/dev/null || true
+    done
+  else
+    mapfile -t nums < <(iptables -w 5 -t "$table" -L "$chain" --line-numbers -n 2>/dev/null | awk -v m="$marker" 'index($0,m){print $1}' | sort -rn)
+    for n in "${nums[@]}"; do
+      [[ "$n" =~ ^[0-9]+$ ]] && iptables -w 5 -t "$table" -D "$chain" "$n" 2>/dev/null || true
+    done
+  fi
+}
+
+realip_flush_managed_rules() {
+  command -v iptables >/dev/null 2>&1 || return 0
+  realip_delete_commented_rules nat PREROUTING "$REALIP_RULE_PREFIX-"
+  realip_delete_commented_rules mangle FORWARD "$REALIP_RULE_PREFIX-"
+  realip_delete_commented_rules filter FORWARD "$REALIP_RULE_PREFIX-"
+}
+
+
+realip_mss_for_iface() {
+  local ifc="$1" mtu mss
+  mtu="$(cat "/sys/class/net/$ifc/mtu" 2>/dev/null || true)"
+  if ! [[ "$mtu" =~ ^[0-9]+$ ]]; then
+    mtu="$(ip -o link show dev "$ifc" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="mtu") {print $(i+1); exit}}')"
+  fi
+  [[ "$mtu" =~ ^[0-9]+$ ]] || mtu=1390
+  # IPv4 TCP header budget: 20 bytes IP + 20 bytes TCP.
+  # Clamp a little below the tunnel MTU so TLS/WebSocket ClientHello packets do not fragment.
+  mss=$((mtu - 40))
+  [ "$mss" -lt 536 ] && mss=536
+  [ "$mss" -gt 1460 ] && mss=1460
+  echo "$mss"
+}
+
+realip_add_tcp_mss_rules() {
+  local port="$1" target="$2" tport="$3" ifc="$4" mss
+  mss="$(realip_mss_for_iface "$ifc")"
+
+  # Forward path: client SYN enters Iran, is DNATed, then exits through the tunnel.
+  iptables -w 5 -t mangle -I FORWARD 1 \
+    -o "$ifc" -p tcp -d "$target" --dport "$tport" \
+    --tcp-flags SYN,RST SYN \
+    -m comment --comment "$REALIP_RULE_PREFIX-tcp-mss-out-$port" \
+    -j TCPMSS --set-mss "$mss" \
+    || warn_msg "Real-IP MSS clamp could not be installed for outgoing TCP port $port."
+
+  # Return path on Iran: SYN-ACK comes back through the same tunnel before reverse NAT.
+  iptables -w 5 -t mangle -I FORWARD 1 \
+    -i "$ifc" -p tcp -s "$target" --sport "$tport" \
+    --tcp-flags SYN,RST SYN \
+    -m comment --comment "$REALIP_RULE_PREFIX-tcp-mss-back-$port" \
+    -j TCPMSS --set-mss "$mss" \
+    || warn_msg "Real-IP return MSS clamp could not be installed for TCP port $port."
+}
+
+realip_tcp_mss_rules_exist() {
+  local port="$1" target="$2" tport="$3" ifc="$4" mss
+  mss="$(realip_mss_for_iface "$ifc")"
+  iptables -w 5 -t mangle -C FORWARD \
+    -o "$ifc" -p tcp -d "$target" --dport "$tport" \
+    --tcp-flags SYN,RST SYN \
+    -m comment --comment "$REALIP_RULE_PREFIX-tcp-mss-out-$port" \
+    -j TCPMSS --set-mss "$mss" 2>/dev/null \
+  && iptables -w 5 -t mangle -C FORWARD \
+    -i "$ifc" -p tcp -s "$target" --sport "$tport" \
+    --tcp-flags SYN,RST SYN \
+    -m comment --comment "$REALIP_RULE_PREFIX-tcp-mss-back-$port" \
+    -j TCPMSS --set-mss "$mss" 2>/dev/null
+}
+
+realip_add_l4_rule() {
+  local l4="$1" port="$2" target="$3" tport="$4" ifc="$5"
+  # IMPORTANT: there is deliberately no POSTROUTING SNAT rule here.
+  iptables -w 5 -t nat -I PREROUTING 1 \
+    -p "$l4" --dport "$port" \
+    -m comment --comment "$REALIP_RULE_PREFIX-$l4-pre-$port" \
+    -j DNAT --to-destination "$target:$tport"
+
+  if [ "$l4" = "tcp" ]; then
+    realip_add_tcp_mss_rules "$port" "$target" "$tport" "$ifc"
+  fi
+
+  iptables -w 5 -I FORWARD 1 \
+    -o "$ifc" -p "$l4" -d "$target" --dport "$tport" \
+    -m comment --comment "$REALIP_RULE_PREFIX-$l4-out-$port" \
+    -j ACCEPT
+
+  iptables -w 5 -I FORWARD 1 \
+    -i "$ifc" -p "$l4" -s "$target" --sport "$tport" \
+    -m conntrack --ctstate ESTABLISHED,RELATED \
+    -m comment --comment "$REALIP_RULE_PREFIX-$l4-back-$port" \
+    -j ACCEPT
+}
+
+realip_sync_rules() {
+  command -v iptables >/dev/null 2>&1 || { err_msg "iptables is required for Real-IP forwarding."; return 1; }
+  enable_ip_forward
+  apply_tunnel_sysctls
+  realip_flush_managed_rules
+
+  local entries port target tport proto restore count=0 skipped=0
+  entries="$(realip_export_entries || true)"
+  [ -n "$entries" ] || return 0
+
+  while read -r port target tport proto restore; do
+    [ -n "${port:-}" ] || continue
+    if ! realip_resolve_target "$target"; then
+      warn_msg "Real-IP port $port skipped: target $target is not a supported/active L3 tunnel path."
+      skipped=$((skipped + 1))
+      continue
+    fi
+    realip_add_l4_rule tcp "$port" "$target" "$tport" "$REALIP_IFACE"
+    if [ "$(realip_normalize_proto "$proto")" = "both" ]; then
+      realip_add_l4_rule udp "$port" "$target" "$tport" "$REALIP_IFACE"
+    fi
+    count=$((count + 1))
+  done <<< "$entries"
+
+  [ "$count" -eq 0 ] || ok_msg "Real-IP rules synchronized for $count port(s); source IP preservation is ON, MSS clamp is ON, and no SNAT rule was added."
+  [ "$skipped" -eq 0 ] || warn_msg "$skipped Real-IP port(s) could not be synchronized."
+  [ "$skipped" -eq 0 ]
+}
+
+realip_rule_exists_l4() {
+  local l4="$1" port="$2" target="$3" tport="$4" ifc="$5"
+  iptables -w 5 -t nat -C PREROUTING \
+    -p "$l4" --dport "$port" \
+    -m comment --comment "$REALIP_RULE_PREFIX-$l4-pre-$port" \
+    -j DNAT --to-destination "$target:$tport" 2>/dev/null \
+  && iptables -w 5 -C FORWARD \
+    -o "$ifc" -p "$l4" -d "$target" --dport "$tport" \
+    -m comment --comment "$REALIP_RULE_PREFIX-$l4-out-$port" \
+    -j ACCEPT 2>/dev/null \
+  && iptables -w 5 -C FORWARD \
+    -i "$ifc" -p "$l4" -s "$target" --sport "$tport" \
+    -m conntrack --ctstate ESTABLISHED,RELATED \
+    -m comment --comment "$REALIP_RULE_PREFIX-$l4-back-$port" \
+    -j ACCEPT 2>/dev/null || return 1
+
+  if [ "$l4" = "tcp" ]; then
+    realip_tcp_mss_rules_exist "$port" "$target" "$tport" "$ifc" || return 1
+  fi
+}
+
+
+realip_rules_healthy() {
+  command -v iptables >/dev/null 2>&1 || return 1
+  local entries port target tport proto restore
+  entries="$(realip_export_entries || true)"
+  [ -n "$entries" ] || return 0
+  while read -r port target tport proto restore; do
+    [ -n "${port:-}" ] || continue
+    realip_resolve_target "$target" >/dev/null 2>&1 || return 1
+    realip_rule_exists_l4 tcp "$port" "$target" "$tport" "$REALIP_IFACE" || return 1
+    if [ "$(realip_normalize_proto "$proto")" = "both" ]; then
+      realip_rule_exists_l4 udp "$port" "$target" "$tport" "$REALIP_IFACE" || return 1
+    fi
+  done <<< "$entries"
+  return 0
+}
+
+realip_config_file_for_item() {
+  local type="$1" id="$2"
+  case "$type" in
+    gre) gre_config_file "$id" ;;
+    vira7) vira7_config_file "$id" ;;
+    viratcp) viratcp_config_file "$id" ;;
+    wireguard) wg_meta_file "$id" ;;
+    *) return 1 ;;
+  esac
+}
+
+realip_saved_role_for_item() {
+  local type="$1" id="$2" file value
+  file="$(realip_config_file_for_item "$type" "$id" 2>/dev/null || true)"
+  [ -n "$file" ] && [ -f "$file" ] || return 1
+  value="$(grep -m1 '^ROLE=' "$file" 2>/dev/null | cut -d= -f2- | tr -d "'\" " || true)"
+  [ "$value" = "1" ] || [ "$value" = "2" ] || return 1
+  printf '%s\n' "$value"
+}
+
+# Reserve only three narrow priority bands and matching private table bands.
+# A rule is considered ours only when BOTH its priority and lookup table match.
+realip_route_numbers() {
+  local type="$1" id="$2" basep baset
+  case "$type" in
+    gre) basep=25000; baset=51000 ;;
+    vira7) basep=25300; baset=52000 ;;
+    viratcp) basep=25600; baset=53000 ;;
+    *) return 1 ;;
+  esac
+  REALIP_ROUTE_PRIO=$((basep + id))
+  REALIP_ROUTE_TABLE=$((baset + id))
+}
+
+realip_cleanup_return_routing() {
+  command -v ip >/dev/null 2>&1 || return 0
+  local line prio table
+  while IFS= read -r line; do
+    prio="${line%%:*}"
+    table="$(awk '{for(i=1;i<=NF;i++) if($i=="lookup") {print $(i+1); exit}}' <<< "$line")"
+    [[ "$prio" =~ ^[0-9]+$ ]] || continue
+    [[ "$table" =~ ^[0-9]+$ ]] || continue
+    if { [ "$prio" -ge 25001 ] && [ "$prio" -le 25254 ] && [ "$table" -ge 51001 ] && [ "$table" -le 51254 ]; } \
+       || { [ "$prio" -ge 25301 ] && [ "$prio" -le 25554 ] && [ "$table" -ge 52001 ] && [ "$table" -le 52254 ]; } \
+       || { [ "$prio" -ge 25601 ] && [ "$prio" -le 25854 ] && [ "$table" -ge 53001 ] && [ "$table" -le 53254 ]; }; then
+      # Delete only the matching reserved priority/table pair; do not sweep any
+      # unrelated rule that might coincidentally share the same priority.
+      ip rule del priority "$prio" lookup "$table" 2>/dev/null || true
+      ip route flush table "$table" 2>/dev/null || true
+    fi
+  done < <(ip -4 rule show 2>/dev/null)
+}
+
+
+realip_prepare_return_iface() {
+  local ifc="$1"
+  [ -n "$ifc" ] || return 0
+  sysctl -w "net.ipv4.conf.$ifc.rp_filter=0" >/dev/null 2>&1 || true
+  ip link set dev "$ifc" txqueuelen 1000 >/dev/null 2>&1 || true
+}
+
+realip_apply_return_routing() {
+  [ -f "$REALIP_RETURN_MARKER" ] || return 0
+  command -v ip >/dev/null 2>&1 || return 1
+  apply_tunnel_sysctls
+  realip_cleanup_return_routing
+
+  build_tunnel_inventory
+  local i type id role ifc local_ip remote_ip applied=0 route_mtu
+  for i in "${!INV_TYPE[@]}"; do
+    type="${INV_TYPE[$i]:-}"; id="${INV_ID[$i]:-}"
+    case "$type" in gre|vira7|viratcp) ;; *) continue ;; esac
+    role="$(realip_saved_role_for_item "$type" "$id" 2>/dev/null || true)"
+    [ "$role" = "2" ] || continue
+    ifc="${INV_IFACE[$i]:-}"
+    local_ip="${INV_LOCAL[$i]:-}"; local_ip="${local_ip%%/*}"
+    remote_ip="${INV_TARGET[$i]:-}"; remote_ip="${remote_ip%%/*}"
+    validate_ipv4 "$local_ip" || continue
+    validate_ipv4 "$remote_ip" || continue
+    tunnel_iface_is_up "$ifc" || { warn_msg "Return route skipped for $type$id: $ifc is down."; continue; }
+    realip_route_numbers "$type" "$id" || continue
+
+    realip_prepare_return_iface "$ifc"
+    route_mtu="$(cat "/sys/class/net/$ifc/mtu" 2>/dev/null || echo 1390)"
+    [[ "$route_mtu" =~ ^[0-9]+$ ]] || route_mtu=1390
+
+    # The peer /32 keeps the tunnel peer reachable inside the dedicated table;
+    # arbitrary client destinations are then sent back through the same L3 tunnel.
+    # The explicit MTU avoids large SYN-ACK / TLS records selecting the physical MTU.
+    ip route replace "$remote_ip/32" dev "$ifc" scope link table "$REALIP_ROUTE_TABLE"
+    ip route replace default dev "$ifc" mtu "$route_mtu" table "$REALIP_ROUTE_TABLE"
+    ip rule add priority "$REALIP_ROUTE_PRIO" from "$local_ip/32" lookup "$REALIP_ROUTE_TABLE"
+    applied=$((applied + 1))
+  done
+  ip route flush cache 2>/dev/null || true
+  [ "$applied" -gt 0 ] || { warn_msg "Real-IP return routing is enabled, but no Kharej-role GRE/Vira7/ViraTCP tunnel was available."; return 1; }
+  return 0
+}
+
+realip_return_routing_healthy() {
+  [ -f "$REALIP_RETURN_MARKER" ] || return 0
+  build_tunnel_inventory
+  local i type id role ifc local_ip found=0
+  for i in "${!INV_TYPE[@]}"; do
+    type="${INV_TYPE[$i]:-}"; id="${INV_ID[$i]:-}"
+    case "$type" in gre|vira7|viratcp) ;; *) continue ;; esac
+    role="$(realip_saved_role_for_item "$type" "$id" 2>/dev/null || true)"
+    [ "$role" = "2" ] || continue
+    found=1
+    ifc="${INV_IFACE[$i]:-}"
+    local_ip="${INV_LOCAL[$i]:-}"; local_ip="${local_ip%%/*}"
+    realip_route_numbers "$type" "$id" || return 1
+    ip -4 rule show 2>/dev/null | grep -Eq "^${REALIP_ROUTE_PRIO}:.*from ${local_ip}([ /]|$).*lookup ${REALIP_ROUTE_TABLE}([[:space:]]|$)" || return 1
+    ip -4 route show table "$REALIP_ROUTE_TABLE" 2>/dev/null | grep -Eq "^default .*dev ${ifc}([[:space:]]|$)" || return 1
+  done
+  [ "$found" -eq 1 ]
+}
+
+realip_sync_all() {
+  local rc=0
+  realip_sync_rules || rc=1
+  if [ -f "$REALIP_RETURN_MARKER" ]; then realip_apply_return_routing || rc=1; fi
+  return "$rc"
+}
+
+realip_install_service() {
+  command -v systemctl >/dev/null 2>&1 || return 0
+  mkdir -p "$REALIP_CONFIG_DIR"
+  install_manager_binary >/dev/null 2>&1 || true
+  [ -s "$INSTALL_BIN" ] || return 1
+  cat > "$REALIP_SERVICE_UNIT" <<EOF_REALIP_SERVICE
+[Unit]
+Description=GRE-TUN Real-IP DNAT forwarding and return policy routing
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash $INSTALL_BIN --service realip-sync
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF_REALIP_SERVICE
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable "$REALIP_SERVICE_NAME" >/dev/null 2>&1 || true
+}
+
+realip_self_heal_check() {
+  [ -s "$REALIP_FORWARDS_FILE" ] || [ -f "$REALIP_RETURN_MARKER" ] || return 0
+  local need=0
+  realip_rules_healthy || need=1
+  realip_return_routing_healthy || need=1
+  [ "$need" -eq 0 ] && return 0
+  local lockdir="/run/gretun-realip-repair.lock"
+  mkdir "$lockdir" 2>/dev/null || return 0
+  info_msg "Real-IP self-heal detected missing/stale rules; rebuilding..."
+  realip_sync_all || true
+  rmdir "$lockdir" 2>/dev/null || true
+}
+
+realip_list_forwards() {
+  echo -e "${C_BOLD}${C_WHITE}Real-IP forwarded ports (DNAT without SNAT):${C_RESET}"
+  local entries proto restore
+  entries="$(realip_export_entries || true)"
+  if [ -z "$entries" ]; then warn_msg "No Real-IP forwarded ports configured."; return 0; fi
+  printf "${C_DIM}%8s  %-15s %-12s %-10s %-12s${C_RESET}\n" "Port" "Target-IP" "Target-Port" "L3" "HAProxy-back"
+  printf "${C_DIM}%s${C_RESET}\n" "---------------------------------------------------------------------"
+  while read -r port ip tport proto restore; do
+    printf "%8s  ${C_MAGENTA}%-15s${C_RESET} %-12s ${C_GREEN}%-10s${C_RESET} %-12s\n" \
+      "$port" "$ip" "$tport" "$(realip_proto_label "$proto")" "$restore"
+  done <<< "$entries"
+  echo
+  if [ -f "$REALIP_RETURN_MARKER" ]; then
+    echo -e "Kharej return routing: ${C_GREEN}ENABLED${C_RESET}"
+  else
+    echo -e "Kharej return routing: ${C_YELLOW}NOT ENABLED on this server${C_RESET}"
+  fi
+}
+
+realip_add_port() {
+  local raw_ports tmp port restore
+  echo "00) Back to main menu"
+  echo "Examples: 443   |   443 8443 2053   |   443,8443,2053"
+  echo -e "${C_DIM}Tip: Real-IP defaults to TCP only. Turn UDP on only for ports that really need UDP.${C_RESET}"
+  read -rp "Enter local port(s) to add/update: " raw_ports
+  if is_main_menu_token "$raw_ports"; then return_main_msg; return 99; fi
+  haproxy_parse_port_list "$raw_ports" || return 1
+
+  # Never allow one public port to be owned by both engines accidentally.
+  local hap_entries conflicts=""
+  hap_entries="$(haproxy_export_entries || true)"
+  for port in "${HAP_PORTS[@]}"; do
+    if awk -v p="$port" '$1==p{found=1} END{exit found?0:1}' <<< "$hap_entries"; then conflicts+=" $port"; fi
+  done
+  if [ -n "$conflicts" ]; then
+    err_msg "Port(s)$conflicts are currently owned by HAProxy. Use Switch Forwarding Engine instead of creating duplicate rules."
+    return 1
+  fi
+
+  echo
+  realip_prompt_target_ip || return $?
+  echo
+  realip_prompt_protocol || return $?
+  restore="$(realip_restore_proto_for_l3 "$REALIP_SELECTED_PROTO")"
+
+  tmp="$(realip_entries_tmp)"
+  for port in "${HAP_PORTS[@]}"; do
+    awk -v p="$port" '$1!=p' "$tmp" > "$tmp.new" || true
+    printf '%s %s %s %s %s\n' "$port" "$REALIP_TARGET_IP" "$port" "$REALIP_SELECTED_PROTO" "$restore" >> "$tmp.new"
+    mv -f "$tmp.new" "$tmp"
+  done
+  if ! realip_commit_entries_file "$tmp"; then rm -f "$tmp"; return 1; fi
+  rm -f "$tmp"
+  ok_msg "Applied ${#HAP_PORTS[@]} Real-IP port(s) -> $REALIP_TARGET_IP. Client source IP is preserved."
+}
+
+realip_change_all_ips() {
+  local tmp
+  tmp="$(realip_entries_tmp)"
+  if [ ! -s "$tmp" ]; then warn_msg "No Real-IP forwards to update."; rm -f "$tmp"; return 0; fi
+  realip_prompt_target_ip || { local rc=$?; rm -f "$tmp"; return "$rc"; }
+  awk -v ip="$REALIP_TARGET_IP" '{print $1, ip, $3, $4, $5}' "$tmp" > "$tmp.new"
+  mv -f "$tmp.new" "$tmp"
+  if ! realip_commit_entries_file "$tmp"; then rm -f "$tmp"; return 1; fi
+  rm -f "$tmp"
+}
+
+realip_delete_port() {
+  local port tmp before after
+  tmp="$(realip_entries_tmp)"
+  if [ ! -s "$tmp" ]; then warn_msg "No Real-IP forwards to delete."; rm -f "$tmp"; return 0; fi
+  realip_list_forwards; echo
+  read -rp "Enter Real-IP local port to delete (00=menu): " port
+  if is_main_menu_token "$port"; then rm -f "$tmp"; return_main_msg; return 99; fi
+  validate_port "$port" || { err_msg "Invalid port."; rm -f "$tmp"; return 1; }
+  before="$(wc -l < "$tmp" | tr -d ' ')"
+  awk -v p="$port" '$1!=p' "$tmp" > "$tmp.new" || true
+  after="$(wc -l < "$tmp.new" | tr -d ' ')"
+  if [ "$before" = "$after" ]; then warn_msg "Port $port was not found."; rm -f "$tmp" "$tmp.new"; return 0; fi
+  mv -f "$tmp.new" "$tmp"
+  if ! realip_commit_entries_file "$tmp"; then rm -f "$tmp"; return 1; fi
+  rm -f "$tmp"
+  ok_msg "Real-IP port $port removed; HAProxy was not changed."
+}
+
+realip_change_one_ip() {
+  local port tmp rc
+  tmp="$(realip_entries_tmp)"
+  if [ ! -s "$tmp" ]; then warn_msg "No Real-IP forwards to update."; rm -f "$tmp"; return 0; fi
+  realip_list_forwards; echo
+  read -rp "Enter Real-IP local port to change target (00=menu): " port
+  if is_main_menu_token "$port"; then rm -f "$tmp"; return_main_msg; return 99; fi
+  validate_port "$port" || { err_msg "Invalid port."; rm -f "$tmp"; return 1; }
+  awk -v p="$port" '$1==p{found=1} END{exit found?0:1}' "$tmp" || { warn_msg "Port $port was not found."; rm -f "$tmp"; return 0; }
+  realip_prompt_target_ip; rc=$?
+  if [ "$rc" -ne 0 ]; then rm -f "$tmp"; return "$rc"; fi
+  awk -v p="$port" -v ip="$REALIP_TARGET_IP" '{if($1==p) print $1,ip,$3,$4,$5; else print}' "$tmp" > "$tmp.new"
+  mv -f "$tmp.new" "$tmp"
+  if ! realip_commit_entries_file "$tmp"; then rm -f "$tmp"; return 1; fi
+  rm -f "$tmp"
+}
+
+realip_change_protocol() {
+  local tmp port restore rc changed=0
+  tmp="$(realip_entries_tmp)"
+  if [ ! -s "$tmp" ]; then warn_msg "No Real-IP forwards found."; rm -f "$tmp"; return 0; fi
+
+  realip_list_forwards
+  echo
+  select_ports_from_tmp "Real-IP protocol / UDP mode" "$tmp"; rc=$?
+  if [ "$rc" -ne 0 ]; then rm -f "$tmp"; return "$rc"; fi
+
+  echo
+  realip_prompt_protocol; rc=$?
+  if [ "$rc" -ne 0 ]; then rm -f "$tmp"; return "$rc"; fi
+  restore="$(realip_restore_proto_for_l3 "$REALIP_SELECTED_PROTO")"
+
+  for port in "${SELECTED_PORTS[@]}"; do
+    awk -v p="$port" '$1==p{found=1} END{exit found?0:1}' "$tmp" || { err_msg "Real-IP port $port was not found."; rm -f "$tmp"; return 1; }
+    awk -v p="$port" -v proto="$REALIP_SELECTED_PROTO" -v hp="$restore" '{if($1==p) print $1,$2,$3,proto,hp; else print}' "$tmp" > "$tmp.new"
+    mv -f "$tmp.new" "$tmp"
+    changed=$((changed + 1))
+  done
+
+  if ! realip_commit_entries_file "$tmp"; then rm -f "$tmp"; return 1; fi
+  rm -f "$tmp"
+  ok_msg "Updated protocol for $changed Real-IP port(s) to $(realip_proto_label "$REALIP_SELECTED_PROTO")."
+  [ "$REALIP_SELECTED_PROTO" = "tcp" ] && info_msg "UDP is now OFF for the selected Real-IP port(s), which should reduce handshake/latency pressure."
+}
+
+realip_repair() {
+  realip_install_service
+  realip_sync_all
+  if realip_rules_healthy && realip_return_routing_healthy; then
+    ok_msg "Real-IP repair/verification completed successfully."
+  else
+    err_msg "Real-IP verification still reports a missing rule/path."
+    return 1
+  fi
+}
+
+realip_doctor() {
+  local entries port target tport proto restore route failed=0
+  echo -e "${C_BOLD}${C_WHITE}Kernel Real-IP / 3x-ui diagnostic${C_RESET}"
+  echo "Mode: direct DNAT without SNAT"
+  echo "3x-ui inbound Proxy Protocol: keep DISABLED (this mode does not send a PROXY header)"
+  echo
+
+  if [ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo 0)" = "1" ]; then
+    ok_msg "IPv4 forwarding is enabled."
+  else
+    err_msg "IPv4 forwarding is disabled."
+    failed=1
+  fi
+
+  entries="$(realip_export_entries || true)"
+  if [ -z "$entries" ]; then
+    warn_msg "No Real-IP ports are configured on this server."
+    return "$failed"
+  fi
+
+  while read -r port target tport proto restore; do
+    [ -n "${port:-}" ] || continue
+    if realip_resolve_target "$target" >/dev/null 2>&1 && tunnel_iface_is_up "$REALIP_IFACE"; then
+      route="$(ip -4 route get "$target" 2>/dev/null | head -n1 || true)"
+      ok_msg "$port -> $target:$tport ($(realip_proto_label "$proto")) via $REALIP_IFACE | ${route:-route unavailable}"
+    else
+      err_msg "$port -> $target:$tport has no active supported tunnel path."
+      failed=1
+    fi
+  done <<< "$entries"
+
+  if realip_rules_healthy; then
+    ok_msg "All managed DNAT/FORWARD/MSS rules are present."
+  else
+    err_msg "One or more managed Real-IP rules are missing. Run Repair."
+    failed=1
+  fi
+
+  echo
+  info_msg "KHAREJ must have return routing enabled once; otherwise Xray receives the SYN but replies leave through the public gateway."
+  return "$failed"
+}
+
+realip_enable_return_routing() {
+  build_tunnel_inventory
+  local i type id role found=0
+  for i in "${!INV_TYPE[@]}"; do
+    type="${INV_TYPE[$i]:-}"; id="${INV_ID[$i]:-}"
+    case "$type" in gre|vira7|viratcp) ;; *) continue ;; esac
+    role="$(realip_saved_role_for_item "$type" "$id" 2>/dev/null || true)"
+    [ "$role" = "2" ] && { found=1; break; }
+  done
+  if [ "$found" -ne 1 ]; then
+    err_msg "No Kharej-role GRE/Vira7/ViraTCP tunnel was detected on this server. Enable return routing on the KHAREJ server, not the Iran entry server."
+    return 1
+  fi
+  mkdir -p "$REALIP_CONFIG_DIR"
+  printf 'enabled\n' > "$REALIP_RETURN_MARKER"
+  chmod 600 "$REALIP_RETURN_MARKER"
+  realip_install_service
+  realip_apply_return_routing
+  ok_msg "Kharej Real-IP return routing ENABLED. Future health checks will keep it repaired."
+}
+
+realip_disable_return_routing() {
+  rm -f "$REALIP_RETURN_MARKER"
+  realip_cleanup_return_routing
+  ok_msg "Kharej Real-IP return routing DISABLED on this server. Real-IP port definitions were not deleted."
+}
+
+realip_toggle_return_routing() {
+  if [ -f "$REALIP_RETURN_MARKER" ]; then
+    realip_disable_return_routing
+  else
+    realip_enable_return_routing
+  fi
+}
+
+# Move one or many HAProxy rows into Real-IP without changing tunnel definitions.
+# Existing HAProxy functionality remains installed; only the selected ports move.
+switch_haproxy_to_realip_impl() {
+  local hap_tmp real_tmp real_before port target tport hp l3 selected_count=0 rc
+  hap_tmp="$(haproxy_entries_tmp)"; real_tmp="$(realip_entries_tmp)"
+  real_before="$(mktemp)"
+  cp -f "$real_tmp" "$real_before"
+  if [ ! -s "$hap_tmp" ]; then warn_msg "No HAProxy ports are available to switch."; rm -f "$hap_tmp" "$real_tmp" "$real_before"; return 0; fi
+
+  haproxy_list_forwards
+  echo
+  select_ports_from_tmp "HAProxy -> Real-IP" "$hap_tmp"; rc=$?
+  if [ "$rc" -ne 0 ]; then rm -f "$hap_tmp" "$real_tmp" "$real_before"; return "$rc"; fi
+
+  echo
+  realip_prompt_switch_protocol; rc=$?
+  if [ "$rc" -ne 0 ]; then rm -f "$hap_tmp" "$real_tmp" "$real_before"; return "$rc"; fi
+
+  # Validate every selected row/path before changing either engine.
+  for port in "${SELECTED_PORTS[@]}"; do
+    target="$(awk -v p="$port" '$1==p{print $2; exit}' "$hap_tmp")"
+    [ -n "$target" ] || { err_msg "HAProxy port $port was not found."; rm -f "$hap_tmp" "$real_tmp" "$real_before"; return 1; }
+    if ! realip_resolve_target "$target" >/dev/null 2>&1; then
+      err_msg "Port $port targets $target, which is not a supported GRE/Vira7/ViraTCP Real-IP path. Nothing was switched."
+      rm -f "$hap_tmp" "$real_tmp" "$real_before"; return 1
+    fi
+  done
+
+  for port in "${SELECTED_PORTS[@]}"; do
+    read -r _ target tport hp < <(awk -v p="$port" '$1==p{print; exit}' "$hap_tmp")
+    hp="$(haproxy_normalize_proto "${hp:-http}")"
+    case "$REALIP_SWITCH_PROTO_MODE" in
+      tcp) l3="tcp" ;;
+      both) l3="both" ;;
+      keep) [ "$hp" = "tcp" ] && l3="both" || l3="tcp" ;;
+      *) l3="tcp" ;;
+    esac
+    awk -v p="$port" '$1!=p' "$real_tmp" > "$real_tmp.new" || true
+    printf '%s %s %s %s %s\n' "$port" "$target" "$tport" "$l3" "$hp" >> "$real_tmp.new"
+    mv -f "$real_tmp.new" "$real_tmp"
+    awk -v p="$port" '$1!=p' "$hap_tmp" > "$hap_tmp.new" || true
+    mv -f "$hap_tmp.new" "$hap_tmp"
+    selected_count=$((selected_count + 1))
+  done
+
+  # Stage and verify the kernel path first. New packets can traverse Real-IP
+  # immediately while the old HAProxy listener still exists, so there is no
+  # empty forwarding window. Then remove only the selected HAProxy listeners.
+  if ! realip_commit_entries_file "$real_tmp"; then
+    err_msg "Real-IP preflight/apply failed; HAProxy was left unchanged."
+    rm -f "$hap_tmp" "$real_tmp" "$real_before"; return 1
+  fi
+  if ! haproxy_write_entries_file "$hap_tmp"; then
+    err_msg "HAProxy rewrite failed; restoring the previous Real-IP table."
+    realip_write_entries_file "$real_before"
+    realip_sync_rules >/dev/null 2>&1 || true
+    rm -f "$hap_tmp" "$real_tmp" "$real_before"; return 1
+  fi
+  rm -f "$hap_tmp" "$real_tmp" "$real_before"
+  ok_msg "Switched $selected_count port(s): HAProxy -> Real-IP."
+  info_msg "Real-IP protocol used: $(case "$REALIP_SWITCH_PROTO_MODE" in tcp) echo TCP-only ;; both) echo TCP+UDP ;; keep) echo preserve-HAProxy-mode ;; esac)."
+  info_msg "Handshake fix: Real-IP now clamps TCP MSS on the tunnel path. Keep UDP off unless the inbound really needs UDP."
+  info_msg "One-time requirement: on the KHAREJ server open Real-IP Manager and enable 'Kharej return routing'. After that, future switches are done only here."
+}
+
+switch_realip_to_haproxy_impl() {
+  local hap_tmp real_tmp hap_before port target tport l3 restore selected_count=0 rc
+  haproxy_ensure_ready || return 1
+  hap_tmp="$(haproxy_entries_tmp)"; real_tmp="$(realip_entries_tmp)"
+  hap_before="$(mktemp)"
+  cp -f "$hap_tmp" "$hap_before"
+  if [ ! -s "$real_tmp" ]; then warn_msg "No Real-IP ports are available to switch."; rm -f "$hap_tmp" "$real_tmp" "$hap_before"; return 0; fi
+
+  realip_list_forwards
+  echo
+  select_ports_from_tmp "Real-IP -> HAProxy" "$real_tmp"; rc=$?
+  if [ "$rc" -ne 0 ]; then rm -f "$hap_tmp" "$real_tmp" "$hap_before"; return "$rc"; fi
+
+  for port in "${SELECTED_PORTS[@]}"; do
+    awk -v p="$port" '$1==p{found=1} END{exit found?0:1}' "$real_tmp" || { err_msg "Real-IP port $port was not found."; rm -f "$hap_tmp" "$real_tmp" "$hap_before"; return 1; }
+    if awk -v p="$port" '$1==p{found=1} END{exit found?0:1}' "$hap_tmp"; then
+      err_msg "HAProxy already contains port $port. Resolve the duplicate manually; nothing was switched."
+      rm -f "$hap_tmp" "$real_tmp" "$hap_before"; return 1
+    fi
+  done
+
+  for port in "${SELECTED_PORTS[@]}"; do
+    read -r _ target tport l3 restore < <(awk -v p="$port" '$1==p{print; exit}' "$real_tmp")
+    restore="$(haproxy_normalize_proto "${restore:-$(realip_restore_proto_for_l3 "$l3")}")"
+    printf '%s %s %s %s\n' "$port" "$target" "$tport" "$restore" >> "$hap_tmp"
+    awk -v p="$port" '$1!=p' "$real_tmp" > "$real_tmp.new" || true
+    mv -f "$real_tmp.new" "$real_tmp"
+    selected_count=$((selected_count + 1))
+  done
+
+  # Start HAProxy first, then remove the Real-IP NAT rules. This avoids a gap if HAProxy validation fails.
+  if ! haproxy_write_entries_file "$hap_tmp"; then
+    err_msg "HAProxy validation/restart failed; Real-IP configuration was kept unchanged."
+    rm -f "$hap_tmp" "$real_tmp" "$hap_before"; return 1
+  fi
+  if ! realip_commit_entries_file "$real_tmp"; then
+    err_msg "Real-IP removal failed; restoring the previous HAProxy table to avoid mixed ownership."
+    haproxy_write_entries_file "$hap_before" >/dev/null 2>&1 || true
+    rm -f "$hap_tmp" "$real_tmp" "$hap_before"; return 1
+  fi
+  rm -f "$hap_tmp" "$real_tmp" "$hap_before"
+  ok_msg "Switched $selected_count port(s): Real-IP -> HAProxy. Original HAProxy protocol mode was restored."
+}
+
+# Serialize operator switches so the 20-second health repair cannot overlap a
+# second manual switch. flock is part of util-linux on the supported distros.
+switch_haproxy_to_realip() {
+  if command -v flock >/dev/null 2>&1; then
+    ( flock -w 20 9 || { err_msg "Another forwarding switch is still running."; return 1; }; switch_haproxy_to_realip_impl ) 9>"$FORWARD_SWITCH_LOCK"
+  else
+    switch_haproxy_to_realip_impl
+  fi
+}
+
+switch_realip_to_haproxy() {
+  if command -v flock >/dev/null 2>&1; then
+    ( flock -w 20 9 || { err_msg "Another forwarding switch is still running."; return 1; }; switch_realip_to_haproxy_impl ) 9>"$FORWARD_SWITCH_LOCK"
+  else
+    switch_realip_to_haproxy_impl
+  fi
+}
+
+forward_switch_menu() {
+  while true; do
+    show_header "Switch Forwarding Engine"
+    echo -e "${C_BOLD}${C_WHITE}Switch Menu${C_RESET}"
+    echo -e "  ${C_CYAN}1)${C_RESET} show HAProxy + Real-IP tables"
+    echo -e "  ${C_GREEN}2)${C_RESET} HAProxy -> Real-IP ${C_DIM}(0 = ALL during selection; TCP-only default)${C_RESET}"
+    echo -e "  ${C_YELLOW}3)${C_RESET} Real-IP -> HAProxy ${C_DIM}(0 = ALL during selection)${C_RESET}"
+    echo -e "  ${C_GREEN}4)${C_RESET} repair/sync Real-IP rules"
+    echo -e "  ${C_DIM}00) Back${C_RESET}"
+    echo
+    read -rp "Choose switch option [1-4/00]: " FWD_SWITCH_CHOICE
+    case "$FWD_SWITCH_CHOICE" in
+      1) haproxy_list_forwards; echo; realip_list_forwards; pause ;;
+      2) haproxy_run_action switch_haproxy_to_realip || return 0 ;;
+      3) haproxy_run_action switch_realip_to_haproxy || return 0 ;;
+      4) haproxy_run_action realip_repair || return 0 ;;
+      00) return_main_msg; return 0 ;;
+      *) err_msg "Invalid option"; sleep 1 ;;
+    esac
+  done
+}
+
+realip_menu() {
+  mkdir -p "$REALIP_CONFIG_DIR"
+  while true; do
+    show_header "Real-IP Port Forward Manager"
+    echo -e "${C_BOLD}${C_WHITE}Real-IP Menu (DNAT without SNAT + MSS clamp)${C_RESET}"
+    echo -e "${C_DIM}Status${C_RESET}"
+    echo -e "  ${C_GREEN}1)${C_RESET} list Real-IP ports + return-routing status"
+    echo
+    echo -e "${C_DIM}Quick switch${C_RESET}"
+    echo -e "  ${C_GREEN}2)${C_RESET} switch HAProxy -> Real-IP ${C_DIM}(0 = ALL; TCP-only default)${C_RESET}"
+    echo -e "  ${C_YELLOW}3)${C_RESET} switch Real-IP -> HAProxy ${C_DIM}(0 = ALL)${C_RESET}"
+    echo
+    echo -e "${C_DIM}Real-IP ports${C_RESET}"
+    echo -e "  ${C_GREEN}4)${C_RESET} add/update Real-IP port(s) ${C_DIM}(TCP-only default)${C_RESET}"
+    echo -e "  ${C_CYAN}5)${C_RESET} change target for one port"
+    echo -e "  ${C_YELLOW}6)${C_RESET} change target for ALL ports"
+    echo -e "  ${C_MAGENTA}7)${C_RESET} set protocol / UDP mode ${C_DIM}(0 = ALL; choose TCP-only or TCP+UDP)${C_RESET}"
+    echo -e "  ${C_RED}8)${C_RESET} delete port"
+    echo
+    echo -e "${C_DIM}Repair / backend${C_RESET}"
+    echo -e "  ${C_GREEN}9)${C_RESET} repair + verify Real-IP rules"
+    echo -e "  ${C_BLUE}10)${C_RESET} toggle KHAREJ return routing ${C_DIM}(one-time backend setup)${C_RESET}"
+    echo -e "  ${C_CYAN}11)${C_RESET} 3x-ui Real-IP doctor ${C_DIM}(Proxy Protocol stays OFF)${C_RESET}"
+    echo -e "  ${C_DIM}00) Back to main menu${C_RESET}"
+    echo
+    read -rp "Choose Real-IP option [1-11/00]: " REALIP_CHOICE
+    case "$REALIP_CHOICE" in
+      1) haproxy_run_action realip_list_forwards || return 0 ;;
+      2) haproxy_run_action switch_haproxy_to_realip || return 0 ;;
+      3) haproxy_run_action switch_realip_to_haproxy || return 0 ;;
+      4) haproxy_run_action realip_add_port || return 0 ;;
+      5) haproxy_run_action realip_change_one_ip || return 0 ;;
+      6) haproxy_run_action realip_change_all_ips || return 0 ;;
+      7) haproxy_run_action realip_change_protocol || return 0 ;;
+      8) haproxy_run_action realip_delete_port || return 0 ;;
+      9) haproxy_run_action realip_repair || return 0 ;;
+      10) haproxy_run_action realip_toggle_return_routing || return 0 ;;
+      11) haproxy_run_action realip_doctor || return 0 ;;
       00) return_main_msg; return 0 ;;
       *) err_msg "Invalid option"; sleep 1 ;;
     esac
@@ -5751,25 +6757,29 @@ haproxy_menu() {
 }
 
 show_menu() {
-  show_header "GRE + WireGuard + Vira7 + ViraTCP Management v${APP_VERSION}"
+  show_header "GRE + WireGuard + Vira7 + Reverse ViraTCP v${APP_VERSION}"
   echo -e "${C_BOLD}${C_WHITE}Main Menu${C_RESET}"
   echo -e "  ${C_GREEN}1)${C_RESET} create/update tunnel"
   echo -e "  ${C_RED}2)${C_RESET} remove tunnel"
   echo -e "  ${C_YELLOW}3)${C_RESET} reset all tunnels"
   echo -e "  ${C_CYAN}4)${C_RESET} ping test tunnels"
   echo -e "  ${C_MAGENTA}5)${C_RESET} haproxy port manager"
-  echo -e "  ${C_BLUE}6)${C_RESET} optimize Vira7 CPU"
+  echo -e "  ${C_BLUE}6)${C_RESET} reverse tunnel wizard ${C_DIM}(ViraTCP; TCP transport carries TCP + UDP)${C_RESET}"
+  echo -e "  ${C_GREEN}7)${C_RESET} Real-IP port manager ${C_DIM}(lowest CPU; Proxy Protocol OFF)${C_RESET}"
+  echo -e "  ${C_YELLOW}8)${C_RESET} switch forwarding engine ${C_DIM}(HAProxy <-> Real-IP)${C_RESET}"
   echo -e "  ${C_DIM}00) Main menu / back${C_RESET}"
   echo -e "  ${C_DIM}0) Exit${C_RESET}"
   echo
-  read -rp "Choose an option [0-6]: " CHOICE
+  read -rp "Choose an option [0-8]: " CHOICE
   case "$CHOICE" in
     1) if menu_config_tunnel; then pause; fi ;;
     2) if remove_tun; then pause; fi ;;
     3) if reset_all_tunnels; then pause; fi ;;
     4) if test_tunnels_menu; then pause; fi ;;
     5) haproxy_menu || true ;;
-    6) if vira7_optimize_cpu_menu; then pause; fi ;;
+    6) if viratcp_menu_config_tunnel; then pause; fi ;;
+    7) realip_menu || true ;;
+    8) forward_switch_menu || true ;;
     00) return_main_msg ;;
     0) echo "Bye"; exit 0 ;;
     *) err_msg "Invalid option"; sleep 1 ;;
@@ -5830,8 +6840,13 @@ if [[ "${1:-}" == "--service" ]]; then
       haproxy_periodic_udp_repair
       exit $?
       ;;
+    realip-sync)
+      ensure_root
+      realip_sync_all
+      exit $?
+      ;;
     *)
-      echo "Unknown service command. Use --service supervise-gre <id>, health-check-all, haproxy-udp-sync, or haproxy-udp-repair." >&2
+      echo "Unknown service command. Use --service supervise-gre <id>, health-check-all, haproxy-udp-sync, haproxy-udp-repair, or realip-sync." >&2
       exit 1
       ;;
   esac
