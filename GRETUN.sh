@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + WireGuard + Vira7 + Reverse ViraTCP + HAProxy + Kernel Real-IP manager v9.0.0
+# GRE + WireGuard + Vira7 + Reverse ViraTCP + HAProxy + Kernel Real-IP manager v9.0.1
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
@@ -33,8 +33,13 @@ set -euo pipefail
 #   CPU menu, and exposes ViraTCP as a reverse L3 tunnel that carries TCP+UDP.
 # - v9.0.0 also removes the static ViraTCP wire magic so a session no longer
 #   starts every encrypted frame with a fixed, easily fingerprinted marker.
+# - v9.0.1 fixes successful-looking Real-IP switches with dead public ports:
+#   Kharej source-policy return routing is now enabled and verified automatically
+#   for every compatible Kharej tunnel, and candidate backend ports are probed
+#   before HAProxy ownership is removed. Reverse ViraTCP is shown only inside
+#   Create/Update Tunnel instead of occupying a separate main-menu entry.
 
-APP_VERSION="9.0.0"
+APP_VERSION="9.0.1"
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -65,7 +70,7 @@ VIRA7_DEFAULT_KEEPALIVE=5
 VIRA7_DEFAULT_BUFFER_SIZE=2097152
 VIRA7_DEFAULT_QUEUE_LEN=1000
 # Vira7 runtime defaults are fixed at creation time; there is no separate CPU
-# tuning menu in v9.0.0. These values preserve the existing packet format.
+# tuning menu in v9.0.x. These values preserve the existing packet format.
 VIRA7_DEFAULT_CHECKSUM=1
 VIRA7_DEFAULT_VERIFY_CHECKSUM=0
 VIRA7_DEFAULT_BATCH=128
@@ -881,6 +886,7 @@ tunnel_health_check_all() {
 
   # Real-IP has its own rule namespace and health check. When configured, repair
   # its DNAT/FORWARD rules and (on Kharej) the source-policy return route.
+  realip_auto_enable_kharej_return_routing || true
   realip_self_heal_check || true
 }
 
@@ -914,6 +920,11 @@ bootstrap_runtime_repairs() {
   if [ -f "$HAPROXY_CONFIG" ] && command -v haproxy >/dev/null 2>&1; then
     haproxy_install_udp_service >/dev/null 2>&1 || true
   fi
+
+  # v9.0.1: any active compatible tunnel configured with Kharej role gets the
+  # source-specific reply route automatically. This does not alter the server's
+  # normal public default route.
+  realip_auto_enable_kharej_return_routing || warn_msg "Kharej Real-IP return routing is not ready; keep affected ports on HAProxy until repaired."
 
   # Restore Real-IP forwarding/return-routing after upgrades or reboot only if
   # the operator has configured this separate engine.
@@ -3884,7 +3895,7 @@ viratcp_menu_config_tunnel() {
   show_header "Configure Reverse ViraTCP Encrypted TCP-TUN"
   echo "Iran opens one persistent outbound TCP tunnel; Kharej listens on the selected TCP port."
   echo "The L3 tunnel carries both TCP and UDP payloads without a per-forwarder handshake."
-  echo "ViraTCP wire format v2 requires GRE-TUN v9.0.0 on BOTH servers."
+  echo "ViraTCP wire format v2 requires GRE-TUN v9.0.x on BOTH servers."
   echo "Use the exact same port and 64-character PSK on both servers."
   echo
   prompt_role || return
@@ -4286,12 +4297,15 @@ heal_remaining_tunnels_after_remove() {
 menu_config_tunnel() {
   show_header "Create / Update Tunnel"
   ask_tunnel_type || return
+  local rc=0
   case "$SELECTED_TUNNEL_TYPE" in
-    gre) gre_menu_config_tunnel ;;
-    wireguard) wg_menu_config_tunnel ;;
-    vira7) vira7_menu_config_tunnel ;;
-    viratcp) viratcp_menu_config_tunnel ;;
+    gre) gre_menu_config_tunnel || rc=$? ;;
+    wireguard) wg_menu_config_tunnel || rc=$? ;;
+    vira7) vira7_menu_config_tunnel || rc=$? ;;
+    viratcp) viratcp_menu_config_tunnel || rc=$? ;;
   esac
+  if [ "$rc" -eq 0 ]; then realip_auto_enable_kharej_return_routing || rc=$?; fi
+  return "$rc"
 }
 
 status_check() {
@@ -5840,6 +5854,24 @@ realip_write_entries_file() {
   mv -f "$staged" "$REALIP_FORWARDS_FILE"
 }
 
+# A switch must not remove the working HAProxy listener when the selected Xray
+# inbound is not reachable through the tunnel. This is a TCP connect-only probe;
+# it sends no Xray/PROXY payload and therefore does not disturb the inbound.
+realip_tcp_backend_reachable() {
+  local ip="$1" port="$2"
+  validate_ipv4 "$ip" || return 1
+  validate_port "$port" || return 1
+  if command -v nc >/dev/null 2>&1; then
+    nc -z -w 3 "$ip" "$port" >/dev/null 2>&1
+  elif command -v timeout >/dev/null 2>&1; then
+    timeout 3 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$ip" "$port" >/dev/null 2>&1
+  else
+    # Minimal installations without either probe tool keep the old behavior;
+    # rule verification still runs before the switch is committed.
+    return 0
+  fi
+}
+
 # Validate the complete candidate before touching either the saved state or the
 # running firewall. An inactive or unsupported tunnel is rejected here instead
 # of silently leaving only part of the selected ports online.
@@ -5857,6 +5889,10 @@ realip_validate_entries_file() {
     case "$(realip_normalize_proto "$proto")" in tcp|both) ;; *) return 1 ;; esac
     if ! realip_resolve_target "$target" >/dev/null 2>&1 || ! tunnel_iface_is_up "$REALIP_IFACE"; then
       err_msg "Real-IP candidate rejected: $target is not on an active GRE/Vira7/Reverse-ViraTCP path."
+      return 1
+    fi
+    if ! realip_tcp_backend_reachable "$target" "$tport"; then
+      err_msg "Real-IP candidate rejected: Xray/backend $target:$tport is not accepting TCP through $REALIP_IFACE. HAProxy was not changed."
       return 1
     fi
   done < "$src"
@@ -6251,7 +6287,7 @@ realip_apply_return_routing() {
   realip_cleanup_return_routing
 
   build_tunnel_inventory
-  local i type id role ifc local_ip remote_ip applied=0 route_mtu
+  local i type id role ifc local_ip remote_ip applied=0 failed=0 route_mtu route_check
   for i in "${!INV_TYPE[@]}"; do
     type="${INV_TYPE[$i]:-}"; id="${INV_ID[$i]:-}"
     case "$type" in gre|vira7|viratcp) ;; *) continue ;; esac
@@ -6272,14 +6308,39 @@ realip_apply_return_routing() {
     # The peer /32 keeps the tunnel peer reachable inside the dedicated table;
     # arbitrary client destinations are then sent back through the same L3 tunnel.
     # The explicit MTU avoids large SYN-ACK / TLS records selecting the physical MTU.
-    ip route replace "$remote_ip/32" dev "$ifc" scope link table "$REALIP_ROUTE_TABLE"
-    ip route replace default dev "$ifc" mtu "$route_mtu" table "$REALIP_ROUTE_TABLE"
-    ip rule add priority "$REALIP_ROUTE_PRIO" from "$local_ip/32" lookup "$REALIP_ROUTE_TABLE"
+    if ! ip -4 route replace "$remote_ip/32" dev "$ifc" scope link table "$REALIP_ROUTE_TABLE"; then
+      warn_msg "Return route failed for $type$id: could not add peer route in table $REALIP_ROUTE_TABLE."
+      failed=$((failed + 1))
+      continue
+    fi
+    if ! ip -4 route replace default dev "$ifc" mtu "$route_mtu" table "$REALIP_ROUTE_TABLE"; then
+      warn_msg "Return route failed for $type$id: could not add default route in table $REALIP_ROUTE_TABLE."
+      ip -4 route flush table "$REALIP_ROUTE_TABLE" 2>/dev/null || true
+      failed=$((failed + 1))
+      continue
+    fi
+    if ! ip -4 rule add priority "$REALIP_ROUTE_PRIO" from "$local_ip/32" lookup "$REALIP_ROUTE_TABLE" 2>/dev/null; then
+      if ! ip -4 rule show 2>/dev/null | grep -Eq "^${REALIP_ROUTE_PRIO}:.*from ${local_ip}([ /]|$).*lookup ${REALIP_ROUTE_TABLE}([[:space:]]|$)"; then
+        warn_msg "Return route failed for $type$id: could not add source rule $local_ip -> table $REALIP_ROUTE_TABLE."
+        ip -4 route flush table "$REALIP_ROUTE_TABLE" 2>/dev/null || true
+        failed=$((failed + 1))
+        continue
+      fi
+    fi
+
+    route_check="$(ip -4 route get 1.1.1.1 from "$local_ip" 2>/dev/null | head -n1 || true)"
+    if ! grep -Eq "(^|[[:space:]])dev ${ifc}([[:space:]]|$)" <<< "$route_check"; then
+      warn_msg "Return route verification failed for $type$id: reply traffic from $local_ip is not selecting $ifc."
+      ip -4 rule del priority "$REALIP_ROUTE_PRIO" from "$local_ip/32" lookup "$REALIP_ROUTE_TABLE" 2>/dev/null || true
+      ip -4 route flush table "$REALIP_ROUTE_TABLE" 2>/dev/null || true
+      failed=$((failed + 1))
+      continue
+    fi
     applied=$((applied + 1))
   done
   ip route flush cache 2>/dev/null || true
-  [ "$applied" -gt 0 ] || { warn_msg "Real-IP return routing is enabled, but no Kharej-role GRE/Vira7/ViraTCP tunnel was available."; return 1; }
-  return 0
+  [ "$applied" -gt 0 ] || { warn_msg "Real-IP return routing is enabled, but no active Kharej-role GRE/Vira7/ViraTCP tunnel was available."; return 1; }
+  [ "$failed" -eq 0 ]
 }
 
 realip_return_routing_healthy() {
@@ -6291,14 +6352,55 @@ realip_return_routing_healthy() {
     case "$type" in gre|vira7|viratcp) ;; *) continue ;; esac
     role="$(realip_saved_role_for_item "$type" "$id" 2>/dev/null || true)"
     [ "$role" = "2" ] || continue
-    found=1
     ifc="${INV_IFACE[$i]:-}"
+    tunnel_iface_is_up "$ifc" || continue
+    found=1
     local_ip="${INV_LOCAL[$i]:-}"; local_ip="${local_ip%%/*}"
     realip_route_numbers "$type" "$id" || return 1
     ip -4 rule show 2>/dev/null | grep -Eq "^${REALIP_ROUTE_PRIO}:.*from ${local_ip}([ /]|$).*lookup ${REALIP_ROUTE_TABLE}([[:space:]]|$)" || return 1
     ip -4 route show table "$REALIP_ROUTE_TABLE" 2>/dev/null | grep -Eq "^default .*dev ${ifc}([[:space:]]|$)" || return 1
   done
-  [ "$found" -eq 1 ]
+  # No active Kharej tunnel is not a routing failure. The health timer calls the
+  # auto-enable function first and will install/verify routes as soon as one is up.
+  [ "$found" -eq 0 ] && return 0
+  return 0
+}
+
+# Real client IP preservation requires the Xray server to send replies sourced
+# from its tunnel IP back through that same tunnel. This narrow source-policy
+# rule is safe to enable automatically on Kharej and removes the hidden manual
+# step that caused v9.0.0 switches to look successful while public ports died.
+realip_auto_enable_kharej_return_routing() {
+  build_tunnel_inventory
+  local i type id role ifc found=0 newly_enabled=0
+  for i in "${!INV_TYPE[@]}"; do
+    type="${INV_TYPE[$i]:-}"; id="${INV_ID[$i]:-}"; ifc="${INV_IFACE[$i]:-}"
+    case "$type" in gre|vira7|viratcp) ;; *) continue ;; esac
+    role="$(realip_saved_role_for_item "$type" "$id" 2>/dev/null || true)"
+    [ "$role" = "2" ] || continue
+    tunnel_iface_is_up "$ifc" || continue
+    found=1
+    break
+  done
+  [ "$found" -eq 1 ] || return 0
+
+  if [ -f "$REALIP_RETURN_MARKER" ] && realip_return_routing_healthy; then
+    return 0
+  fi
+
+  mkdir -p "$REALIP_CONFIG_DIR"
+  if [ ! -f "$REALIP_RETURN_MARKER" ]; then newly_enabled=1; fi
+  printf 'enabled-auto-v9.0.1\n' > "$REALIP_RETURN_MARKER"
+  chmod 600 "$REALIP_RETURN_MARKER"
+  realip_install_service >/dev/null 2>&1 || true
+
+  if realip_apply_return_routing && realip_return_routing_healthy; then
+    [ "$newly_enabled" -eq 0 ] || ok_msg "Kharej Real-IP return routing enabled automatically for active tunnel(s)."
+    return 0
+  fi
+
+  err_msg "Kharej Real-IP return routing could not be verified; Real-IP forwarding must not be used until this is repaired."
+  return 1
 }
 
 realip_sync_all() {
@@ -6524,7 +6626,7 @@ realip_doctor() {
   fi
 
   echo
-  info_msg "KHAREJ must have return routing enabled once; otherwise Xray receives the SYN but replies leave through the public gateway."
+  info_msg "On v9.0.1, Kharej return routing is enabled automatically when an active Kharej-role tunnel is detected."
   return "$failed"
 }
 
@@ -6625,7 +6727,7 @@ switch_haproxy_to_realip_impl() {
   ok_msg "Switched $selected_count port(s): HAProxy -> Real-IP."
   info_msg "Real-IP protocol used: $(case "$REALIP_SWITCH_PROTO_MODE" in tcp) echo TCP-only ;; both) echo TCP+UDP ;; keep) echo preserve-HAProxy-mode ;; esac)."
   info_msg "Handshake fix: Real-IP now clamps TCP MSS on the tunnel path. Keep UDP off unless the inbound really needs UDP."
-  info_msg "One-time requirement: on the KHAREJ server open Real-IP Manager and enable 'Kharej return routing'. After that, future switches are done only here."
+  info_msg "Kharej requirement: run GRE-TUN v9.0.1 once on the panel server; return routing is then enabled and verified automatically."
 }
 
 switch_realip_to_haproxy_impl() {
@@ -6764,22 +6866,20 @@ show_menu() {
   echo -e "  ${C_YELLOW}3)${C_RESET} reset all tunnels"
   echo -e "  ${C_CYAN}4)${C_RESET} ping test tunnels"
   echo -e "  ${C_MAGENTA}5)${C_RESET} haproxy port manager"
-  echo -e "  ${C_BLUE}6)${C_RESET} reverse tunnel wizard ${C_DIM}(ViraTCP; TCP transport carries TCP + UDP)${C_RESET}"
-  echo -e "  ${C_GREEN}7)${C_RESET} Real-IP port manager ${C_DIM}(lowest CPU; Proxy Protocol OFF)${C_RESET}"
-  echo -e "  ${C_YELLOW}8)${C_RESET} switch forwarding engine ${C_DIM}(HAProxy <-> Real-IP)${C_RESET}"
+  echo -e "  ${C_GREEN}6)${C_RESET} Real-IP port manager ${C_DIM}(lowest CPU; Proxy Protocol OFF)${C_RESET}"
+  echo -e "  ${C_YELLOW}7)${C_RESET} switch forwarding engine ${C_DIM}(HAProxy <-> Real-IP)${C_RESET}"
   echo -e "  ${C_DIM}00) Main menu / back${C_RESET}"
   echo -e "  ${C_DIM}0) Exit${C_RESET}"
   echo
-  read -rp "Choose an option [0-8]: " CHOICE
+  read -rp "Choose an option [0-7]: " CHOICE
   case "$CHOICE" in
     1) if menu_config_tunnel; then pause; fi ;;
     2) if remove_tun; then pause; fi ;;
     3) if reset_all_tunnels; then pause; fi ;;
     4) if test_tunnels_menu; then pause; fi ;;
     5) haproxy_menu || true ;;
-    6) if viratcp_menu_config_tunnel; then pause; fi ;;
-    7) realip_menu || true ;;
-    8) forward_switch_menu || true ;;
+    6) realip_menu || true ;;
+    7) forward_switch_menu || true ;;
     00) return_main_msg ;;
     0) echo "Bye"; exit 0 ;;
     *) err_msg "Invalid option"; sleep 1 ;;
