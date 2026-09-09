@@ -198,12 +198,12 @@ show_header() {
   local ip_addr
   ip_addr="$(detect_local_public_ip || true)"
   clear 2>/dev/null || true
-  echo -e "${C_CYAN}${C_BOLD}╔══════════════════════════════════════════════════════╗${C_RESET}"
-  printf "${C_CYAN}${C_BOLD}║${C_RESET} %-52s ${C_CYAN}${C_BOLD}║${C_RESET}
+  echo -e "${C_CYAN}${C_BOLD}â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—${C_RESET}"
+  printf "${C_CYAN}${C_BOLD}â•‘${C_RESET} %-52s ${C_CYAN}${C_BOLD}â•‘${C_RESET}
 " "$title"
-  printf "${C_CYAN}${C_BOLD}║${C_RESET} Local public IP: %-35s ${C_CYAN}${C_BOLD}║${C_RESET}
+  printf "${C_CYAN}${C_BOLD}â•‘${C_RESET} Local public IP: %-35s ${C_CYAN}${C_BOLD}â•‘${C_RESET}
 " "${ip_addr:-UNKNOWN}"
-  echo -e "${C_CYAN}${C_BOLD}╚══════════════════════════════════════════════════════╝${C_RESET}"
+  echo -e "${C_CYAN}${C_BOLD}â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•${C_RESET}"
   echo
 }
 
@@ -249,16 +249,14 @@ ask_tunnel_type() {
   echo "Select tunnel type:"
   echo "1) Normal GRE tunnel"
   echo "2) WireGuard tunnel"
-  echo "3) Vira7 UDP-TUN tunnel"
-  echo "4) ViraTCP encrypted TCP-TUN (anti UDP/GRE filtering)"
+  echo "3) ViraTCP encrypted TCP-TUN (anti UDP/GRE filtering)"
   echo
-  read -rp "Choose [1-4] (00=menu): " TUNNEL_TYPE_CHOICE
+  read -rp "Choose [1-3] (00=menu): " TUNNEL_TYPE_CHOICE
   if is_main_menu_token "$TUNNEL_TYPE_CHOICE"; then return_main_msg; return 99; fi
   case "$TUNNEL_TYPE_CHOICE" in
     1) SELECTED_TUNNEL_TYPE="gre" ;;
     2) SELECTED_TUNNEL_TYPE="wireguard" ;;
-    3) SELECTED_TUNNEL_TYPE="vira7" ;;
-    4) SELECTED_TUNNEL_TYPE="viratcp" ;;
+    3) SELECTED_TUNNEL_TYPE="viratcp" ;;
     *) echo "Invalid tunnel type"; return 1 ;;
   esac
 }
@@ -4047,21 +4045,6 @@ build_tunnel_inventory() {
     INV_TYPE+=("wireguard"); INV_ID+=("$id"); INV_IFACE+=("$ifc"); INV_LOCAL+=("$local_ip"); INV_TARGET+=("$target"); INV_LOCAL_PUBLIC+=("$local_pub"); INV_REMOTE_PUBLIC+=("$remote_pub"); INV_STATE+=("$state"); INV_DESC+=("$desc")
   done <<< "$ids"
 
-  ids="$(vira7_collect_ids || true)"
-  while IFS= read -r id; do
-    [ -n "$id" ] || continue
-    ifc="$(vira7_iface_name "$id")"
-    local_ip=""; target=""; local_pub=""; remote_pub=""; desc="Vira7 UDP-TUN"
-    if vira7_load_config "$id"; then
-      local_ip="${LOCAL_VIRA7_IP:-${local_priv:-}}"
-      target="${REMOTE_VIRA7_IP:-${remote_priv:-}}"
-      local_pub="${LOCAL_PUBLIC_IP:-${bind_ip:-}}"
-      remote_pub="${REMOTE_PUBLIC_IP:-${remote_ip:-}}"
-    fi
-    if tunnel_iface_is_up "$ifc"; then state="active"; else state="inactive"; fi
-    INV_TYPE+=("vira7"); INV_ID+=("$id"); INV_IFACE+=("$ifc"); INV_LOCAL+=("$local_ip"); INV_TARGET+=("$target"); INV_LOCAL_PUBLIC+=("$local_pub"); INV_REMOTE_PUBLIC+=("$remote_pub"); INV_STATE+=("$state"); INV_DESC+=("$desc")
-  done <<< "$ids"
-
   ids="$(viratcp_collect_ids || true)"
   while IFS= read -r id; do
     [ -n "$id" ] || continue
@@ -4572,16 +4555,106 @@ test_all_tunnels_ping() {
   echo "============================================================"
 }
 
+tunnel_speed_test_menu() {
+  show_header "Tunnel Throughput Speed Test"
+  command -v iperf3 >/dev/null 2>&1 || {
+    echo "iperf3 is required. Install it now? [y/N]"
+    read -r answer
+    [[ "$answer" =~ ^[Yy]$ ]] || return 1
+    if command -v apt-get >/dev/null 2>&1; then apt-get update -y && apt-get install -y iperf3
+    elif command -v dnf >/dev/null 2>&1; then dnf install -y iperf3
+    elif command -v yum >/dev/null 2>&1; then yum install -y iperf3
+    else echo "No supported package manager found."; return 1; fi
+  }
+  build_tunnel_inventory
+  print_tunnel_inventory || return
+  read -rp "Select tunnel number for speed test (00=menu): " selected
+  if is_main_menu_token "$selected"; then return 99; fi
+  [[ "$selected" =~ ^[0-9]+$ ]] && [ "$selected" -ge 1 ] && [ "$selected" -le "${#INV_TYPE[@]}" ] || { err_msg "Invalid tunnel selection."; return 1; }
+  local idx=$((selected-1)) local_ip="${INV_LOCAL[$idx]}" target
+  echo "Select this server's location:"
+  echo "1) Iran (client)"
+  echo "2) Kharej/outside (iperf3 server)"
+  read -rp "Choose [1-2] (00=menu): " role
+  if is_main_menu_token "$role"; then return 99; fi
+  read -rp "Remote tunnel IPv4 (inner IP): " target
+  validate_ipv4 "$target" || { err_msg "Invalid IPv4."; return 1; }
+  read -rp "Test duration seconds [10]: " duration
+  duration="${duration:-10}"
+  [[ "$duration" =~ ^[0-9]+$ ]] || duration=10
+  echo
+  if [ "$role" = "2" ]; then
+    echo "Starting iperf3 server on this (Kharej) side. Run the same speed test on Iran and press Ctrl-C when finished."
+    iperf3 -s
+  elif [ "$role" = "1" ]; then
+    echo "Make sure iperf3 -s is running on the Kharej server, then testing through the selected tunnel..."
+    if [ -n "$local_ip" ]; then iperf3 -c "$target" -B "$local_ip" -t "$duration" -P 4
+    else iperf3 -c "$target" -t "$duration" -P 4; fi
+  else
+    err_msg "Invalid role."; return 1
+  fi
+}
+
+tunnel_ecmp_multipath_menu() {
+  show_header "Multi-Tunnel ECMP Aggregation"
+  if ! command -v ip >/dev/null 2>&1; then
+    echo "iproute2 is required. Install it now? [y/N]"; read -r answer
+    [[ "$answer" =~ ^[Yy]$ ]] || return 1
+    if command -v apt-get >/dev/null 2>&1; then apt-get update -y && apt-get install -y iproute2
+    elif command -v dnf >/dev/null 2>&1; then dnf install -y iproute
+    elif command -v yum >/dev/null 2>&1; then yum install -y iproute
+    else err_msg "No supported package manager found."; return 1; fi
+  fi
+  build_tunnel_inventory
+  print_tunnel_inventory || return
+  echo "Enter two or more tunnel list numbers separated by commas (example: 1,2,3)."
+  read -rp "Tunnels (00=menu): " raw
+  if is_main_menu_token "$raw"; then return 99; fi
+  raw="${raw// /}"
+  IFS=',' read -ra picks <<< "$raw"
+  [ "${#picks[@]}" -ge 2 ] || { err_msg "Select at least two tunnels."; return 1; }
+  local target="" p idx ifc state route=""
+  for p in "${picks[@]}"; do
+    [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le "${#INV_TYPE[@]}" ] || { err_msg "Invalid tunnel number: $p"; return 1; }
+    idx=$((p-1)); ifc="${INV_IFACE[$idx]}"; state="${INV_STATE[$idx]}"
+    [ "$state" = "active" ] || { err_msg "Tunnel $p ($ifc) is not active."; return 1; }
+    [ -n "$target" ] && [ "$target" != "${INV_TARGET[$idx]}" ] && { err_msg "Selected tunnels have different remote inner IPs."; return 1; }
+    target="${INV_TARGET[$idx]}"
+    [ -n "$target" ] || { err_msg "Remote inner IP is missing for tunnel $p."; return 1; }
+    route+=" nexthop dev $ifc weight 1"
+  done
+  validate_ipv4 "$target" || { err_msg "Invalid remote inner IP: $target"; return 1; }
+  if ! ip route replace "$target/32" scope link$route; then
+    err_msg "ECMP route installation failed."; return 1
+  fi
+  sysctl -w net.ipv4.fib_multipath_hash_policy=1 >/dev/null 2>&1 || true
+  echo
+  ok_msg "ECMP multipath route installed for $target across ${#picks[@]} tunnels."
+  echo "Parallel connections can use the combined capacity; one TCP connection may remain on one path."
+  echo "To remove it later: ip route del $target/32"
+}
+
 test_tunnels_menu() {
   show_header "Tunnel Ping Test"
   build_tunnel_inventory
   print_tunnel_inventory || return
 
   echo -e "${C_GREEN}${C_BOLD}0) ping ALL tunnels${C_RESET}"
+  echo -e "${C_MAGENTA}${C_BOLD}s) throughput speed test (iperf3)${C_RESET}"
+  echo -e "${C_BLUE}${C_BOLD}m) combine multiple tunnels (ECMP)${C_RESET}"
   echo "Select a tunnel number from the list, or 0 to ping all."
   echo
-  read -rp "Choose tunnel to ping [0/list number] (00=menu): " selected
+  read -rp "Choose tunnel to ping [0/list number/s] (00=menu): " selected
   if is_main_menu_token "$selected"; then return_main_msg; return 99; fi
+
+  if [[ "$selected" =~ ^[sS]$ ]]; then
+    tunnel_speed_test_menu
+    return
+  fi
+  if [[ "$selected" =~ ^[mM]$ ]]; then
+    tunnel_ecmp_multipath_menu
+    return
+  fi
 
   if [ "$selected" = "0" ]; then
     local i total ok fail
@@ -4768,7 +4841,7 @@ haproxy_install_package() {
   fi
 
   if ! haproxy_is_installed; then
-    err_msg "HAProxy نصب نشد. این بخش بدون نصب HAProxy کار نمی‌کند؛ حتماً باید نصبش کنی."
+    err_msg "HAProxy Ù†ØµØ¨ Ù†Ø´Ø¯. Ø§ÛŒÙ† Ø¨Ø®Ø´ Ø¨Ø¯ÙˆÙ† Ù†ØµØ¨ HAProxy Ú©Ø§Ø± Ù†Ù…ÛŒâ€ŒÚ©Ù†Ø¯Ø› Ø­ØªÙ…Ø§Ù‹ Ø¨Ø§ÛŒØ¯ Ù†ØµØ¨Ø´ Ú©Ù†ÛŒ."
     return 1
   fi
 
@@ -5751,25 +5824,23 @@ haproxy_menu() {
 }
 
 show_menu() {
-  show_header "GRE + WireGuard + Vira7 + ViraTCP Management v${APP_VERSION}"
+  show_header "GRE + WireGuard + ViraTCP Management v${APP_VERSION}"
   echo -e "${C_BOLD}${C_WHITE}Main Menu${C_RESET}"
   echo -e "  ${C_GREEN}1)${C_RESET} create/update tunnel"
   echo -e "  ${C_RED}2)${C_RESET} remove tunnel"
   echo -e "  ${C_YELLOW}3)${C_RESET} reset all tunnels"
   echo -e "  ${C_CYAN}4)${C_RESET} ping test tunnels"
   echo -e "  ${C_MAGENTA}5)${C_RESET} haproxy port manager"
-  echo -e "  ${C_BLUE}6)${C_RESET} optimize Vira7 CPU"
   echo -e "  ${C_DIM}00) Main menu / back${C_RESET}"
   echo -e "  ${C_DIM}0) Exit${C_RESET}"
   echo
-  read -rp "Choose an option [0-6]: " CHOICE
+  read -rp "Choose an option [0-5]: " CHOICE
   case "$CHOICE" in
     1) if menu_config_tunnel; then pause; fi ;;
     2) if remove_tun; then pause; fi ;;
     3) if reset_all_tunnels; then pause; fi ;;
     4) if test_tunnels_menu; then pause; fi ;;
     5) haproxy_menu || true ;;
-    6) if vira7_optimize_cpu_menu; then pause; fi ;;
     00) return_main_msg ;;
     0) echo "Bye"; exit 0 ;;
     *) err_msg "Invalid option"; sleep 1 ;;
