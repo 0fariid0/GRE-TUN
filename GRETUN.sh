@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + WireGuard + Vira7 + ViraTCP + HAProxy multi-tunnel manager v8.8.2
+# GRE + WireGuard + ViraTCP + HAProxy multi-tunnel manager v8.8.4
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
@@ -20,8 +20,9 @@ set -euo pipefail
 #   rebuilds its UDP companion rules, and verifies DNAT/SNAT/FORWARD installation per port
 # - v8.8.3 adds HAProxy UDP auto-heal: the existing 20s health monitor detects missing managed UDP rules
 #   and repairs them immediately, while an hourly systemd timer force-runs the same repair as HAProxy option 8
+# - v8.8.4 adds iperf3 tunnel throughput tests and optional ECMP multipath routes across active tunnel interfaces
 
-APP_VERSION="8.8.3"
+APP_VERSION="8.8.4"
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -198,12 +199,10 @@ show_header() {
   local ip_addr
   ip_addr="$(detect_local_public_ip || true)"
   clear 2>/dev/null || true
-  echo -e "${C_CYAN}${C_BOLD}â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—${C_RESET}"
-  printf "${C_CYAN}${C_BOLD}â•‘${C_RESET} %-52s ${C_CYAN}${C_BOLD}â•‘${C_RESET}
-" "$title"
-  printf "${C_CYAN}${C_BOLD}â•‘${C_RESET} Local public IP: %-35s ${C_CYAN}${C_BOLD}â•‘${C_RESET}
-" "${ip_addr:-UNKNOWN}"
-  echo -e "${C_CYAN}${C_BOLD}â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•${C_RESET}"
+  echo -e "${C_CYAN}${C_BOLD}╔══════════════════════════════════════════════════════╗${C_RESET}"
+  printf "${C_CYAN}${C_BOLD}║${C_RESET} %-52s ${C_CYAN}${C_BOLD}║${C_RESET}\n" "$title"
+  printf "${C_CYAN}${C_BOLD}║${C_RESET} Local public IP: %-35s ${C_CYAN}${C_BOLD}║${C_RESET}\n" "${ip_addr:-UNKNOWN}"
+  echo -e "${C_CYAN}${C_BOLD}╚══════════════════════════════════════════════════════╝${C_RESET}"
   echo
 }
 
@@ -528,13 +527,19 @@ net.ipv4.ip_forward=1
 net.ipv4.conf.all.rp_filter=0
 net.ipv4.conf.default.rp_filter=0
 net.ipv4.conf.all.src_valid_mark=1
+net.ipv4.fib_multipath_hash_policy=1
 EOF_SYSCTL
+  fi
+
+  if ! grep -q '^net.ipv4.fib_multipath_hash_policy=' "$sysctl_file" 2>/dev/null; then
+    echo 'net.ipv4.fib_multipath_hash_policy=1' >> "$sysctl_file"
   fi
 
   sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
   sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true
   sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true
   sysctl -w net.ipv4.conf.all.src_valid_mark=1 >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.fib_multipath_hash_policy=1 >/dev/null 2>&1 || true
 
   local rp
   for rp in /proc/sys/net/ipv4/conf/*/rp_filter; do
@@ -4557,35 +4562,49 @@ test_all_tunnels_ping() {
 
 tunnel_speed_test_menu() {
   show_header "Tunnel Throughput Speed Test"
-  command -v iperf3 >/dev/null 2>&1 || {
-    echo "iperf3 is required. Install it now? [y/N]"
-    read -r answer
-    [[ "$answer" =~ ^[Yy]$ ]] || return 1
-    if command -v apt-get >/dev/null 2>&1; then apt-get update -y && apt-get install -y iperf3
-    elif command -v dnf >/dev/null 2>&1; then dnf install -y iperf3
-    elif command -v yum >/dev/null 2>&1; then yum install -y iperf3
-    else echo "No supported package manager found."; return 1; fi
-  }
+  if ! command -v iperf3 >/dev/null 2>&1; then
+    info_msg "iperf3 is missing; installing it automatically..."
+    if command -v apt-get >/dev/null 2>&1; then
+      apt-get update || true
+      DEBIAN_FRONTEND=noninteractive apt-get install -y iperf3 || { err_msg "iperf3 installation failed."; return 1; }
+    elif command -v dnf >/dev/null 2>&1; then
+      dnf install -y iperf3 || { err_msg "iperf3 installation failed."; return 1; }
+    elif command -v yum >/dev/null 2>&1; then
+      yum install -y iperf3 || { err_msg "iperf3 installation failed."; return 1; }
+    else
+      err_msg "No supported package manager found; install iperf3 manually."; return 1
+    fi
+  fi
+  command -v iperf3 >/dev/null 2>&1 || { err_msg "iperf3 is unavailable after installation."; return 1; }
   build_tunnel_inventory
   print_tunnel_inventory || return
   read -rp "Select tunnel number for speed test (00=menu): " selected
   if is_main_menu_token "$selected"; then return 99; fi
   [[ "$selected" =~ ^[0-9]+$ ]] && [ "$selected" -ge 1 ] && [ "$selected" -le "${#INV_TYPE[@]}" ] || { err_msg "Invalid tunnel selection."; return 1; }
-  local idx=$((selected-1)) local_ip="${INV_LOCAL[$idx]}" target
+  local idx local_ip target role duration answer
+  idx=$((selected - 1))
+  local_ip="${INV_LOCAL[$idx]:-}"
   echo "Select this server's location:"
   echo "1) Iran (client)"
   echo "2) Kharej/outside (iperf3 server)"
   read -rp "Choose [1-2] (00=menu): " role
   if is_main_menu_token "$role"; then return 99; fi
-  read -rp "Remote tunnel IPv4 (inner IP): " target
-  validate_ipv4 "$target" || { err_msg "Invalid IPv4."; return 1; }
+  if [ "$role" = "1" ]; then
+    target="${INV_TARGET[$idx]:-}"
+    read -rp "Remote tunnel IPv4 (inner IP) [${target:-required}]: " answer
+    target="${answer:-$target}"
+    validate_ipv4 "$target" || { err_msg "Invalid remote IPv4."; return 1; }
+  elif [ "$role" != "2" ]; then
+    err_msg "Invalid role."; return 1
+  fi
   read -rp "Test duration seconds [10]: " duration
   duration="${duration:-10}"
-  [[ "$duration" =~ ^[0-9]+$ ]] || duration=10
+  [[ "$duration" =~ ^[1-9][0-9]*$ ]] || duration=10
   echo
   if [ "$role" = "2" ]; then
-    echo "Starting iperf3 server on this (Kharej) side. Run the same speed test on Iran and press Ctrl-C when finished."
-    iperf3 -s
+    iperf3_prepare_firewall "${INV_IFACE[$idx]:-}"
+    echo "Starting iperf3 server on this (Kharej) side. Run the client test from Iran, then press Ctrl-C to stop."
+    if [ -n "$local_ip" ]; then iperf3 -s -B "$local_ip"; else iperf3 -s; fi
   elif [ "$role" = "1" ]; then
     echo "Make sure iperf3 -s is running on the Kharej server, then testing through the selected tunnel..."
     if [ -n "$local_ip" ]; then iperf3 -c "$target" -B "$local_ip" -t "$duration" -P 4
@@ -4598,13 +4617,19 @@ tunnel_speed_test_menu() {
 tunnel_ecmp_multipath_menu() {
   show_header "Multi-Tunnel ECMP Aggregation"
   if ! command -v ip >/dev/null 2>&1; then
-    echo "iproute2 is required. Install it now? [y/N]"; read -r answer
-    [[ "$answer" =~ ^[Yy]$ ]] || return 1
-    if command -v apt-get >/dev/null 2>&1; then apt-get update -y && apt-get install -y iproute2
-    elif command -v dnf >/dev/null 2>&1; then dnf install -y iproute
-    elif command -v yum >/dev/null 2>&1; then yum install -y iproute
-    else err_msg "No supported package manager found."; return 1; fi
+    info_msg "iproute2 is missing; installing it automatically..."
+    if command -v apt-get >/dev/null 2>&1; then
+      apt-get update || true
+      DEBIAN_FRONTEND=noninteractive apt-get install -y iproute2 || { err_msg "iproute2 installation failed."; return 1; }
+    elif command -v dnf >/dev/null 2>&1; then
+      dnf install -y iproute || { err_msg "iproute installation failed."; return 1; }
+    elif command -v yum >/dev/null 2>&1; then
+      yum install -y iproute || { err_msg "iproute installation failed."; return 1; }
+    else
+      err_msg "No supported package manager found; install iproute2 manually."; return 1
+    fi
   fi
+  command -v ip >/dev/null 2>&1 || { err_msg "iproute2 is unavailable after installation."; return 1; }
   build_tunnel_inventory
   print_tunnel_inventory || return
   echo "Enter two or more tunnel list numbers separated by commas (example: 1,2,3)."
@@ -4613,25 +4638,52 @@ tunnel_ecmp_multipath_menu() {
   raw="${raw// /}"
   IFS=',' read -ra picks <<< "$raw"
   [ "${#picks[@]}" -ge 2 ] || { err_msg "Select at least two tunnels."; return 1; }
-  local target="" p idx ifc state route=""
+  local destination p idx ifc state route="" seen=" "
   for p in "${picks[@]}"; do
     [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le "${#INV_TYPE[@]}" ] || { err_msg "Invalid tunnel number: $p"; return 1; }
-    idx=$((p-1)); ifc="${INV_IFACE[$idx]}"; state="${INV_STATE[$idx]}"
+    case "$seen" in *" $p "*) { err_msg "Tunnel $p was selected more than once."; return 1; } ;; esac
+    seen+="$p "
+    idx=$((p - 1)); ifc="${INV_IFACE[$idx]}"; state="${INV_STATE[$idx]}"
     [ "$state" = "active" ] || { err_msg "Tunnel $p ($ifc) is not active."; return 1; }
-    [ -n "$target" ] && [ "$target" != "${INV_TARGET[$idx]}" ] && { err_msg "Selected tunnels have different remote inner IPs."; return 1; }
-    target="${INV_TARGET[$idx]}"
-    [ -n "$target" ] || { err_msg "Remote inner IP is missing for tunnel $p."; return 1; }
     route+=" nexthop dev $ifc weight 1"
   done
-  validate_ipv4 "$target" || { err_msg "Invalid remote inner IP: $target"; return 1; }
-  if ! ip route replace "$target/32" scope link$route; then
-    err_msg "ECMP route installation failed."; return 1
+
+  echo
+  echo "Enter a remote destination reachable through every selected tunnel."
+  echo "Use an address (for example 10.50.0.10) or a CIDR (for example 10.50.0.0/24)."
+  read -rp "Remote destination (00=menu): " destination
+  if is_main_menu_token "$destination"; then return 99; fi
+  local dest_ip dest_prefix
+  if [[ "$destination" =~ ^([^/]+)/([0-9]{1,2})$ ]]; then
+    dest_ip="${BASH_REMATCH[1]}"; dest_prefix="${BASH_REMATCH[2]}"
+    validate_ipv4 "$dest_ip" || { err_msg "Invalid destination IPv4."; return 1; }
+    [ "$dest_prefix" -ge 1 ] && [ "$dest_prefix" -le 32 ] || { err_msg "CIDR prefix must be between 1 and 32."; return 1; }
+  else
+    validate_ipv4 "$destination" || { err_msg "Invalid destination. Use IPv4 or IPv4/CIDR."; return 1; }
+    dest_ip="$destination"; dest_prefix=32
+  fi
+  destination="$dest_ip/$dest_prefix"
+  if ! ip route replace "$destination" scope link$route; then
+    err_msg "ECMP route installation failed for $destination."; return 1
   fi
   sysctl -w net.ipv4.fib_multipath_hash_policy=1 >/dev/null 2>&1 || true
   echo
-  ok_msg "ECMP multipath route installed for $target across ${#picks[@]} tunnels."
+  ok_msg "ECMP multipath route installed for $destination across ${#picks[@]} tunnels."
   echo "Parallel connections can use the combined capacity; one TCP connection may remain on one path."
-  echo "To remove it later: ip route del $target/32"
+  echo "To remove it later: ip route del $destination"
+}
+
+iperf3_prepare_firewall() {
+  local ifc="${1:-}" port=5201
+  [ -n "$ifc" ] || return 0
+  if command -v iptables >/dev/null 2>&1; then
+    if ! iptables -C INPUT -i "$ifc" -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1; then
+      iptables -I INPUT -i "$ifc" -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1 || true
+    fi
+  fi
+  if command -v ufw >/dev/null 2>&1; then
+    ufw allow in on "$ifc" to any port "$port" proto tcp >/dev/null 2>&1 || true
+  fi
 }
 
 test_tunnels_menu() {
@@ -4841,7 +4893,7 @@ haproxy_install_package() {
   fi
 
   if ! haproxy_is_installed; then
-    err_msg "HAProxy Ù†ØµØ¨ Ù†Ø´Ø¯. Ø§ÛŒÙ† Ø¨Ø®Ø´ Ø¨Ø¯ÙˆÙ† Ù†ØµØ¨ HAProxy Ú©Ø§Ø± Ù†Ù…ÛŒâ€ŒÚ©Ù†Ø¯Ø› Ø­ØªÙ…Ø§Ù‹ Ø¨Ø§ÛŒØ¯ Ù†ØµØ¨Ø´ Ú©Ù†ÛŒ."
+    err_msg "HAProxy نصب نشد. این بخش بدون نصب HAProxy کار نمی‌کند؛ حتماً باید نصبش کنی."
     return 1
   fi
 
