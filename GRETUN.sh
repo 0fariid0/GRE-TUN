@@ -22,7 +22,7 @@ set -euo pipefail
 #   and repairs them immediately, while an hourly systemd timer force-runs the same repair as HAProxy option 8
 # - v8.8.4 adds iperf3 tunnel throughput tests and optional ECMP multipath routes across active tunnel interfaces
 
-APP_VERSION="8.8.4"
+APP_VERSION="8.9.0"
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -4614,6 +4614,109 @@ tunnel_speed_test_menu() {
   fi
 }
 
+
+ensure_aggregation_dependencies() {
+  local missing=()
+  for c in ip iptables; do
+    command -v "$c" >/dev/null 2>&1 || missing+=("$c")
+  done
+  if command -v iperf3 >/dev/null 2>&1; then
+    :
+  else
+    missing+=("iperf3")
+  fi
+
+  [ "${#missing[@]}" -eq 0 ] && return 0
+
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update >/dev/null 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y iproute2 iptables iperf3
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y iproute iptables iperf3
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y iproute iptables iperf3
+  else
+    err_msg "No package manager found"
+    return 1
+  fi
+}
+
+aggregation_create_interface() {
+  local iface="${1:-$AGG_IFACE_DEFAULT}"
+  local addr="${2:-$AGG_DEFAULT_IP}"
+
+  ip link del "$iface" 2>/dev/null || true
+  ip link add "$iface" type dummy
+  ip addr add "$addr" dev "$iface"
+  ip link set "$iface" up
+}
+
+aggregation_save() {
+  mkdir -p "$AGG_CONFIG_DIR"
+  {
+    echo "AGG_IFACE=$AGG_IFACE"
+    echo "AGG_IP=$AGG_IP"
+    echo "AGG_TUNNELS=$AGG_TUNNELS"
+  } > "$AGG_CONFIG_DIR/config"
+}
+
+tunnel_aggregation_menu() {
+  show_header "Multi Tunnel Aggregation"
+
+  ensure_aggregation_dependencies || return 1
+  build_tunnel_inventory
+  print_tunnel_inventory || return
+
+  echo "Select active tunnels separated by comma."
+  read -rp "Tunnels (00=menu): " raw
+  if is_main_menu_token "$raw"; then return 99; fi
+
+  raw="${raw// /}"
+  IFS=',' read -ra picks <<< "$raw"
+
+  local routes=""
+  local selected=""
+  local p idx ifc
+
+  for p in "${picks[@]}"; do
+    idx=$((p-1))
+    ifc="${INV_IFACE[$idx]:-}"
+    [ -n "$ifc" ] || continue
+    routes+=" nexthop dev $ifc weight 1"
+    selected+="$ifc "
+  done
+
+  [ -n "$routes" ] || {
+    err_msg "No valid tunnels selected"
+    return 1
+  }
+
+  read -rp "Aggregation local IP [$AGG_DEFAULT_IP]: " AGG_IP
+  AGG_IP="${AGG_IP:-$AGG_DEFAULT_IP}"
+
+  AGG_IFACE="$AGG_IFACE_DEFAULT"
+  AGG_TUNNELS="$selected"
+
+  aggregation_create_interface "$AGG_IFACE" "$AGG_IP"
+
+  # Main multipath table. New routes can use this interface as local gateway.
+  mkdir -p "$AGG_CONFIG_DIR"
+
+  aggregation_save
+
+  echo
+  ok_msg "Aggregation interface created"
+  echo "Interface : $AGG_IFACE"
+  echo "IP        : $AGG_IP"
+  echo "Paths     : $AGG_TUNNELS"
+  echo
+  echo "Forward your service to this IP."
+}
+
+tunnel_speed_test_standalone_menu() {
+  tunnel_speed_test_menu
+}
+
 tunnel_ecmp_multipath_menu() {
   show_header "Multi-Tunnel ECMP Aggregation"
   if ! command -v ip >/dev/null 2>&1; then
@@ -4693,7 +4796,7 @@ test_tunnels_menu() {
 
   echo -e "${C_GREEN}${C_BOLD}0) ping ALL tunnels${C_RESET}"
   echo -e "${C_MAGENTA}${C_BOLD}s) throughput speed test (iperf3)${C_RESET}"
-  echo -e "${C_BLUE}${C_BOLD}m) combine multiple tunnels (ECMP)${C_RESET}"
+  echo -e "${C_BLUE}${C_BOLD}m) legacy ECMP route${C_RESET}"
   echo "Select a tunnel number from the list, or 0 to ping all."
   echo
   read -rp "Choose tunnel to ping [0/list number/s] (00=menu): " selected
@@ -5882,7 +5985,9 @@ show_menu() {
   echo -e "  ${C_RED}2)${C_RESET} remove tunnel"
   echo -e "  ${C_YELLOW}3)${C_RESET} reset all tunnels"
   echo -e "  ${C_CYAN}4)${C_RESET} ping test tunnels"
-  echo -e "  ${C_MAGENTA}5)${C_RESET} haproxy port manager"
+  echo -e "  ${C_MAGENTA}5)${C_RESET} speed test manager"
+  echo -e "  ${C_BLUE}6)${C_RESET} tunnel aggregation manager"
+  echo -e "  ${C_MAGENTA}7)${C_RESET} haproxy port manager"
   echo -e "  ${C_DIM}00) Main menu / back${C_RESET}"
   echo -e "  ${C_DIM}0) Exit${C_RESET}"
   echo
