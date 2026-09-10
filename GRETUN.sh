@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + WireGuard + ViraTCP + HAProxy multi-tunnel manager v9.1.0
+# GRE + WireGuard + ViraTCP + HAProxy multi-tunnel manager v9.1.1
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
@@ -28,8 +28,9 @@ set -euo pipefail
 # - v9.1.0 exposes aggregate profiles in the unified ping, throughput, and removal lists; accepts both
 #   comma- and space-separated aggregate member selections; asks for the local role before tunnel selection;
 #   and makes iperf3 return safely to the menu after a one-shot server or a failed/interrupted test.
+# - v9.1.1 strips CIDR prefixes from local/remote throughput-test addresses before passing them to iperf3.
 
-APP_VERSION="9.1.0"
+APP_VERSION="9.1.1"
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -4718,6 +4719,7 @@ tunnel_speed_test_menu() {
   local idx local_ip target role duration answer rc=0 type
   idx=$((selected - 1))
   local_ip="${INV_LOCAL[$idx]:-}"
+  local_ip="${local_ip%%/*}"
   type="${INV_TYPE[$idx]:-}"
   echo "Select this server's location:"
   echo "1) Iran (client)"
@@ -4728,6 +4730,7 @@ tunnel_speed_test_menu() {
     target="${INV_TARGET[$idx]:-}"
     read -rp "Remote tunnel IPv4 (inner IP) [${target:-required}]: " answer
     target="${answer:-$target}"
+    target="${target%%/*}"
     validate_ipv4 "$target" || { err_msg "Invalid remote IPv4."; return 1; }
   elif [ "$role" != "2" ]; then
     err_msg "Invalid role."; return 1
@@ -4741,16 +4744,20 @@ tunnel_speed_test_menu() {
     echo "Starting a one-shot iperf3 server on this (Kharej) side."
     echo "Now start the client test on Iran; this server will stop automatically after that one test."
     if [ -n "$local_ip" ]; then
+      echo "Command: iperf3 -s -1 -B $local_ip"
       if iperf3 -s -1 -B "$local_ip"; then :; else rc=$?; fi
     else
+      echo "Command: iperf3 -s -1"
       if iperf3 -s -1; then :; else rc=$?; fi
     fi
   elif [ "$role" = "1" ]; then
     echo "Make sure iperf3 -s is running on the Kharej server, then testing through the selected tunnel..."
     [ "$type" = "aggregate" ] && echo "Aggregate test uses 4 parallel flows so ECMP can exercise multiple healthy members."
     if [ -n "$local_ip" ]; then
+      echo "Command: iperf3 -c $target -B $local_ip -t $duration -P 4"
       if iperf3 -c "$target" -B "$local_ip" -t "$duration" -P 4; then :; else rc=$?; fi
     else
+      echo "Command: iperf3 -c $target -t $duration -P 4"
       if iperf3 -c "$target" -t "$duration" -P 4; then :; else rc=$?; fi
     fi
   else
