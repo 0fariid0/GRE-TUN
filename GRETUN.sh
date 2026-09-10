@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + WireGuard + ViraTCP + HAProxy multi-tunnel manager v8.8.4
+# GRE + WireGuard + ViraTCP + HAProxy multi-tunnel manager v9.0.0
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
@@ -21,8 +21,12 @@ set -euo pipefail
 # - v8.8.3 adds HAProxy UDP auto-heal: the existing 20s health monitor detects missing managed UDP rules
 #   and repairs them immediately, while an hourly systemd timer force-runs the same repair as HAProxy option 8
 # - v8.8.4 adds iperf3 tunnel throughput tests and optional ECMP multipath routes across active tunnel interfaces
+# - v9.0.0 separates ping, throughput, and aggregation menus; replaces the temporary ECMP action with
+#   persistent, health-aware aggregation profiles that expose a stable local virtual IPv4 on both peers.
+#   Concurrent TCP/UDP flows to the peer aggregate IPv4 are distributed across every healthy selected tunnel.
+#   Dependencies are checked on every use but installed only when a required command is actually missing.
 
-APP_VERSION="8.9.0"
+APP_VERSION="9.0.0"
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -83,6 +87,11 @@ HAPROXY_UDP_REPAIR_SERVICE_NAME="gretun-haproxy-udp-repair.service"
 HAPROXY_UDP_REPAIR_SERVICE_UNIT="/etc/systemd/system/${HAPROXY_UDP_REPAIR_SERVICE_NAME}"
 HAPROXY_UDP_REPAIR_TIMER_NAME="gretun-haproxy-udp-repair.timer"
 HAPROXY_UDP_REPAIR_TIMER_UNIT="/etc/systemd/system/${HAPROXY_UDP_REPAIR_TIMER_NAME}"
+
+AGG_CONFIG_DIR="/etc/gretun-aggregate"
+AGG_SERVICE_TEMPLATE="/etc/systemd/system/gretun-aggregate@.service"
+AGG_IFACE_PREFIX="gtagg"
+DEPENDENCY_STATE_DIR="/var/lib/gretun-manager/dependencies"
 
 # Color/theme helpers
 if [ -t 1 ]; then
@@ -286,6 +295,66 @@ write_var() {
   local name="$1"
   local value="${2:-}"
   printf '%s=%q\n' "$name" "$value"
+}
+
+# Check first, install only what is missing, and never run a package-index refresh
+# on later invocations when all required commands are already available.
+ensure_feature_dependencies() {
+  local feature="$1"; shift
+  local spec cmd pkg missing=0
+  local -a packages=()
+
+  for spec in "$@"; do
+    cmd="${spec%%:*}"
+    pkg="${spec#*:}"
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      missing=1
+      packages+=("$pkg")
+    fi
+  done
+  [ "$missing" -eq 1 ] || return 0
+
+  # De-duplicate package names before calling the package manager.
+  local -A seen_pkg=()
+  local -a unique_packages=()
+  for pkg in "${packages[@]}"; do
+    if [ -z "${seen_pkg[$pkg]+x}" ]; then
+      unique_packages+=("$pkg")
+      seen_pkg[$pkg]=1
+    fi
+  done
+
+  info_msg "$feature prerequisites are missing; installing: ${unique_packages[*]}"
+  if command -v apt-get >/dev/null 2>&1; then
+    # apt-get update is intentionally reached only when a required command is missing.
+    DEBIAN_FRONTEND=noninteractive apt-get update || return 1
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "${unique_packages[@]}" || return 1
+  elif command -v dnf >/dev/null 2>&1; then
+    packages=()
+    for pkg in "${unique_packages[@]}"; do
+      case "$pkg" in iproute2) packages+=(iproute) ;; iputils-ping) packages+=(iputils) ;; *) packages+=("$pkg") ;; esac
+    done
+    dnf install -y "${packages[@]}" || return 1
+  elif command -v yum >/dev/null 2>&1; then
+    packages=()
+    for pkg in "${unique_packages[@]}"; do
+      case "$pkg" in iproute2) packages+=(iproute) ;; iputils-ping) packages+=(iputils) ;; *) packages+=("$pkg") ;; esac
+    done
+    yum install -y "${packages[@]}" || return 1
+  else
+    err_msg "No supported package manager found for $feature prerequisites."
+    return 1
+  fi
+
+  for spec in "$@"; do
+    cmd="${spec%%:*}"
+    command -v "$cmd" >/dev/null 2>&1 || {
+      err_msg "$feature prerequisite is still unavailable after installation: $cmd"
+      return 1
+    }
+  done
+  mkdir -p "$DEPENDENCY_STATE_DIR" 2>/dev/null || true
+  printf '%s\n' "checked=$(date -u +%FT%TZ)" > "$DEPENDENCY_STATE_DIR/$feature.ok" 2>/dev/null || true
 }
 
 # Install a persistent copy safely. When this script is launched with
@@ -842,6 +911,7 @@ tunnel_health_check_all() {
   # HAProxy UDP companions are checked last. This is intentionally lightweight:
   # when all four managed rules exist for every TCP row, nothing is changed.
   # If firewall/NAT rules disappear, run the same rebuild+verify logic as menu option 8.
+  aggregate_apply_all || true
   haproxy_udp_self_heal_check || true
 }
 
@@ -856,6 +926,10 @@ bootstrap_runtime_repairs() {
   gre_write_service_template
   install_health_monitor
   apply_tunnel_sysctls
+  if [ -d "$AGG_CONFIG_DIR" ]; then
+    aggregate_write_service_template
+    aggregate_apply_all || true
+  fi
   systemctl daemon-reload >/dev/null 2>&1 || true
 
   ids="$(gre_collect_ids || true)"
@@ -1652,7 +1726,7 @@ wg_write_config() {
   private_file="$(wg_private_key_file "$id")"
   conf="$(wg_config_file "$id")"
   private_key="$(cat "$private_file")"
-  allowed_ips="$REMOTE_WG_IP/32"
+  allowed_ips="$(aggregate_wg_allowed_ips "$id" "${REMOTE_WG_IP%%/*}")"
   endpoint_ip="$(wg_auto_endpoint_ip)"
   endpoint_mode_note="${WG_ENDPOINT_MODE:-public}"
   mtu_value="${WG_MTU:-1420}"
@@ -4050,6 +4124,21 @@ build_tunnel_inventory() {
     INV_TYPE+=("wireguard"); INV_ID+=("$id"); INV_IFACE+=("$ifc"); INV_LOCAL+=("$local_ip"); INV_TARGET+=("$target"); INV_LOCAL_PUBLIC+=("$local_pub"); INV_REMOTE_PUBLIC+=("$remote_pub"); INV_STATE+=("$state"); INV_DESC+=("$desc")
   done <<< "$ids"
 
+  ids="$(vira7_collect_ids || true)"
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    ifc="$(vira7_iface_name "$id")"
+    local_ip=""; target=""; local_pub=""; remote_pub=""; desc="Vira7 UDP-TUN"
+    if vira7_load_config "$id"; then
+      local_ip="${LOCAL_VIRA7_IP:-${local_priv:-}}"
+      target="${REMOTE_VIRA7_IP:-${remote_priv:-}}"
+      local_pub="${LOCAL_PUBLIC_IP:-${bind_ip:-}}"
+      remote_pub="${REMOTE_PUBLIC_IP:-${remote_ip:-}}"
+    fi
+    if tunnel_iface_is_up "$ifc"; then state="active"; else state="inactive"; fi
+    INV_TYPE+=("vira7"); INV_ID+=("$id"); INV_IFACE+=("$ifc"); INV_LOCAL+=("$local_ip"); INV_TARGET+=("$target"); INV_LOCAL_PUBLIC+=("$local_pub"); INV_REMOTE_PUBLIC+=("$remote_pub"); INV_STATE+=("$state"); INV_DESC+=("$desc")
+  done <<< "$ids"
+
   ids="$(viratcp_collect_ids || true)"
   while IFS= read -r id; do
     [ -n "$id" ] || continue
@@ -4167,12 +4256,18 @@ wg_uses_transport_tunnel() {
 # This avoids the common "I removed one tunnel and the others stopped" case.
 remove_selection_dependency_guard() {
   local -a selected=("$@")
-  local idx i type id wg_ids wg_id blocked=0
+  local idx i type id wg_ids wg_id agg_profile blocked=0
 
   for idx in "${selected[@]}"; do
     i=$((idx - 1))
     type="${INV_TYPE[$i]:-}"
     id="${INV_ID[$i]:-}"
+
+    if agg_profile="$(aggregate_uses_member "$type" "$id" 2>/dev/null)"; then
+      warn_msg "Cannot remove $type tunnel $id: aggregate profile $agg_profile is using it."
+      echo "  Remove or update aggregate profile $agg_profile first."
+      blocked=1
+    fi
 
     case "$type" in
       gre|vira7)
@@ -4562,20 +4657,7 @@ test_all_tunnels_ping() {
 
 tunnel_speed_test_menu() {
   show_header "Tunnel Throughput Speed Test"
-  if ! command -v iperf3 >/dev/null 2>&1; then
-    info_msg "iperf3 is missing; installing it automatically..."
-    if command -v apt-get >/dev/null 2>&1; then
-      apt-get update || true
-      DEBIAN_FRONTEND=noninteractive apt-get install -y iperf3 || { err_msg "iperf3 installation failed."; return 1; }
-    elif command -v dnf >/dev/null 2>&1; then
-      dnf install -y iperf3 || { err_msg "iperf3 installation failed."; return 1; }
-    elif command -v yum >/dev/null 2>&1; then
-      yum install -y iperf3 || { err_msg "iperf3 installation failed."; return 1; }
-    else
-      err_msg "No supported package manager found; install iperf3 manually."; return 1
-    fi
-  fi
-  command -v iperf3 >/dev/null 2>&1 || { err_msg "iperf3 is unavailable after installation."; return 1; }
+  ensure_feature_dependencies "speed-test" "iperf3:iperf3" || return 1
   build_tunnel_inventory
   print_tunnel_inventory || return
   read -rp "Select tunnel number for speed test (00=menu): " selected
@@ -4614,166 +4696,340 @@ tunnel_speed_test_menu() {
   fi
 }
 
+aggregate_config_file() { echo "$AGG_CONFIG_DIR/profile-$1.conf"; }
+aggregate_iface_name() { echo "${AGG_IFACE_PREFIX}$1"; }
+aggregate_service_name() { echo "gretun-aggregate@$1.service"; }
 
-ensure_aggregation_dependencies() {
-  local missing=()
-  for c in ip iptables; do
-    command -v "$c" >/dev/null 2>&1 || missing+=("$c")
-  done
-  if command -v iperf3 >/dev/null 2>&1; then
-    :
-  else
-    missing+=("iperf3")
-  fi
-
-  [ "${#missing[@]}" -eq 0 ] && return 0
-
-  if command -v apt-get >/dev/null 2>&1; then
-    apt-get update >/dev/null 2>&1 || true
-    DEBIAN_FRONTEND=noninteractive apt-get install -y iproute2 iptables iperf3
-  elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y iproute iptables iperf3
-  elif command -v yum >/dev/null 2>&1; then
-    yum install -y iproute iptables iperf3
-  else
-    err_msg "No package manager found"
-    return 1
-  fi
+aggregate_collect_ids() {
+  local f id
+  [ -d "$AGG_CONFIG_DIR" ] || return 0
+  for f in "$AGG_CONFIG_DIR"/profile-*.conf; do
+    [ -e "$f" ] || continue
+    id="${f##*/profile-}"; id="${id%.conf}"
+    validate_tunnel_id "$id" && echo "$id"
+  done | sort -n -u
 }
 
-aggregation_create_interface() {
-  local iface="${1:-$AGG_IFACE_DEFAULT}"
-  local addr="${2:-$AGG_DEFAULT_IP}"
-
-  ip link del "$iface" 2>/dev/null || true
-  ip link add "$iface" type dummy
-  ip addr add "$addr" dev "$iface"
-  ip link set "$iface" up
+aggregate_load_config() {
+  local id="$1" f
+  f="$(aggregate_config_file "$id")"
+  [ -f "$f" ] || return 1
+  unset AGG_PROFILE_ID AGG_ROLE LOCAL_AGG_IP REMOTE_AGG_IP AGG_MEMBERS
+  # shellcheck disable=SC1090
+  source "$f"
+  validate_tunnel_id "${AGG_PROFILE_ID:-}" || return 1
+  validate_ipv4 "${LOCAL_AGG_IP:-}" || return 1
+  validate_ipv4 "${REMOTE_AGG_IP:-}" || return 1
+  [ -n "${AGG_MEMBERS:-}" ]
 }
 
-aggregation_save() {
-  mkdir -p "$AGG_CONFIG_DIR"
-  {
-    echo "AGG_IFACE=$AGG_IFACE"
-    echo "AGG_IP=$AGG_IP"
-    echo "AGG_TUNNELS=$AGG_TUNNELS"
-  } > "$AGG_CONFIG_DIR/config"
-}
-
-tunnel_aggregation_menu() {
-  show_header "Multi Tunnel Aggregation"
-
-  ensure_aggregation_dependencies || return 1
+aggregate_member_details() {
+  local want_type="$1" want_id="$2" i
   build_tunnel_inventory
-  print_tunnel_inventory || return
-
-  echo "Select active tunnels separated by comma."
-  read -rp "Tunnels (00=menu): " raw
-  if is_main_menu_token "$raw"; then return 99; fi
-
-  raw="${raw// /}"
-  IFS=',' read -ra picks <<< "$raw"
-
-  local routes=""
-  local selected=""
-  local p idx ifc
-
-  for p in "${picks[@]}"; do
-    idx=$((p-1))
-    ifc="${INV_IFACE[$idx]:-}"
-    [ -n "$ifc" ] || continue
-    routes+=" nexthop dev $ifc weight 1"
-    selected+="$ifc "
-  done
-
-  [ -n "$routes" ] || {
-    err_msg "No valid tunnels selected"
-    return 1
-  }
-
-  read -rp "Aggregation local IP [$AGG_DEFAULT_IP]: " AGG_IP
-  AGG_IP="${AGG_IP:-$AGG_DEFAULT_IP}"
-
-  AGG_IFACE="$AGG_IFACE_DEFAULT"
-  AGG_TUNNELS="$selected"
-
-  aggregation_create_interface "$AGG_IFACE" "$AGG_IP"
-
-  # Main multipath table. New routes can use this interface as local gateway.
-  mkdir -p "$AGG_CONFIG_DIR"
-
-  aggregation_save
-
-  echo
-  ok_msg "Aggregation interface created"
-  echo "Interface : $AGG_IFACE"
-  echo "IP        : $AGG_IP"
-  echo "Paths     : $AGG_TUNNELS"
-  echo
-  echo "Forward your service to this IP."
-}
-
-tunnel_speed_test_standalone_menu() {
-  tunnel_speed_test_menu
-}
-
-tunnel_ecmp_multipath_menu() {
-  show_header "Multi-Tunnel ECMP Aggregation"
-  if ! command -v ip >/dev/null 2>&1; then
-    info_msg "iproute2 is missing; installing it automatically..."
-    if command -v apt-get >/dev/null 2>&1; then
-      apt-get update || true
-      DEBIAN_FRONTEND=noninteractive apt-get install -y iproute2 || { err_msg "iproute2 installation failed."; return 1; }
-    elif command -v dnf >/dev/null 2>&1; then
-      dnf install -y iproute || { err_msg "iproute installation failed."; return 1; }
-    elif command -v yum >/dev/null 2>&1; then
-      yum install -y iproute || { err_msg "iproute installation failed."; return 1; }
-    else
-      err_msg "No supported package manager found; install iproute2 manually."; return 1
+  for i in "${!INV_TYPE[@]}"; do
+    if [ "${INV_TYPE[$i]}" = "$want_type" ] && [ "${INV_ID[$i]}" = "$want_id" ]; then
+      printf '%s\t%s\t%s\t%s\n' "${INV_IFACE[$i]}" "${INV_LOCAL[$i]%%/*}" "${INV_TARGET[$i]%%/*}" "${INV_STATE[$i]}"
+      return 0
     fi
+  done
+  return 1
+}
+
+# Return every aggregate peer /32 that must be accepted by a WireGuard peer.
+aggregate_wg_allowed_ips() {
+  local wg_id="$1" base_remote="$2" f remote members ref
+  local result="$base_remote/32"
+  for f in "$AGG_CONFIG_DIR"/profile-*.conf; do
+    [ -e "$f" ] || continue
+    remote="$(bash -c 'source "$1" 2>/dev/null; printf "%s" "${REMOTE_AGG_IP:-}"' _ "$f" 2>/dev/null || true)"
+    members="$(bash -c 'source "$1" 2>/dev/null; printf "%s" "${AGG_MEMBERS:-}"' _ "$f" 2>/dev/null || true)"
+    validate_ipv4 "$remote" || continue
+    IFS=',' read -ra _agg_refs <<< "$members"
+    for ref in "${_agg_refs[@]}"; do
+      if [ "$ref" = "wireguard:$wg_id" ] && [[ ",$result," != *",$remote/32,"* ]]; then
+        result+=",$remote/32"
+      fi
+    done
+  done
+  printf '%s\n' "$result"
+}
+
+aggregate_refresh_wireguard_member() {
+  local id="$1" allowed conf ifc key
+  wg_load_meta "$id" || return 0
+  [ -n "${REMOTE_WG_PUBLIC_KEY:-}" ] || return 0
+  allowed="$(aggregate_wg_allowed_ips "$id" "${REMOTE_WG_IP%%/*}")"
+  conf="$(wg_config_file "$id")"; ifc="$(wg_iface_name "$id")"; key="$REMOTE_WG_PUBLIC_KEY"
+  if [ -f "$conf" ]; then
+    sed -i -E "s|^[[:space:]]*AllowedIPs[[:space:]]*=.*$|AllowedIPs = $allowed|" "$conf" || true
   fi
-  command -v ip >/dev/null 2>&1 || { err_msg "iproute2 is unavailable after installation."; return 1; }
+  if command -v wg >/dev/null 2>&1 && ip link show "$ifc" >/dev/null 2>&1; then
+    wg set "$ifc" peer "$key" allowed-ips "$allowed" >/dev/null 2>&1 || true
+  fi
+}
+
+aggregate_remove_member_firewall() {
+  local ifc="$1" local_ip="$2" remote_ip="$3"
+  command -v iptables >/dev/null 2>&1 || return 0
+  while iptables -w 5 -C INPUT -i "$ifc" -d "$local_ip" -j ACCEPT 2>/dev/null; do
+    iptables -w 5 -D INPUT -i "$ifc" -d "$local_ip" -j ACCEPT 2>/dev/null || break
+  done
+  while iptables -w 5 -C FORWARD -o "$ifc" -d "$remote_ip" -j ACCEPT 2>/dev/null; do
+    iptables -w 5 -D FORWARD -o "$ifc" -d "$remote_ip" -j ACCEPT 2>/dev/null || break
+  done
+  while iptables -w 5 -C FORWARD -i "$ifc" -s "$remote_ip" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null; do
+    iptables -w 5 -D FORWARD -i "$ifc" -s "$remote_ip" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || break
+  done
+}
+
+aggregate_write_service_template() {
+  command -v systemctl >/dev/null 2>&1 || return 0
+  mkdir -p "$(dirname "$AGG_SERVICE_TEMPLATE")"
+  cat > "$AGG_SERVICE_TEMPLATE" <<EOF_AGG_SERVICE
+[Unit]
+Description=GRE-TUN aggregate profile %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash $INSTALL_BIN --service apply-aggregate %i
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF_AGG_SERVICE
+}
+
+aggregate_apply_profile() {
+  local id="$1" iface local_ip remote_ip members ref type tid details ifc src peer state
+  local healthy=0
+  local -a route_args=()
+  aggregate_load_config "$id" || return 1
+  local_ip="$LOCAL_AGG_IP"; remote_ip="$REMOTE_AGG_IP"; members="$AGG_MEMBERS"
+  iface="$(aggregate_iface_name "$id")"
+
+  apply_tunnel_sysctls
+  ip link show "$iface" >/dev/null 2>&1 || ip link add "$iface" type dummy
+  ip addr replace "$local_ip/32" dev "$iface"
+  ip link set "$iface" up
+
+  IFS=',' read -ra _agg_members <<< "$members"
+  for ref in "${_agg_members[@]}"; do
+    type="${ref%%:*}"; tid="${ref#*:}"
+    details="$(aggregate_member_details "$type" "$tid" 2>/dev/null || true)"
+    [ -n "$details" ] || continue
+    IFS=$'\t' read -r ifc src peer state <<< "$details"
+    [ "$state" = "active" ] || continue
+    validate_ipv4 "$peer" || continue
+    quick_tunnel_ping "$ifc" "$peer" || continue
+    route_args+=(nexthop via "$peer" dev "$ifc" weight 1)
+    healthy=$((healthy + 1))
+    if command -v iptables >/dev/null 2>&1; then
+      iptables -w 5 -C INPUT -i "$ifc" -d "$local_ip" -j ACCEPT 2>/dev/null || iptables -w 5 -I INPUT 1 -i "$ifc" -d "$local_ip" -j ACCEPT || true
+      iptables -w 5 -C FORWARD -o "$ifc" -d "$remote_ip" -j ACCEPT 2>/dev/null || iptables -w 5 -I FORWARD 1 -o "$ifc" -d "$remote_ip" -j ACCEPT || true
+      iptables -w 5 -C FORWARD -i "$ifc" -s "$remote_ip" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || iptables -w 5 -I FORWARD 1 -i "$ifc" -s "$remote_ip" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT || true
+    fi
+    [ "$type" = "wireguard" ] && aggregate_refresh_wireguard_member "$tid"
+  done
+
+  if [ "$healthy" -eq 0 ]; then
+    ip route del "$remote_ip/32" 2>/dev/null || true
+    return 1
+  fi
+  ip route replace "$remote_ip/32" proto static "${route_args[@]}"
+  return 0
+}
+
+aggregate_apply_all() {
+  local ids id
+  ids="$(aggregate_collect_ids || true)"
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    aggregate_apply_profile "$id" >/dev/null 2>&1 || true
+  done <<< "$ids"
+}
+
+aggregate_profile_for_remote_ip() {
+  local target="$1" id ids
+  ids="$(aggregate_collect_ids || true)"
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    if aggregate_load_config "$id" && [ "$REMOTE_AGG_IP" = "$target" ]; then
+      printf '%s\n' "$id"
+      return 0
+    fi
+  done <<< "$ids"
+  return 1
+}
+
+aggregate_uses_member() {
+  local type="$1" id="$2" f members ref
+  for f in "$AGG_CONFIG_DIR"/profile-*.conf; do
+    [ -e "$f" ] || continue
+    members="$(bash -c 'source "$1" 2>/dev/null; printf "%s" "${AGG_MEMBERS:-}"' _ "$f" 2>/dev/null || true)"
+    IFS=',' read -ra _agg_refs <<< "$members"
+    for ref in "${_agg_refs[@]}"; do
+      [ "$ref" = "$type:$id" ] && { echo "${f##*/profile-}" | sed 's/\.conf$//'; return 0; }
+    done
+  done
+  return 1
+}
+
+aggregate_save_profile() {
+  local id="$1" role="$2" local_ip="$3" remote_ip="$4" members="$5" f
+  mkdir -p "$AGG_CONFIG_DIR"
+  f="$(aggregate_config_file "$id")"
+  {
+    write_var AGG_PROFILE_ID "$id"
+    write_var AGG_ROLE "$role"
+    write_var LOCAL_AGG_IP "$local_ip"
+    write_var REMOTE_AGG_IP "$remote_ip"
+    write_var AGG_MEMBERS "$members"
+  } > "$f"
+  chmod 600 "$f"
+}
+
+aggregate_create_menu() {
+  show_header "Create / Update Aggregate Tunnel"
+  ensure_feature_dependencies "aggregation" "ip:iproute2" "ping:iputils-ping" "iptables:iptables" || return 1
   build_tunnel_inventory
-  print_tunnel_inventory || return
-  echo "Enter two or more tunnel list numbers separated by commas (example: 1,2,3)."
-  read -rp "Tunnels (00=menu): " raw
-  if is_main_menu_token "$raw"; then return 99; fi
+  print_tunnel_inventory || return 1
+  echo "Select at least two ACTIVE tunnel rows (example: 1,2,3)."
+  read -rp "Tunnel rows (00=menu): " raw
+  is_main_menu_token "$raw" && return 99
   raw="${raw// /}"
   IFS=',' read -ra picks <<< "$raw"
   [ "${#picks[@]}" -ge 2 ] || { err_msg "Select at least two tunnels."; return 1; }
-  local destination p idx ifc state route="" seen=" "
+
+  local p idx seen=" " members="" profile_id role local_ip remote_ip
+  local previous_members="" previous_local="" previous_remote="" ref type tid details ifc _src _peer _state
   for p in "${picks[@]}"; do
-    [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le "${#INV_TYPE[@]}" ] || { err_msg "Invalid tunnel number: $p"; return 1; }
-    case "$seen" in *" $p "*) { err_msg "Tunnel $p was selected more than once."; return 1; } ;; esac
-    seen+="$p "
-    idx=$((p - 1)); ifc="${INV_IFACE[$idx]}"; state="${INV_STATE[$idx]}"
-    [ "$state" = "active" ] || { err_msg "Tunnel $p ($ifc) is not active."; return 1; }
-    route+=" nexthop dev $ifc weight 1"
+    [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le "${#INV_TYPE[@]}" ] || { err_msg "Invalid tunnel row: $p"; return 1; }
+    [[ "$seen" != *" $p "* ]] || { err_msg "Tunnel row $p was selected twice."; return 1; }
+    seen+="$p "; idx=$((p - 1))
+    [ "${INV_STATE[$idx]}" = "active" ] || { err_msg "${INV_IFACE[$idx]} is not active."; return 1; }
+    members+="${members:+,}${INV_TYPE[$idx]}:${INV_ID[$idx]}"
   done
 
-  echo
-  echo "Enter a remote destination reachable through every selected tunnel."
-  echo "Use an address (for example 10.50.0.10) or a CIDR (for example 10.50.0.0/24)."
-  read -rp "Remote destination (00=menu): " destination
-  if is_main_menu_token "$destination"; then return 99; fi
-  local dest_ip dest_prefix
-  if [[ "$destination" =~ ^([^/]+)/([0-9]{1,2})$ ]]; then
-    dest_ip="${BASH_REMATCH[1]}"; dest_prefix="${BASH_REMATCH[2]}"
-    validate_ipv4 "$dest_ip" || { err_msg "Invalid destination IPv4."; return 1; }
-    [ "$dest_prefix" -ge 1 ] && [ "$dest_prefix" -le 32 ] || { err_msg "CIDR prefix must be between 1 and 32."; return 1; }
-  else
-    validate_ipv4 "$destination" || { err_msg "Invalid destination. Use IPv4 or IPv4/CIDR."; return 1; }
-    dest_ip="$destination"; dest_prefix=32
+  read -rp "Aggregate profile number [1-254] (same number on both servers, 00=menu): " profile_id
+  is_main_menu_token "$profile_id" && return 99
+  validate_tunnel_id "$profile_id" || { err_msg "Invalid aggregate profile number."; return 1; }
+  echo "1) Iran side    2) Kharej/outside side"
+  read -rp "This server role [1-2] (00=menu): " role
+  is_main_menu_token "$role" && return 99
+  [[ "$role" = "1" || "$role" = "2" ]] || { err_msg "Invalid role."; return 1; }
+  if [ "$role" = "1" ]; then local_ip="10.99.$profile_id.1"; remote_ip="10.99.$profile_id.2"
+  else local_ip="10.99.$profile_id.2"; remote_ip="10.99.$profile_id.1"; fi
+
+  if aggregate_load_config "$profile_id"; then
+    previous_members="$AGG_MEMBERS"; previous_local="$LOCAL_AGG_IP"; previous_remote="$REMOTE_AGG_IP"
+    ip route del "$previous_remote/32" 2>/dev/null || true
+    if [ "$previous_local" != "$local_ip" ]; then
+      ip addr del "$previous_local/32" dev "$(aggregate_iface_name "$profile_id")" 2>/dev/null || true
+    fi
   fi
-  destination="$dest_ip/$dest_prefix"
-  if ! ip route replace "$destination" scope link$route; then
-    err_msg "ECMP route installation failed for $destination."; return 1
+  aggregate_save_profile "$profile_id" "$role" "$local_ip" "$remote_ip" "$members"
+  if [ -n "$previous_members" ]; then
+    IFS=',' read -ra _old_agg_members <<< "$previous_members"
+    for ref in "${_old_agg_members[@]}"; do
+      type="${ref%%:*}"; tid="${ref#*:}"
+      details="$(aggregate_member_details "$type" "$tid" 2>/dev/null || true)"
+      if [ -n "$details" ]; then
+        IFS=$'\t' read -r ifc _src _peer _state <<< "$details"
+        aggregate_remove_member_firewall "$ifc" "$previous_local" "$previous_remote"
+      fi
+      [ "$type" = "wireguard" ] && aggregate_refresh_wireguard_member "$tid"
+    done
   fi
-  sysctl -w net.ipv4.fib_multipath_hash_policy=1 >/dev/null 2>&1 || true
+  install_manager_binary || { err_msg "Could not install the persistent manager."; return 1; }
+  aggregate_write_service_template
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable "$(aggregate_service_name "$profile_id")" >/dev/null 2>&1 || true
+  if ! aggregate_apply_profile "$profile_id"; then
+    err_msg "Profile was saved, but no selected path passed its health check. Run Repair after the peer tunnels are up."
+    return 1
+  fi
+  systemctl restart "$(aggregate_service_name "$profile_id")" >/dev/null 2>&1 || true
   echo
-  ok_msg "ECMP multipath route installed for $destination across ${#picks[@]} tunnels."
-  echo "Parallel connections can use the combined capacity; one TCP connection may remain on one path."
-  echo "To remove it later: ip route del $destination"
+  ok_msg "Aggregate profile $profile_id is active."
+  echo "Local virtual IPv4 : $local_ip ($(aggregate_iface_name "$profile_id"))"
+  echo "Peer aggregate IPv4: $remote_ip"
+  echo "HAProxy/forward target on this server should be the peer aggregate IPv4: $remote_ip"
+  echo "Concurrent connections are ECMP-hashed across all healthy selected tunnels."
+}
+
+aggregate_list_profiles() {
+  show_header "Aggregate Tunnel Status"
+  local ids id iface route active total ref type tid details
+  ids="$(aggregate_collect_ids || true)"
+  [ -n "$ids" ] || { warn_msg "No aggregate profile exists."; return 0; }
+  while IFS= read -r id; do
+    aggregate_load_config "$id" || continue
+    iface="$(aggregate_iface_name "$id")"; active=0; total=0
+    IFS=',' read -ra _agg_members <<< "$AGG_MEMBERS"
+    for ref in "${_agg_members[@]}"; do
+      total=$((total + 1)); type="${ref%%:*}"; tid="${ref#*:}"
+      details="$(aggregate_member_details "$type" "$tid" 2>/dev/null || true)"
+      [[ "$details" == *$'\tactive' ]] && active=$((active + 1))
+    done
+    route="$(ip route show "$REMOTE_AGG_IP/32" 2>/dev/null | head -n1 || true)"
+    printf 'Profile %-3s  local=%-15s peer=%-15s iface=%-9s paths=%s/%s route=%s\n' "$id" "$LOCAL_AGG_IP" "$REMOTE_AGG_IP" "$iface" "$active" "$total" "${route:+installed}"
+    echo "  members: $AGG_MEMBERS"
+  done <<< "$ids"
+}
+
+aggregate_repair_all_menu() {
+  show_header "Repair Aggregate Tunnels"
+  ensure_feature_dependencies "aggregation" "ip:iproute2" "ping:iputils-ping" "iptables:iptables" || return 1
+  aggregate_apply_all
+  aggregate_list_profiles
+  ok_msg "Aggregate profiles were rebuilt from currently healthy tunnel paths."
+}
+
+aggregate_remove_menu() {
+  aggregate_list_profiles
+  local id iface local_ip remote members ref type tid details ifc _src _peer _state
+  read -rp "Aggregate profile to remove [1-254] (00=menu): " id
+  is_main_menu_token "$id" && return 99
+  validate_tunnel_id "$id" || { err_msg "Invalid profile number."; return 1; }
+  aggregate_load_config "$id" || { err_msg "Profile $id was not found."; return 1; }
+  local_ip="$LOCAL_AGG_IP"; remote="$REMOTE_AGG_IP"; members="$AGG_MEMBERS"; iface="$(aggregate_iface_name "$id")"
+  systemctl disable --now "$(aggregate_service_name "$id")" >/dev/null 2>&1 || true
+  ip route del "$remote/32" 2>/dev/null || true
+  ip link del "$iface" 2>/dev/null || true
+  rm -f "$(aggregate_config_file "$id")"
+  IFS=',' read -ra _agg_members <<< "$members"
+  for ref in "${_agg_members[@]}"; do
+    type="${ref%%:*}"; tid="${ref#*:}"
+    details="$(aggregate_member_details "$type" "$tid" 2>/dev/null || true)"
+    if [ -n "$details" ]; then
+      IFS=$'\t' read -r ifc _src _peer _state <<< "$details"
+      aggregate_remove_member_firewall "$ifc" "$local_ip" "$remote"
+    fi
+    [ "$type" = "wireguard" ] && aggregate_refresh_wireguard_member "$tid"
+  done
+  ok_msg "Aggregate profile $id removed."
+}
+
+tunnel_aggregation_menu() {
+  while true; do
+    show_header "Persistent Multi-Tunnel Aggregation"
+    echo "  1) create/update aggregate profile"
+    echo "  2) list/status profiles"
+    echo "  3) repair/rebuild all profiles"
+    echo "  4) remove profile"
+    echo "  00) back to main menu"
+    read -rp "Choose [1-4/00]: " AGG_CHOICE
+    case "$AGG_CHOICE" in
+      1) aggregate_create_menu; pause ;;
+      2) aggregate_list_profiles; pause ;;
+      3) aggregate_repair_all_menu; pause ;;
+      4) aggregate_remove_menu; pause ;;
+      00) return 0 ;;
+      *) err_msg "Invalid option"; sleep 1 ;;
+    esac
+  done
 }
 
 iperf3_prepare_firewall() {
@@ -4795,21 +5051,10 @@ test_tunnels_menu() {
   print_tunnel_inventory || return
 
   echo -e "${C_GREEN}${C_BOLD}0) ping ALL tunnels${C_RESET}"
-  echo -e "${C_MAGENTA}${C_BOLD}s) throughput speed test (iperf3)${C_RESET}"
-  echo -e "${C_BLUE}${C_BOLD}m) legacy ECMP route${C_RESET}"
   echo "Select a tunnel number from the list, or 0 to ping all."
   echo
-  read -rp "Choose tunnel to ping [0/list number/s] (00=menu): " selected
+  read -rp "Choose tunnel to ping [0/list number] (00=menu): " selected
   if is_main_menu_token "$selected"; then return_main_msg; return 99; fi
-
-  if [[ "$selected" =~ ^[sS]$ ]]; then
-    tunnel_speed_test_menu
-    return
-  fi
-  if [[ "$selected" =~ ^[mM]$ ]]; then
-    tunnel_ecmp_multipath_menu
-    return
-  fi
 
   if [ "$selected" = "0" ]; then
     local i total ok fail
@@ -4929,6 +5174,10 @@ reset_all_tunnels() {
       echo "[WARN] WireGuard tunnel $id reset failed"
     fi
   done <<< "$ids"
+
+  echo
+  echo "Rebuilding aggregate profiles..."
+  aggregate_apply_all || true
 
   echo
   echo "[OK] Reset all finished."
@@ -5151,18 +5400,30 @@ haproxy_target_inventory() {
       "$idx" "$type" "$ifc" "$local_tun" "$remote_tun" "$local_pub" "$remote_pub" "$state"
   done
   echo
+
+  local agg_ids agg_id
+  agg_ids="$(aggregate_collect_ids || true)"
+  if [ -n "$agg_ids" ]; then
+    echo -e "${C_BOLD}${C_WHITE}Aggregate targets (all healthy member tunnels):${C_RESET}"
+    while IFS= read -r agg_id; do
+      [ -n "$agg_id" ] || continue
+      aggregate_load_config "$agg_id" || continue
+      printf "  a%-3s  peer=%-15s  local=%-15s  members=%s\n" "$agg_id" "$REMOTE_AGG_IP" "$LOCAL_AGG_IP" "$AGG_MEMBERS"
+    done <<< "$agg_ids"
+    echo
+  fi
 }
 
 # Sets HAP_TARGET_IP. The operator may choose a numbered tunnel row or type any IPv4.
 haproxy_prompt_target_ip() {
   local prompt_label="${1:-Select target tunnel number or enter target IPv4}"
-  local input idx count target
+  local input idx count target agg_id
 
   build_tunnel_inventory
   count="${#INV_TYPE[@]}"
   if [ "$count" -gt 0 ]; then
     haproxy_target_inventory || true
-    echo "Choose a row number to use its Remote-Tun address, or type a custom IPv4 exactly as before."
+    echo "Choose a tunnel row, an aggregate target such as a1, or type a custom IPv4."
   else
     warn_msg "No managed tunnel was found. You can still enter a target IPv4 manually."
   fi
@@ -5173,6 +5434,17 @@ haproxy_prompt_target_ip() {
   if validate_ipv4 "$input"; then
     HAP_TARGET_IP="$input"
     return 0
+  fi
+
+  if [[ "$input" =~ ^[aA]([0-9]+)$ ]]; then
+    agg_id="${BASH_REMATCH[1]}"
+    if aggregate_load_config "$agg_id"; then
+      HAP_TARGET_IP="$REMOTE_AGG_IP"
+      info_msg "Selected aggregate profile $agg_id -> $HAP_TARGET_IP"
+      return 0
+    fi
+    err_msg "Aggregate profile $agg_id was not found."
+    return 1
   fi
 
   if [[ "$input" =~ ^[0-9]+$ ]] && [ "$input" -ge 1 ] && [ "$input" -le "$count" ]; then
@@ -5209,9 +5481,20 @@ HAP_UDP_FWD_CHAIN="GRETUN_HAP_UDP_FWD"       # legacy v8.8.0 migration only
 # Prefer the saved tunnel inventory, then fall back to the kernel route lookup
 # so manually-entered target IPs continue to work exactly like before.
 haproxy_udp_resolve_path() {
-  local target="$1" i inv_target route
+  local target="$1" i inv_target route agg_id
   HAP_UDP_IFACE=""
   HAP_UDP_LOCAL_IP=""
+  HAP_UDP_AGGREGATE=0
+
+  if agg_id="$(aggregate_profile_for_remote_ip "$target" 2>/dev/null)"; then
+    aggregate_apply_profile "$agg_id" >/dev/null 2>&1 || true
+    if ip route show "$target/32" 2>/dev/null | grep -q 'nexthop'; then
+      HAP_UDP_IFACE="MULTIPATH"
+      HAP_UDP_LOCAL_IP="AUTO"
+      HAP_UDP_AGGREGATE=1
+      return 0
+    fi
+  fi
 
   build_tunnel_inventory
   for i in "${!INV_TYPE[@]}"; do
@@ -5308,6 +5591,16 @@ haproxy_udp_remove_equivalent_rules() {
     -p udp --dport "$port" \
     -j DNAT --to-destination "$target:$tport"
 
+  if [ "${HAP_UDP_AGGREGATE:-0}" = "1" ]; then
+    haproxy_udp_delete_exact_rule nat POSTROUTING \
+      -p udp -d "$target" --dport "$tport" -j MASQUERADE
+    haproxy_udp_delete_exact_rule filter FORWARD \
+      -p udp -d "$target" --dport "$tport" -j ACCEPT
+    haproxy_udp_delete_exact_rule filter FORWARD \
+      -p udp -s "$target" --sport "$tport" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    return 0
+  fi
+
   haproxy_udp_delete_exact_rule nat POSTROUTING \
     -o "$ifc" -p udp -d "$target" --dport "$tport" \
     -j SNAT --to-source "$local_ip"
@@ -5331,6 +5624,21 @@ haproxy_udp_add_rule() {
     -m comment --comment "gretun-hap-udp-pre-$port" \
     -j DNAT --to-destination "$target:$tport"
 
+  if [ "${HAP_UDP_AGGREGATE:-0}" = "1" ]; then
+    # MASQUERADE chooses the correct inner source address after ECMP selects a
+    # member interface, so UDP flows can use every healthy aggregate path.
+    iptables -w 5 -t nat -I POSTROUTING 1 \
+      -p udp -d "$target" --dport "$tport" \
+      -m comment --comment "gretun-hap-udp-post-$port" -j MASQUERADE
+    iptables -w 5 -I FORWARD 1 \
+      -p udp -d "$target" --dport "$tport" \
+      -m comment --comment "gretun-hap-udp-out-$port" -j ACCEPT
+    iptables -w 5 -I FORWARD 1 \
+      -p udp -s "$target" --sport "$tport" -m conntrack --ctstate ESTABLISHED,RELATED \
+      -m comment --comment "gretun-hap-udp-back-$port" -j ACCEPT
+    return 0
+  fi
+
   iptables -w 5 -t nat -I POSTROUTING 1 \
     -o "$ifc" -p udp -d "$target" --dport "$tport" \
     -m comment --comment "gretun-hap-udp-post-$port" \
@@ -5346,6 +5654,33 @@ haproxy_udp_add_rule() {
     -m conntrack --ctstate ESTABLISHED,RELATED \
     -m comment --comment "gretun-hap-udp-back-$port" \
     -j ACCEPT
+}
+
+haproxy_udp_rule_set_present() {
+  local port="$1" target="$2" tport="$3"
+  iptables -w 5 -t nat -C PREROUTING \
+    -p udp --dport "$port" -m comment --comment "gretun-hap-udp-pre-$port" \
+    -j DNAT --to-destination "$target:$tport" 2>/dev/null || return 1
+
+  if [ "${HAP_UDP_AGGREGATE:-0}" = "1" ]; then
+    iptables -w 5 -t nat -C POSTROUTING \
+      -p udp -d "$target" --dport "$tport" -m comment --comment "gretun-hap-udp-post-$port" -j MASQUERADE 2>/dev/null || return 1
+    iptables -w 5 -C FORWARD \
+      -p udp -d "$target" --dport "$tport" -m comment --comment "gretun-hap-udp-out-$port" -j ACCEPT 2>/dev/null || return 1
+    iptables -w 5 -C FORWARD \
+      -p udp -s "$target" --sport "$tport" -m conntrack --ctstate ESTABLISHED,RELATED \
+      -m comment --comment "gretun-hap-udp-back-$port" -j ACCEPT 2>/dev/null || return 1
+  else
+    iptables -w 5 -t nat -C POSTROUTING \
+      -o "$HAP_UDP_IFACE" -p udp -d "$target" --dport "$tport" \
+      -m comment --comment "gretun-hap-udp-post-$port" -j SNAT --to-source "$HAP_UDP_LOCAL_IP" 2>/dev/null || return 1
+    iptables -w 5 -C FORWARD \
+      -o "$HAP_UDP_IFACE" -p udp -d "$target" --dport "$tport" \
+      -m comment --comment "gretun-hap-udp-out-$port" -j ACCEPT 2>/dev/null || return 1
+    iptables -w 5 -C FORWARD \
+      -i "$HAP_UDP_IFACE" -p udp -s "$target" --sport "$tport" \
+      -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment "gretun-hap-udp-back-$port" -j ACCEPT 2>/dev/null || return 1
+  fi
 }
 
 haproxy_sync_udp_rules() {
@@ -5776,26 +6111,7 @@ haproxy_udp_rules_healthy() {
     [ -n "${port:-}" ] || continue
     haproxy_udp_resolve_path "$target" || return 1
 
-    iptables -w 5 -t nat -C PREROUTING \
-      -p udp --dport "$port" \
-      -m comment --comment "gretun-hap-udp-pre-$port" \
-      -j DNAT --to-destination "$target:$tport" 2>/dev/null || return 1
-
-    iptables -w 5 -t nat -C POSTROUTING \
-      -o "$HAP_UDP_IFACE" -p udp -d "$target" --dport "$tport" \
-      -m comment --comment "gretun-hap-udp-post-$port" \
-      -j SNAT --to-source "$HAP_UDP_LOCAL_IP" 2>/dev/null || return 1
-
-    iptables -w 5 -C FORWARD \
-      -o "$HAP_UDP_IFACE" -p udp -d "$target" --dport "$tport" \
-      -m comment --comment "gretun-hap-udp-out-$port" \
-      -j ACCEPT 2>/dev/null || return 1
-
-    iptables -w 5 -C FORWARD \
-      -i "$HAP_UDP_IFACE" -p udp -s "$target" --sport "$tport" \
-      -m conntrack --ctstate ESTABLISHED,RELATED \
-      -m comment --comment "gretun-hap-udp-back-$port" \
-      -j ACCEPT 2>/dev/null || return 1
+    haproxy_udp_rule_set_present "$port" "$target" "$tport" || return 1
   done <<< "$tcp_entries"
 
   return 0
@@ -5899,23 +6215,7 @@ haproxy_repair_udp() {
       continue
     fi
 
-    if iptables -w 5 -t nat -C PREROUTING \
-         -p udp --dport "$port" \
-         -m comment --comment "gretun-hap-udp-pre-$port" \
-         -j DNAT --to-destination "$target:$tport" 2>/dev/null \
-       && iptables -w 5 -t nat -C POSTROUTING \
-         -o "$HAP_UDP_IFACE" -p udp -d "$target" --dport "$tport" \
-         -m comment --comment "gretun-hap-udp-post-$port" \
-         -j SNAT --to-source "$HAP_UDP_LOCAL_IP" 2>/dev/null \
-       && iptables -w 5 -C FORWARD \
-         -o "$HAP_UDP_IFACE" -p udp -d "$target" --dport "$tport" \
-         -m comment --comment "gretun-hap-udp-out-$port" \
-         -j ACCEPT 2>/dev/null \
-       && iptables -w 5 -C FORWARD \
-         -i "$HAP_UDP_IFACE" -p udp -s "$target" --sport "$tport" \
-         -m conntrack --ctstate ESTABLISHED,RELATED \
-         -m comment --comment "gretun-hap-udp-back-$port" \
-         -j ACCEPT 2>/dev/null; then
+    if haproxy_udp_rule_set_present "$port" "$target" "$tport"; then
       ok_msg "UDP $port -> $target:$tport via $HAP_UDP_IFACE ($HAP_UDP_LOCAL_IP) repaired"
       verified=$((verified + 1))
     else
@@ -5985,19 +6285,21 @@ show_menu() {
   echo -e "  ${C_RED}2)${C_RESET} remove tunnel"
   echo -e "  ${C_YELLOW}3)${C_RESET} reset all tunnels"
   echo -e "  ${C_CYAN}4)${C_RESET} ping test tunnels"
-  echo -e "  ${C_MAGENTA}5)${C_RESET} speed test manager"
-  echo -e "  ${C_BLUE}6)${C_RESET} tunnel aggregation manager"
+  echo -e "  ${C_MAGENTA}5)${C_RESET} throughput speed test ${C_DIM}(iperf3)${C_RESET}"
+  echo -e "  ${C_BLUE}6)${C_RESET} aggregate multiple tunnels ${C_DIM}(persistent ECMP + local IP)${C_RESET}"
   echo -e "  ${C_MAGENTA}7)${C_RESET} haproxy port manager"
   echo -e "  ${C_DIM}00) Main menu / back${C_RESET}"
   echo -e "  ${C_DIM}0) Exit${C_RESET}"
   echo
-  read -rp "Choose an option [0-5]: " CHOICE
+  read -rp "Choose an option [0-7]: " CHOICE
   case "$CHOICE" in
     1) if menu_config_tunnel; then pause; fi ;;
     2) if remove_tun; then pause; fi ;;
     3) if reset_all_tunnels; then pause; fi ;;
     4) if test_tunnels_menu; then pause; fi ;;
-    5) haproxy_menu || true ;;
+    5) if tunnel_speed_test_menu; then pause; fi ;;
+    6) tunnel_aggregation_menu || true ;;
+    7) haproxy_menu || true ;;
     00) return_main_msg ;;
     0) echo "Bye"; exit 0 ;;
     *) err_msg "Invalid option"; sleep 1 ;;
@@ -6020,6 +6322,11 @@ if [[ "${1:-}" == "--service" ]]; then
     health-check-all)
       ensure_root
       tunnel_health_check_all
+      exit $?
+      ;;
+    apply-aggregate)
+      ensure_root
+      aggregate_apply_profile "${3:-}"
       exit $?
       ;;
     start)
@@ -6059,7 +6366,7 @@ if [[ "${1:-}" == "--service" ]]; then
       exit $?
       ;;
     *)
-      echo "Unknown service command. Use --service supervise-gre <id>, health-check-all, haproxy-udp-sync, or haproxy-udp-repair." >&2
+      echo "Unknown service command. Use --service supervise-gre <id>, apply-aggregate <id>, health-check-all, haproxy-udp-sync, or haproxy-udp-repair." >&2
       exit 1
       ;;
   esac
