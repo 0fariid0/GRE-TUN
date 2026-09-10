@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + WireGuard + ViraTCP + HAProxy multi-tunnel manager v9.0.0
+# GRE + WireGuard + ViraTCP + HAProxy multi-tunnel manager v9.1.0
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
@@ -25,8 +25,11 @@ set -euo pipefail
 #   persistent, health-aware aggregation profiles that expose a stable local virtual IPv4 on both peers.
 #   Concurrent TCP/UDP flows to the peer aggregate IPv4 are distributed across every healthy selected tunnel.
 #   Dependencies are checked on every use but installed only when a required command is actually missing.
+# - v9.1.0 exposes aggregate profiles in the unified ping, throughput, and removal lists; accepts both
+#   comma- and space-separated aggregate member selections; asks for the local role before tunnel selection;
+#   and makes iperf3 return safely to the menu after a one-shot server or a failed/interrupted test.
 
-APP_VERSION="9.0.0"
+APP_VERSION="9.1.0"
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -4087,6 +4090,7 @@ enable_ip_forward() {
 declare -a INV_TYPE INV_ID INV_IFACE INV_LOCAL INV_TARGET INV_LOCAL_PUBLIC INV_REMOTE_PUBLIC INV_STATE INV_DESC
 
 build_tunnel_inventory() {
+  local include_aggregates="${1:-1}"
   INV_TYPE=(); INV_ID=(); INV_IFACE=(); INV_LOCAL=(); INV_TARGET=(); INV_LOCAL_PUBLIC=(); INV_REMOTE_PUBLIC=(); INV_STATE=(); INV_DESC=()
   local ids id ifc local_ip target local_pub remote_pub state desc
 
@@ -4153,6 +4157,28 @@ build_tunnel_inventory() {
     if tunnel_iface_is_up "$ifc"; then state="active"; else state="inactive"; fi
     INV_TYPE+=("viratcp"); INV_ID+=("$id"); INV_IFACE+=("$ifc"); INV_LOCAL+=("$local_ip"); INV_TARGET+=("$target"); INV_LOCAL_PUBLIC+=("$local_pub"); INV_REMOTE_PUBLIC+=("$remote_pub"); INV_STATE+=("$state"); INV_DESC+=("$desc")
   done <<< "$ids"
+
+  # Aggregate profiles participate in the same user-facing inventory as real
+  # tunnels.  Internal member lookups call this function with 0 to avoid
+  # recursively expanding aggregates while an aggregate is being rebuilt.
+  if [ "$include_aggregates" = "1" ]; then
+    ids="$(aggregate_collect_ids || true)"
+    while IFS= read -r id; do
+      [ -n "$id" ] || continue
+      ifc="$(aggregate_iface_name "$id")"
+      local_ip=""; target=""; local_pub=""; remote_pub=""; desc="Aggregate ECMP"
+      if aggregate_load_config "$id"; then
+        local_ip="${LOCAL_AGG_IP:-}"
+        target="${REMOTE_AGG_IP:-}"
+      fi
+      if tunnel_iface_is_up "$ifc" && [ -n "$target" ] && ip route show "$target/32" 2>/dev/null | grep -q .; then
+        state="active"
+      else
+        state="inactive"
+      fi
+      INV_TYPE+=("aggregate"); INV_ID+=("$id"); INV_IFACE+=("$ifc"); INV_LOCAL+=("$local_ip"); INV_TARGET+=("$target"); INV_LOCAL_PUBLIC+=("$local_pub"); INV_REMOTE_PUBLIC+=("$remote_pub"); INV_STATE+=("$state"); INV_DESC+=("$desc")
+    done <<< "$ids"
+  fi
 }
 
 
@@ -4190,6 +4216,7 @@ remove_inventory_item() {
     wireguard) wg_remove_one_tunnel "$id" ;;
     vira7) vira7_remove_one_tunnel "$id" ;;
     viratcp) viratcp_remove_one_tunnel "$id" ;;
+    aggregate) aggregate_remove_profile "$id" ;;
   esac
 }
 
@@ -4203,6 +4230,7 @@ ping_inventory_item() {
     wireguard) test_wg_tunnel_ping "$id" ;;
     vira7) test_vira7_tunnel_ping "$id" ;;
     viratcp) test_viratcp_tunnel_ping "$id" ;;
+    aggregate) test_aggregate_profile_ping "$id" ;;
   esac
 }
 
@@ -4256,18 +4284,22 @@ wg_uses_transport_tunnel() {
 # This avoids the common "I removed one tunnel and the others stopped" case.
 remove_selection_dependency_guard() {
   local -a selected=("$@")
-  local idx i type id wg_ids wg_id agg_profile blocked=0
+  local idx i type id wg_ids wg_id agg_profile agg_profiles blocked=0
 
   for idx in "${selected[@]}"; do
     i=$((idx - 1))
     type="${INV_TYPE[$i]:-}"
     id="${INV_ID[$i]:-}"
 
-    if agg_profile="$(aggregate_uses_member "$type" "$id" 2>/dev/null)"; then
-      warn_msg "Cannot remove $type tunnel $id: aggregate profile $agg_profile is using it."
-      echo "  Remove or update aggregate profile $agg_profile first."
-      blocked=1
-    fi
+    agg_profiles="$(aggregate_uses_member "$type" "$id" 2>/dev/null || true)"
+    while IFS= read -r agg_profile; do
+      [ -n "$agg_profile" ] || continue
+      if ! selection_has_type_id "aggregate" "$agg_profile" "${selected[@]}"; then
+        warn_msg "Cannot remove $type tunnel $id: aggregate profile $agg_profile is using it."
+        echo "  Select aggregate profile $agg_profile too, or remove/update it first."
+        blocked=1
+      fi
+    done <<< "$agg_profiles"
 
     case "$type" in
       gre|vira7)
@@ -4402,13 +4434,16 @@ remove_tun() {
 
   if [ "$selected" = "88" ]; then
     echo
-    echo -e "${C_RED}${C_BOLD}WARNING:${C_RESET} this will remove ALL GRE, WireGuard, Vira7, and ViraTCP tunnels."
+    echo -e "${C_RED}${C_BOLD}WARNING:${C_RESET} this will remove ALL aggregate profiles, GRE, WireGuard, Vira7, and ViraTCP tunnels."
     if ! confirm_yes "Are you sure?"; then
       echo "Cancelled."
       return
     fi
 
     local ids id
+    # Remove aggregate profiles before the member tunnels they reference.
+    ids="$(aggregate_collect_ids || true)"
+    while IFS= read -r id; do [ -n "$id" ] && aggregate_remove_profile "$id"; done <<< "$ids"
     # Remove UDP/overlay tunnels first, then GRE transport last.
     ids="$(wg_collect_ids || true)"
     while IFS= read -r id; do [ -n "$id" ] && wg_remove_one_tunnel "$id"; done <<< "$ids"
@@ -4470,9 +4505,9 @@ remove_tun() {
     return
   fi
 
-  # Remove in dependency-safe order. WireGuard may depend on GRE/Vira transport,
-  # so overlay tunnels are removed first, GRE transport last.
-  for phase in wireguard vira7 viratcp gre; do
+  # Remove in dependency-safe order. Profiles go before their members;
+  # WireGuard may depend on GRE/Vira transport, so GRE remains last.
+  for phase in aggregate wireguard vira7 viratcp gre; do
     for idx in "${SELECTED_INDEXES[@]}"; do
       i=$((idx - 1))
       if [ "${INV_TYPE[$i]}" = "$phase" ]; then
@@ -4597,6 +4632,23 @@ test_viratcp_tunnel_ping() {
   ping4_target "ViraTCP tunnel $id ($ifc) remote inner IP" "${REMOTE_VIRATCP_IP:-${remote_priv:-}}" "$ifc"
 }
 
+test_aggregate_profile_ping() {
+  local id="$1" ifc target source_ip
+  if ! aggregate_load_config "$id"; then
+    echo "[SKIP] Aggregate profile $id: no valid saved configuration"
+    return 1
+  fi
+  ifc="$(aggregate_iface_name "$id")"
+  target="$REMOTE_AGG_IP"
+  source_ip="$LOCAL_AGG_IP"
+  # Rebuild the ECMP route first so a recovered member is included before the
+  # user tests the virtual peer address.
+  aggregate_apply_profile "$id" >/dev/null 2>&1 || true
+  # Bind the virtual source address, not the dummy device: the actual egress
+  # device must remain free for the kernel to choose an ECMP member.
+  ping4_target "Aggregate profile $id ($ifc) peer virtual IP" "$target" "$source_ip"
+}
+
 test_one_tunnel_ping_menu() {
   show_header "Test One Tunnel"
   ask_tunnel_type || return
@@ -4663,9 +4715,10 @@ tunnel_speed_test_menu() {
   read -rp "Select tunnel number for speed test (00=menu): " selected
   if is_main_menu_token "$selected"; then return 99; fi
   [[ "$selected" =~ ^[0-9]+$ ]] && [ "$selected" -ge 1 ] && [ "$selected" -le "${#INV_TYPE[@]}" ] || { err_msg "Invalid tunnel selection."; return 1; }
-  local idx local_ip target role duration answer
+  local idx local_ip target role duration answer rc=0 type
   idx=$((selected - 1))
   local_ip="${INV_LOCAL[$idx]:-}"
+  type="${INV_TYPE[$idx]:-}"
   echo "Select this server's location:"
   echo "1) Iran (client)"
   echo "2) Kharej/outside (iperf3 server)"
@@ -4685,15 +4738,31 @@ tunnel_speed_test_menu() {
   echo
   if [ "$role" = "2" ]; then
     iperf3_prepare_firewall "${INV_IFACE[$idx]:-}"
-    echo "Starting iperf3 server on this (Kharej) side. Run the client test from Iran, then press Ctrl-C to stop."
-    if [ -n "$local_ip" ]; then iperf3 -s -B "$local_ip"; else iperf3 -s; fi
+    echo "Starting a one-shot iperf3 server on this (Kharej) side."
+    echo "Now start the client test on Iran; this server will stop automatically after that one test."
+    if [ -n "$local_ip" ]; then
+      if iperf3 -s -1 -B "$local_ip"; then :; else rc=$?; fi
+    else
+      if iperf3 -s -1; then :; else rc=$?; fi
+    fi
   elif [ "$role" = "1" ]; then
     echo "Make sure iperf3 -s is running on the Kharej server, then testing through the selected tunnel..."
-    if [ -n "$local_ip" ]; then iperf3 -c "$target" -B "$local_ip" -t "$duration" -P 4
-    else iperf3 -c "$target" -t "$duration" -P 4; fi
+    [ "$type" = "aggregate" ] && echo "Aggregate test uses 4 parallel flows so ECMP can exercise multiple healthy members."
+    if [ -n "$local_ip" ]; then
+      if iperf3 -c "$target" -B "$local_ip" -t "$duration" -P 4; then :; else rc=$?; fi
+    else
+      if iperf3 -c "$target" -t "$duration" -P 4; then :; else rc=$?; fi
+    fi
   else
     err_msg "Invalid role."; return 1
   fi
+
+  if [ "$rc" -ne 0 ]; then
+    warn_msg "iperf3 ended or was interrupted (status $rc). Returning safely to the menu."
+  else
+    ok_msg "Speed test finished. Returning to the menu."
+  fi
+  return 0
 }
 
 aggregate_config_file() { echo "$AGG_CONFIG_DIR/profile-$1.conf"; }
@@ -4724,15 +4793,32 @@ aggregate_load_config() {
 }
 
 aggregate_member_details() {
-  local want_type="$1" want_id="$2" i
-  build_tunnel_inventory
-  for i in "${!INV_TYPE[@]}"; do
-    if [ "${INV_TYPE[$i]}" = "$want_type" ] && [ "${INV_ID[$i]}" = "$want_id" ]; then
-      printf '%s\t%s\t%s\t%s\n' "${INV_IFACE[$i]}" "${INV_LOCAL[$i]%%/*}" "${INV_TARGET[$i]%%/*}" "${INV_STATE[$i]}"
-      return 0
-    fi
-  done
-  return 1
+  local want_type="$1" want_id="$2" ifc="" src="" peer="" state="inactive"
+  case "$want_type" in
+    gre)
+      gre_load_config "$want_id" || return 1
+      ifc="$(gre_iface "$want_id")"; src="${LOCAL_GRE_IP:-}"; src="${src%%/*}"; peer="${REMOTE_GRE_IP:-}"; peer="${peer%%/*}"
+      ;;
+    wireguard)
+      wg_load_meta "$want_id" || return 1
+      ifc="$(wg_iface_name "$want_id")"; src="${LOCAL_WG_IP:-}"; src="${src%%/*}"; peer="${REMOTE_WG_IP:-}"; peer="${peer%%/*}"
+      ;;
+    vira7)
+      vira7_load_config "$want_id" || return 1
+      ifc="$(vira7_iface_name "$want_id")"
+      src="${LOCAL_VIRA7_IP:-${local_priv:-}}"; src="${src%%/*}"
+      peer="${REMOTE_VIRA7_IP:-${remote_priv:-}}"; peer="${peer%%/*}"
+      ;;
+    viratcp)
+      viratcp_load_config "$want_id" || return 1
+      ifc="$(viratcp_iface_name "$want_id")"
+      src="${LOCAL_VIRATCP_IP:-${local_priv:-}}"; src="${src%%/*}"
+      peer="${REMOTE_VIRATCP_IP:-${remote_priv:-}}"; peer="${peer%%/*}"
+      ;;
+    *) return 1 ;;
+  esac
+  tunnel_iface_is_up "$ifc" && state="active"
+  printf '%s\t%s\t%s\t%s\n' "$ifc" "$src" "$peer" "$state"
 }
 
 # Return every aggregate peer /32 that must be accepted by a WireGuard peer.
@@ -4864,16 +4950,20 @@ aggregate_profile_for_remote_ip() {
 }
 
 aggregate_uses_member() {
-  local type="$1" id="$2" f members ref
+  local type="$1" id="$2" f members ref found=1
   for f in "$AGG_CONFIG_DIR"/profile-*.conf; do
     [ -e "$f" ] || continue
     members="$(bash -c 'source "$1" 2>/dev/null; printf "%s" "${AGG_MEMBERS:-}"' _ "$f" 2>/dev/null || true)"
     IFS=',' read -ra _agg_refs <<< "$members"
     for ref in "${_agg_refs[@]}"; do
-      [ "$ref" = "$type:$id" ] && { echo "${f##*/profile-}" | sed 's/\.conf$//'; return 0; }
+      if [ "$ref" = "$type:$id" ]; then
+        echo "${f##*/profile-}" | sed 's/\.conf$//'
+        found=0
+        break
+      fi
     done
   done
-  return 1
+  return "$found"
 }
 
 aggregate_save_profile() {
@@ -4893,21 +4983,32 @@ aggregate_save_profile() {
 aggregate_create_menu() {
   show_header "Create / Update Aggregate Tunnel"
   ensure_feature_dependencies "aggregation" "ip:iproute2" "ping:iputils-ping" "iptables:iptables" || return 1
+  local role
+  echo "Select this server's location:"
+  echo "1) Iran side"
+  echo "2) Kharej/outside side"
+  read -rp "Choose [1-2] (00=menu): " role
+  is_main_menu_token "$role" && return 99
+  [[ "$role" = "1" || "$role" = "2" ]] || { err_msg "Invalid role."; return 1; }
+  echo
+
   build_tunnel_inventory
   print_tunnel_inventory || return 1
-  echo "Select at least two ACTIVE tunnel rows (example: 1,2,3)."
+  echo "Select at least two ACTIVE non-aggregate tunnel rows."
+  echo "Examples: 1 2 5  OR  1,2,5"
   read -rp "Tunnel rows (00=menu): " raw
   is_main_menu_token "$raw" && return 99
-  raw="${raw// /}"
-  IFS=',' read -ra picks <<< "$raw"
+  raw="$(printf '%s' "$raw" | tr ',' ' ')"
+  read -ra picks <<< "$raw"
   [ "${#picks[@]}" -ge 2 ] || { err_msg "Select at least two tunnels."; return 1; }
 
-  local p idx seen=" " members="" profile_id role local_ip remote_ip
+  local p idx seen=" " members="" profile_id local_ip remote_ip
   local previous_members="" previous_local="" previous_remote="" ref type tid details ifc _src _peer _state
   for p in "${picks[@]}"; do
     [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le "${#INV_TYPE[@]}" ] || { err_msg "Invalid tunnel row: $p"; return 1; }
     [[ "$seen" != *" $p "* ]] || { err_msg "Tunnel row $p was selected twice."; return 1; }
     seen+="$p "; idx=$((p - 1))
+    [ "${INV_TYPE[$idx]}" != "aggregate" ] || { err_msg "An aggregate profile cannot be a member of another aggregate profile."; return 1; }
     [ "${INV_STATE[$idx]}" = "active" ] || { err_msg "${INV_IFACE[$idx]} is not active."; return 1; }
     members+="${members:+,}${INV_TYPE[$idx]}:${INV_ID[$idx]}"
   done
@@ -4915,10 +5016,6 @@ aggregate_create_menu() {
   read -rp "Aggregate profile number [1-254] (same number on both servers, 00=menu): " profile_id
   is_main_menu_token "$profile_id" && return 99
   validate_tunnel_id "$profile_id" || { err_msg "Invalid aggregate profile number."; return 1; }
-  echo "1) Iran side    2) Kharej/outside side"
-  read -rp "This server role [1-2] (00=menu): " role
-  is_main_menu_token "$role" && return 99
-  [[ "$role" = "1" || "$role" = "2" ]] || { err_msg "Invalid role."; return 1; }
   if [ "$role" = "1" ]; then local_ip="10.99.$profile_id.1"; remote_ip="10.99.$profile_id.2"
   else local_ip="10.99.$profile_id.2"; remote_ip="10.99.$profile_id.1"; fi
 
@@ -4987,11 +5084,8 @@ aggregate_repair_all_menu() {
   ok_msg "Aggregate profiles were rebuilt from currently healthy tunnel paths."
 }
 
-aggregate_remove_menu() {
-  aggregate_list_profiles
-  local id iface local_ip remote members ref type tid details ifc _src _peer _state
-  read -rp "Aggregate profile to remove [1-254] (00=menu): " id
-  is_main_menu_token "$id" && return 99
+aggregate_remove_profile() {
+  local id="$1" iface local_ip remote members ref type tid details ifc _src _peer _state
   validate_tunnel_id "$id" || { err_msg "Invalid profile number."; return 1; }
   aggregate_load_config "$id" || { err_msg "Profile $id was not found."; return 1; }
   local_ip="$LOCAL_AGG_IP"; remote="$REMOTE_AGG_IP"; members="$AGG_MEMBERS"; iface="$(aggregate_iface_name "$id")"
@@ -5010,6 +5104,14 @@ aggregate_remove_menu() {
     [ "$type" = "wireguard" ] && aggregate_refresh_wireguard_member "$tid"
   done
   ok_msg "Aggregate profile $id removed."
+}
+
+aggregate_remove_menu() {
+  aggregate_list_profiles
+  local id
+  read -rp "Aggregate profile to remove [1-254] (00=menu): " id
+  is_main_menu_token "$id" && return 99
+  aggregate_remove_profile "$id"
 }
 
 tunnel_aggregation_menu() {
