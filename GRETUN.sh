@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + WireGuard + ViraTCP + HAProxy multi-tunnel manager v9.1.1
+# GRE + WireGuard + ViraTCP + HAProxy multi-tunnel manager v10.0.0
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
@@ -29,8 +29,12 @@ set -euo pipefail
 #   comma- and space-separated aggregate member selections; asks for the local role before tunnel selection;
 #   and makes iperf3 return safely to the menu after a one-shot server or a failed/interrupted test.
 # - v9.1.1 strips CIDR prefixes from local/remote throughput-test addresses before passing them to iperf3.
+# - v10.0.0 rewrites aggregation as isolated per-member GRE paths. Aggregate destinations are no longer
+#   injected into WireGuard AllowedIPs, so wg-quick restarts cannot replace ECMP routes or disturb handshakes.
+#   Route updates are idempotent and health-aware with failure hysteresis. Fresh WireGuard handshakes also
+#   suppress destructive GRE/WireGuard restarts when ICMP probes are lost under load.
 
-APP_VERSION="9.1.1"
+APP_VERSION="10.0.0"
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -95,6 +99,9 @@ HAPROXY_UDP_REPAIR_TIMER_UNIT="/etc/systemd/system/${HAPROXY_UDP_REPAIR_TIMER_NA
 AGG_CONFIG_DIR="/etc/gretun-aggregate"
 AGG_SERVICE_TEMPLATE="/etc/systemd/system/gretun-aggregate@.service"
 AGG_IFACE_PREFIX="gtagg"
+AGG_PATH_IFACE_PREFIX="ga"
+AGG_FAIL_LIMIT=3
+WG_RECENT_HANDSHAKE_SECONDS=180
 DEPENDENCY_STATE_DIR="/var/lib/gretun-manager/dependencies"
 
 # Color/theme helpers
@@ -635,7 +642,7 @@ ensure_public_endpoint_route() {
   gateway="$(awk '{for(i=1;i<=NF;i++) if($i=="via") {print $(i+1); exit}}' <<< "$route")"
 
   case "$dev" in
-    gre*|wgtun*|vira7*|viratcp*|"")
+    gre*|wgtun*|vira7*|viratcp*|ga*|gtagg*|"")
       route="$(ip -4 route get 1.1.1.1 from "$local_ip" 2>/dev/null | head -n 1 || true)"
       dev="$(awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}' <<< "$route")"
       gateway="$(awk '{for(i=1;i<=NF;i++) if($i=="via") {print $(i+1); exit}}' <<< "$route")"
@@ -643,7 +650,7 @@ ensure_public_endpoint_route() {
   esac
 
   [ -n "$dev" ] || return 0
-  case "$dev" in gre*|wgtun*|vira7*|viratcp*) return 0 ;; esac
+  case "$dev" in gre*|wgtun*|vira7*|viratcp*|ga*|gtagg*) return 0 ;; esac
   if [ -n "$gateway" ]; then
     ip -4 route replace "$remote_ip/32" via "$gateway" dev "$dev" src "$local_ip" metric 5 2>/dev/null || true
   else
@@ -658,6 +665,31 @@ quick_tunnel_ping() {
   [ -n "$ifc" ] && [ -n "$target" ] || return 1
   tunnel_iface_is_up "$ifc" || return 1
   ping -n -I "$ifc" -c 1 -W 2 "$target" >/dev/null 2>&1
+}
+
+# A recent authenticated handshake is stronger evidence of a working
+# WireGuard transport than an ICMP probe, especially while the path is full.
+wg_iface_has_recent_handshake() {
+  local ifc="${1:-}" max_age="${2:-$WG_RECENT_HANDSHAKE_SECONDS}"
+  local latest now
+  [ -n "$ifc" ] && command -v wg >/dev/null 2>&1 || return 1
+  latest="$(wg show "$ifc" latest-handshakes 2>/dev/null | awk '$2 > m {m=$2} END {print m+0}')"
+  [[ "$latest" =~ ^[0-9]+$ ]] && [ "$latest" -gt 0 ] || return 1
+  now="$(date +%s)"
+  [ $((now - latest)) -le "$max_age" ]
+}
+
+transport_has_recent_wg_handshake() {
+  local transport_type="$1" transport_id="$2" ids wg_id
+  ids="$(wg_collect_ids 2>/dev/null || true)"
+  while IFS= read -r wg_id; do
+    [ -n "$wg_id" ] || continue
+    if wg_uses_transport_tunnel "$wg_id" "$transport_type" "$transport_id" && \
+       wg_iface_has_recent_handshake "$(wg_iface_name "$wg_id")"; then
+      return 0
+    fi
+  done <<< "$ids"
+  return 1
 }
 
 health_counter_reset() {
@@ -761,7 +793,7 @@ gre_supervisor() {
         sleep "$GRE_SUPERVISOR_INTERVAL"
         continue
       fi
-    elif quick_tunnel_ping "$ifc" "$target"; then
+    elif transport_has_recent_wg_handshake gre "$id" || quick_tunnel_ping "$ifc" "$target"; then
       failures=0
     else
       failures=$((failures + 1))
@@ -901,7 +933,7 @@ tunnel_health_check_all() {
     if ! systemctl is-active --quiet "$svc" 2>/dev/null || ! tunnel_iface_is_up "$ifc"; then
       systemctl restart "$svc" >/dev/null 2>&1 || true
       health_counter_reset wireguard "$id"
-    elif quick_tunnel_ping "$ifc" "$target"; then
+    elif wg_iface_has_recent_handshake "$ifc" || quick_tunnel_ping "$ifc" "$target"; then
       health_counter_reset wireguard "$id"
     else
       count="$(health_counter_fail wireguard "$id")"
@@ -1730,7 +1762,10 @@ wg_write_config() {
   private_file="$(wg_private_key_file "$id")"
   conf="$(wg_config_file "$id")"
   private_key="$(cat "$private_file")"
-  allowed_ips="$(aggregate_wg_allowed_ips "$id" "${REMOTE_WG_IP%%/*}")"
+  # Aggregate traffic uses isolated GRE-over-member paths in v10.  Keeping the
+  # peer list limited to its real WireGuard addresses prevents wg-quick from
+  # creating competing routes for an aggregate /32 on multiple interfaces.
+  allowed_ips="${REMOTE_WG_IP%%/*}/32"
   endpoint_ip="$(wg_auto_endpoint_ip)"
   endpoint_mode_note="${WG_ENDPOINT_MODE:-public}"
   mtu_value="${WG_MTU:-1420}"
@@ -4790,12 +4825,13 @@ aggregate_load_config() {
   local id="$1" f
   f="$(aggregate_config_file "$id")"
   [ -f "$f" ] || return 1
-  unset AGG_PROFILE_ID AGG_ROLE LOCAL_AGG_IP REMOTE_AGG_IP AGG_MEMBERS
+  unset AGG_PROFILE_ID AGG_ROLE LOCAL_AGG_IP REMOTE_AGG_IP AGG_MEMBERS AGG_MODE
   # shellcheck disable=SC1090
   source "$f"
   validate_tunnel_id "${AGG_PROFILE_ID:-}" || return 1
   validate_ipv4 "${LOCAL_AGG_IP:-}" || return 1
   validate_ipv4 "${REMOTE_AGG_IP:-}" || return 1
+  AGG_MODE="${AGG_MODE:-isolated-gre-v2}"
   [ -n "${AGG_MEMBERS:-}" ]
 }
 
@@ -4828,36 +4864,32 @@ aggregate_member_details() {
   printf '%s\t%s\t%s\t%s\n' "$ifc" "$src" "$peer" "$state"
 }
 
-# Return every aggregate peer /32 that must be accepted by a WireGuard peer.
-aggregate_wg_allowed_ips() {
-  local wg_id="$1" base_remote="$2" f remote members ref
-  local result="$base_remote/32"
-  for f in "$AGG_CONFIG_DIR"/profile-*.conf; do
-    [ -e "$f" ] || continue
-    remote="$(bash -c 'source "$1" 2>/dev/null; printf "%s" "${REMOTE_AGG_IP:-}"' _ "$f" 2>/dev/null || true)"
-    members="$(bash -c 'source "$1" 2>/dev/null; printf "%s" "${AGG_MEMBERS:-}"' _ "$f" 2>/dev/null || true)"
-    validate_ipv4 "$remote" || continue
-    IFS=',' read -ra _agg_refs <<< "$members"
-    for ref in "${_agg_refs[@]}"; do
-      if [ "$ref" = "wireguard:$wg_id" ] && [[ ",$result," != *",$remote/32,"* ]]; then
-        result+=",$remote/32"
-      fi
-    done
-  done
-  printf '%s\n' "$result"
-}
-
+# Restore the WireGuard peer to its own real addresses only.  v9 injected each
+# aggregate /32 into every member's AllowedIPs, which let wg-quick create
+# competing single-path routes after a restart.  v10 carries aggregate packets
+# inside a keyed GRE path whose outer destination is the normal WG peer /32, so
+# no aggregate address ever needs to enter WireGuard cryptokey routing.
 aggregate_refresh_wireguard_member() {
-  local id="$1" allowed conf ifc key
+  local id="$1" allowed conf ifc key desired_compact current_compact config_compact
   wg_load_meta "$id" || return 0
   [ -n "${REMOTE_WG_PUBLIC_KEY:-}" ] || return 0
-  allowed="$(aggregate_wg_allowed_ips "$id" "${REMOTE_WG_IP%%/*}")"
+  allowed="${REMOTE_WG_IP%%/*}/32"
+  if [ -n "${EXTRA_ALLOWED_IPS:-}" ]; then
+    allowed="$allowed, $EXTRA_ALLOWED_IPS"
+  fi
   conf="$(wg_config_file "$id")"; ifc="$(wg_iface_name "$id")"; key="$REMOTE_WG_PUBLIC_KEY"
+  desired_compact="$(printf '%s' "$allowed" | tr -d '[:space:]')"
   if [ -f "$conf" ]; then
-    sed -i -E "s|^[[:space:]]*AllowedIPs[[:space:]]*=.*$|AllowedIPs = $allowed|" "$conf" || true
+    config_compact="$(awk -F= '/^[[:space:]]*AllowedIPs[[:space:]]*=/{v=$0; sub(/^[^=]*=/,"",v); gsub(/[[:space:]]/,"",v); print v; exit}' "$conf")"
+    if [ "$config_compact" != "$desired_compact" ]; then
+      sed -i -E "s|^[[:space:]]*AllowedIPs[[:space:]]*=.*$|AllowedIPs = $allowed|" "$conf" || true
+    fi
   fi
   if command -v wg >/dev/null 2>&1 && ip link show "$ifc" >/dev/null 2>&1; then
-    wg set "$ifc" peer "$key" allowed-ips "$allowed" >/dev/null 2>&1 || true
+    current_compact="$(wg show "$ifc" allowed-ips 2>/dev/null | awk -v k="$key" '$1==k {$1=""; sub(/^[[:space:]]+/,""); gsub(/[[:space:]]/,""); print; exit}')"
+    if [ "$current_compact" != "$desired_compact" ]; then
+      wg set "$ifc" peer "$key" allowed-ips "$allowed" >/dev/null 2>&1 || true
+    fi
   fi
 }
 
@@ -4894,19 +4926,127 @@ WantedBy=multi-user.target
 EOF_AGG_SERVICE
 }
 
-aggregate_apply_profile() {
-  local id="$1" iface local_ip remote_ip members ref type tid details ifc src peer state
-  local healthy=0
-  local -a route_args=()
+aggregate_member_type_code() {
+  case "$1" in
+    gre) echo 1 ;;
+    wireguard) echo 2 ;;
+    vira7) echo 3 ;;
+    viratcp) echo 4 ;;
+    *) return 1 ;;
+  esac
+}
+
+aggregate_path_iface() {
+  local profile="$1" type="$2" tid="$3" code
+  code="$(aggregate_member_type_code "$type")" || return 1
+  # Maximum length is 9 characters (ga + 3 + 1 + 3), below IFNAMSIZ=16.
+  printf '%s%s%s%s\n' "$AGG_PATH_IFACE_PREFIX" "$profile" "$code" "$tid"
+}
+
+aggregate_path_key() {
+  local profile="$1" type="$2" tid="$3" code
+  code="$(aggregate_member_type_code "$type")" || return 1
+  echo $((profile * 1000000 + code * 1000 + tid))
+}
+
+aggregate_member_fail_file() {
+  local profile="$1" type="$2" tid="$3"
+  echo "$HEALTH_STATE_DIR/aggregate-${profile}-${type}-${tid}.fail"
+}
+
+aggregate_member_health_reset() {
+  rm -f "$(aggregate_member_fail_file "$1" "$2" "$3")" 2>/dev/null || true
+}
+
+aggregate_member_health_fail() {
+  local file count
+  file="$(aggregate_member_fail_file "$1" "$2" "$3")"
+  mkdir -p "$HEALTH_STATE_DIR" 2>/dev/null || true
+  count="$(cat "$file" 2>/dev/null || echo 0)"
+  [[ "$count" =~ ^[0-9]+$ ]] || count=0
+  count=$((count + 1))
+  printf '%s\n' "$count" > "$file"
+  printf '%s\n' "$count"
+}
+
+aggregate_route_has_path() {
+  local remote="$1" path_if="$2"
+  ip -o route show "$remote/32" 2>/dev/null | grep -Eq "(^|[[:space:]])dev[[:space:]]+$path_if([[:space:]]|$)"
+}
+
+aggregate_member_is_healthy() {
+  local profile="$1" type="$2" tid="$3" ifc="$4" peer="$5" path_if="$6" remote="$7" failures
+  tunnel_iface_is_up "$ifc" || return 1
+
+  if { [ "$type" = "wireguard" ] && wg_iface_has_recent_handshake "$ifc"; } || \
+     { [ "$type" = "gre" ] && transport_has_recent_wg_handshake gre "$tid"; } || \
+     quick_tunnel_ping "$ifc" "$peer"; then
+    aggregate_member_health_reset "$profile" "$type" "$tid"
+    return 0
+  fi
+
+  failures="$(aggregate_member_health_fail "$profile" "$type" "$tid")"
+  # Do not move established flows after a single probe lost under load.  Keep
+  # an already-installed member until several consecutive checks fail.
+  if [ "$failures" -lt "$AGG_FAIL_LIMIT" ] && aggregate_route_has_path "$remote" "$path_if"; then
+    return 0
+  fi
+  return 1
+}
+
+aggregate_ensure_path() {
+  local path_if="$1" src="$2" peer="$3" key="$4" mtu="$5" shown
+  shown="$(ip tunnel show "$path_if" 2>/dev/null || true)"
+  if [ -n "$shown" ] && { [[ "$shown" != *"remote $peer"* ]] || [[ "$shown" != *"local $src"* ]]; }; then
+    ip link del "$path_if" 2>/dev/null || true
+    shown=""
+  fi
+  if [ -z "$shown" ]; then
+    ip tunnel add "$path_if" mode gre local "$src" remote "$peer" key "$key" || return 1
+  fi
+  ip link set dev "$path_if" mtu "$mtu" up || return 1
+  [ -e "/proc/sys/net/ipv4/conf/$path_if/rp_filter" ] && echo 0 > "/proc/sys/net/ipv4/conf/$path_if/rp_filter" 2>/dev/null || true
+}
+
+aggregate_cleanup_stale_paths() {
+  local profile="$1" keep=" ${2:-} " local_ip="${3:-}" remote_ip="${4:-}" ifc
+  ip -o link show 2>/dev/null | awk -F': ' -v p="^${AGG_PATH_IFACE_PREFIX}${profile}[1-4][0-9]+$" '{n=$2; sub(/@.*/,"",n); if(n ~ p) print n}' | while IFS= read -r ifc; do
+    [ -n "$ifc" ] || continue
+    if [[ "$keep" != *" $ifc "* ]]; then
+      [ -n "$local_ip" ] && [ -n "$remote_ip" ] && aggregate_remove_member_firewall "$ifc" "$local_ip" "$remote_ip"
+      ip link del "$ifc" 2>/dev/null || true
+    fi
+  done
+}
+
+aggregate_route_matches() {
+  local remote="$1" expected="$2" expected_mtu="${3:-}" route path actual=0 wanted=0
+  route="$(ip -o route show "$remote/32" 2>/dev/null || true)"
+  [ -n "$route" ] || return 1
+  [ -z "$expected_mtu" ] || [[ "$route" == *"mtu $expected_mtu"* ]] || return 1
+  for path in $expected; do
+    wanted=$((wanted + 1))
+    [[ "$route" == *"dev $path"* ]] || return 1
+  done
+  actual="$(grep -oE "dev[[:space:]]+${AGG_PATH_IFACE_PREFIX}[0-9]+" <<< "$route" | wc -l | tr -d ' ' || true)"
+  [ "$actual" -eq "$wanted" ]
+}
+
+aggregate_apply_profile_unlocked() {
+  local id="$1" iface local_ip remote_ip members ref type tid details ifc src peer state path_if key
+  local healthy=0 min_mtu=65535 member_mtu candidate_mtu keep_paths="" expected_paths=""
+  local -a route_args=() healthy_types=() healthy_ids=() healthy_ifcs=() healthy_srcs=() healthy_peers=() healthy_paths=() healthy_keys=()
   aggregate_load_config "$id" || return 1
   local_ip="$LOCAL_AGG_IP"; remote_ip="$REMOTE_AGG_IP"; members="$AGG_MEMBERS"
   iface="$(aggregate_iface_name "$id")"
 
   apply_tunnel_sysctls
   ip link show "$iface" >/dev/null 2>&1 || ip link add "$iface" type dummy
-  ip addr replace "$local_ip/32" dev "$iface"
+  ip -4 addr show dev "$iface" 2>/dev/null | grep -qE "[[:space:]]inet[[:space:]]+$local_ip/32([[:space:]]|$)" || ip addr replace "$local_ip/32" dev "$iface"
   ip link set "$iface" up
 
+  # First select stable members with hysteresis and calculate one conservative
+  # MTU for every path. Equal MTU prevents per-flow PMTU surprises.
   IFS=',' read -ra _agg_members <<< "$members"
   for ref in "${_agg_members[@]}"; do
     type="${ref%%:*}"; tid="${ref#*:}"
@@ -4915,22 +5055,77 @@ aggregate_apply_profile() {
     IFS=$'\t' read -r ifc src peer state <<< "$details"
     [ "$state" = "active" ] || continue
     validate_ipv4 "$peer" || continue
-    quick_tunnel_ping "$ifc" "$peer" || continue
-    route_args+=(nexthop via "$peer" dev "$ifc" weight 1)
+    validate_ipv4 "$src" || continue
+    path_if="$(aggregate_path_iface "$id" "$type" "$tid")" || continue
+    key="$(aggregate_path_key "$id" "$type" "$tid")" || continue
+    aggregate_member_is_healthy "$id" "$type" "$tid" "$ifc" "$peer" "$path_if" "$remote_ip" || continue
+
+    member_mtu="$(ip -o link show dev "$ifc" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="mtu") {print $(i+1); exit}}')"
+    [[ "$member_mtu" =~ ^[0-9]+$ ]] || member_mtu=1280
+    candidate_mtu=$((member_mtu - 24))
+    [ "$candidate_mtu" -ge 1200 ] || candidate_mtu=1200
+    [ "$candidate_mtu" -lt "$min_mtu" ] && min_mtu="$candidate_mtu"
+    healthy_types+=("$type"); healthy_ids+=("$tid"); healthy_ifcs+=("$ifc")
+    healthy_srcs+=("$src"); healthy_peers+=("$peer"); healthy_paths+=("$path_if"); healthy_keys+=("$key")
     healthy=$((healthy + 1))
-    if command -v iptables >/dev/null 2>&1; then
-      iptables -w 5 -C INPUT -i "$ifc" -d "$local_ip" -j ACCEPT 2>/dev/null || iptables -w 5 -I INPUT 1 -i "$ifc" -d "$local_ip" -j ACCEPT || true
-      iptables -w 5 -C FORWARD -o "$ifc" -d "$remote_ip" -j ACCEPT 2>/dev/null || iptables -w 5 -I FORWARD 1 -o "$ifc" -d "$remote_ip" -j ACCEPT || true
-      iptables -w 5 -C FORWARD -i "$ifc" -s "$remote_ip" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || iptables -w 5 -I FORWARD 1 -i "$ifc" -s "$remote_ip" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT || true
-    fi
-    [ "$type" = "wireguard" ] && aggregate_refresh_wireguard_member "$tid"
   done
 
   if [ "$healthy" -eq 0 ]; then
+    # Transient failures were already absorbed by per-member hysteresis. At
+    # this point every member reached the fail limit, so withdraw the route
+    # instead of blackholing traffic into dead path interfaces forever.
     ip route del "$remote_ip/32" 2>/dev/null || true
+    aggregate_cleanup_stale_paths "$id" "" "$local_ip" "$remote_ip"
     return 1
   fi
-  ip route replace "$remote_ip/32" proto static "${route_args[@]}"
+
+  local i
+  for i in "${!healthy_types[@]}"; do
+    type="${healthy_types[$i]}"; tid="${healthy_ids[$i]}"; ifc="${healthy_ifcs[$i]}"
+    src="${healthy_srcs[$i]}"; peer="${healthy_peers[$i]}"; path_if="${healthy_paths[$i]}"; key="${healthy_keys[$i]}"
+    aggregate_ensure_path "$path_if" "$src" "$peer" "$key" "$min_mtu" || continue
+    route_args+=(nexthop dev "$path_if" weight 1)
+    keep_paths+="${keep_paths:+ }$path_if"
+    expected_paths+="${expected_paths:+ }$path_if"
+    if command -v iptables >/dev/null 2>&1; then
+      iptables -w 5 -C INPUT -i "$path_if" -d "$local_ip" -j ACCEPT 2>/dev/null || iptables -w 5 -I INPUT 1 -i "$path_if" -d "$local_ip" -j ACCEPT || true
+      iptables -w 5 -C FORWARD -o "$path_if" -d "$remote_ip" -j ACCEPT 2>/dev/null || iptables -w 5 -I FORWARD 1 -o "$path_if" -d "$remote_ip" -j ACCEPT || true
+      iptables -w 5 -C FORWARD -i "$path_if" -s "$remote_ip" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || iptables -w 5 -I FORWARD 1 -i "$path_if" -s "$remote_ip" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT || true
+    fi
+  done
+
+  [ "${#route_args[@]}" -gt 0 ] || return 1
+  aggregate_cleanup_stale_paths "$id" "$keep_paths" "$local_ip" "$remote_ip"
+  if ! aggregate_route_matches "$remote_ip" "$expected_paths" "$min_mtu"; then
+    ip route replace "$remote_ip/32" proto static mtu "$min_mtu" "${route_args[@]}"
+  fi
+  # Migration from v9: the isolated route is live before aggregate prefixes
+  # are removed from WireGuard, so established traffic never sees a gap.
+  for i in "${!healthy_types[@]}"; do
+    [ "${healthy_types[$i]}" = "wireguard" ] && aggregate_refresh_wireguard_member "${healthy_ids[$i]}"
+  done
+  return 0
+}
+
+aggregate_apply_profile() {
+  local id="$1" lockdir="/run/gretun-aggregate-$1.lock" rc owner=""
+  if ! mkdir "$lockdir" 2>/dev/null; then
+    owner="$(cat "$lockdir/pid" 2>/dev/null || true)"
+    if [[ "$owner" =~ ^[0-9]+$ ]] && kill -0 "$owner" 2>/dev/null; then
+      # Another service/menu health pass is already applying this profile.
+      return 0
+    fi
+    rm -f "$lockdir/pid" 2>/dev/null || true
+    rmdir "$lockdir" 2>/dev/null || return 1
+    mkdir "$lockdir" 2>/dev/null || return 1
+  fi
+  printf '%s\n' "$$" > "$lockdir/pid"
+  if aggregate_apply_profile_unlocked "$id"; then rc=0; else rc=$?; fi
+  rm -f "$lockdir/pid" 2>/dev/null || true
+  rmdir "$lockdir" 2>/dev/null || true
+  if [ "$rc" -ne 0 ]; then
+    return 1
+  fi
   return 0
 }
 
@@ -4983,6 +5178,7 @@ aggregate_save_profile() {
     write_var LOCAL_AGG_IP "$local_ip"
     write_var REMOTE_AGG_IP "$remote_ip"
     write_var AGG_MEMBERS "$members"
+    write_var AGG_MODE "isolated-gre-v2"
   } > "$f"
   chmod 600 "$f"
 }
@@ -5065,7 +5261,7 @@ aggregate_create_menu() {
 
 aggregate_list_profiles() {
   show_header "Aggregate Tunnel Status"
-  local ids id iface route active total ref type tid details
+  local ids id iface route active total ref type tid details path_list path_count
   ids="$(aggregate_collect_ids || true)"
   [ -n "$ids" ] || { warn_msg "No aggregate profile exists."; return 0; }
   while IFS= read -r id; do
@@ -5077,9 +5273,12 @@ aggregate_list_profiles() {
       details="$(aggregate_member_details "$type" "$tid" 2>/dev/null || true)"
       [[ "$details" == *$'\tactive' ]] && active=$((active + 1))
     done
-    route="$(ip route show "$REMOTE_AGG_IP/32" 2>/dev/null | head -n1 || true)"
-    printf 'Profile %-3s  local=%-15s peer=%-15s iface=%-9s paths=%s/%s route=%s\n' "$id" "$LOCAL_AGG_IP" "$REMOTE_AGG_IP" "$iface" "$active" "$total" "${route:+installed}"
+    route="$(ip -o route show "$REMOTE_AGG_IP/32" 2>/dev/null | head -n1 || true)"
+    path_list="$(grep -oE "dev[[:space:]]+${AGG_PATH_IFACE_PREFIX}[0-9]+" <<< "$route" | awk '{print $2}' | paste -sd, - 2>/dev/null || true)"
+    path_count="$(grep -oE "dev[[:space:]]+${AGG_PATH_IFACE_PREFIX}[0-9]+" <<< "$route" | wc -l | tr -d ' ' || true)"
+    printf 'Profile %-3s  local=%-15s peer=%-15s iface=%-9s members=%s/%s ecmp=%s mode=%s\n' "$id" "$LOCAL_AGG_IP" "$REMOTE_AGG_IP" "$iface" "$active" "$total" "${path_count:-0}" "${AGG_MODE:-isolated-gre-v2}"
     echo "  members: $AGG_MEMBERS"
+    echo "  isolated paths: ${path_list:-none} | route: ${route:+installed}"
   done <<< "$ids"
 }
 
@@ -5098,6 +5297,7 @@ aggregate_remove_profile() {
   local_ip="$LOCAL_AGG_IP"; remote="$REMOTE_AGG_IP"; members="$AGG_MEMBERS"; iface="$(aggregate_iface_name "$id")"
   systemctl disable --now "$(aggregate_service_name "$id")" >/dev/null 2>&1 || true
   ip route del "$remote/32" 2>/dev/null || true
+  aggregate_cleanup_stale_paths "$id" "" "$local_ip" "$remote"
   ip link del "$iface" 2>/dev/null || true
   rm -f "$(aggregate_config_file "$id")"
   IFS=',' read -ra _agg_members <<< "$members"
@@ -5599,9 +5799,11 @@ haproxy_udp_resolve_path() {
     aggregate_apply_profile "$agg_id" >/dev/null 2>&1 || true
     if ip route show "$target/32" 2>/dev/null | grep -q 'nexthop'; then
       HAP_UDP_IFACE="MULTIPATH"
-      HAP_UDP_LOCAL_IP="AUTO"
+      if aggregate_load_config "$agg_id"; then
+        HAP_UDP_LOCAL_IP="$LOCAL_AGG_IP"
+      fi
       HAP_UDP_AGGREGATE=1
-      return 0
+      validate_ipv4 "$HAP_UDP_LOCAL_IP" && return 0
     fi
   fi
 
@@ -5701,8 +5903,11 @@ haproxy_udp_remove_equivalent_rules() {
     -j DNAT --to-destination "$target:$tport"
 
   if [ "${HAP_UDP_AGGREGATE:-0}" = "1" ]; then
+    # Remove both the old v9 MASQUERADE form and the v10 deterministic SNAT.
     haproxy_udp_delete_exact_rule nat POSTROUTING \
       -p udp -d "$target" --dport "$tport" -j MASQUERADE
+    haproxy_udp_delete_exact_rule nat POSTROUTING \
+      -p udp -d "$target" --dport "$tport" -j SNAT --to-source "$local_ip"
     haproxy_udp_delete_exact_rule filter FORWARD \
       -p udp -d "$target" --dport "$tport" -j ACCEPT
     haproxy_udp_delete_exact_rule filter FORWARD \
@@ -5734,11 +5939,11 @@ haproxy_udp_add_rule() {
     -j DNAT --to-destination "$target:$tport"
 
   if [ "${HAP_UDP_AGGREGATE:-0}" = "1" ]; then
-    # MASQUERADE chooses the correct inner source address after ECMP selects a
-    # member interface, so UDP flows can use every healthy aggregate path.
+    # Every aggregate path terminates at the same virtual address. Deterministic
+    # SNAT keeps replies inside the aggregate instead of exposing a member IP.
     iptables -w 5 -t nat -I POSTROUTING 1 \
       -p udp -d "$target" --dport "$tport" \
-      -m comment --comment "gretun-hap-udp-post-$port" -j MASQUERADE
+      -m comment --comment "gretun-hap-udp-post-$port" -j SNAT --to-source "$local_ip"
     iptables -w 5 -I FORWARD 1 \
       -p udp -d "$target" --dport "$tport" \
       -m comment --comment "gretun-hap-udp-out-$port" -j ACCEPT
@@ -5773,7 +5978,7 @@ haproxy_udp_rule_set_present() {
 
   if [ "${HAP_UDP_AGGREGATE:-0}" = "1" ]; then
     iptables -w 5 -t nat -C POSTROUTING \
-      -p udp -d "$target" --dport "$tport" -m comment --comment "gretun-hap-udp-post-$port" -j MASQUERADE 2>/dev/null || return 1
+      -p udp -d "$target" --dport "$tport" -m comment --comment "gretun-hap-udp-post-$port" -j SNAT --to-source "$HAP_UDP_LOCAL_IP" 2>/dev/null || return 1
     iptables -w 5 -C FORWARD \
       -p udp -d "$target" --dport "$tport" -m comment --comment "gretun-hap-udp-out-$port" -j ACCEPT 2>/dev/null || return 1
     iptables -w 5 -C FORWARD \
