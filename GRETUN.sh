@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + WireGuard + ViraTCP + HAProxy multi-tunnel manager v10.0.0
+# GRE + WireGuard + ViraTCP + HAProxy multi-tunnel manager v10.0.1
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
@@ -34,7 +34,7 @@ set -euo pipefail
 #   Route updates are idempotent and health-aware with failure hysteresis. Fresh WireGuard handshakes also
 #   suppress destructive GRE/WireGuard restarts when ICMP probes are lost under load.
 
-APP_VERSION="10.0.0"
+APP_VERSION="10.0.1"
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -4995,14 +4995,17 @@ aggregate_member_is_healthy() {
 }
 
 aggregate_ensure_path() {
-  local path_if="$1" src="$2" peer="$3" key="$4" mtu="$5" shown
+  local path_if="$1" src="$2" peer="$3" key="$4" mtu="$5" underlay="$6" shown
   shown="$(ip tunnel show "$path_if" 2>/dev/null || true)"
-  if [ -n "$shown" ] && { [[ "$shown" != *"remote $peer"* ]] || [[ "$shown" != *"local $src"* ]]; }; then
+  # Pin every isolated GRE path to its selected member transport. Without this,
+  # nested GRE can recurse through the wrong route (or the physical uplink).
+  if [ -n "$shown" ] && { [[ "$shown" != *"remote $peer"* ]] || [[ "$shown" != *"local $src"* ]] || [[ "$shown" != *"dev $underlay"* ]]; }; then
     ip link del "$path_if" 2>/dev/null || true
     shown=""
   fi
   if [ -z "$shown" ]; then
-    ip tunnel add "$path_if" mode gre local "$src" remote "$peer" key "$key" || return 1
+    ip tunnel add "$path_if" mode gre local "$src" remote "$peer" key "$key" dev "$underlay" nopmtudisc || \
+      ip tunnel add "$path_if" mode gre local "$src" remote "$peer" key "$key" dev "$underlay" || return 1
   fi
   ip link set dev "$path_if" mtu "$mtu" up || return 1
   [ -e "/proc/sys/net/ipv4/conf/$path_if/rp_filter" ] && echo 0 > "/proc/sys/net/ipv4/conf/$path_if/rp_filter" 2>/dev/null || true
@@ -5083,7 +5086,7 @@ aggregate_apply_profile_unlocked() {
   for i in "${!healthy_types[@]}"; do
     type="${healthy_types[$i]}"; tid="${healthy_ids[$i]}"; ifc="${healthy_ifcs[$i]}"
     src="${healthy_srcs[$i]}"; peer="${healthy_peers[$i]}"; path_if="${healthy_paths[$i]}"; key="${healthy_keys[$i]}"
-    aggregate_ensure_path "$path_if" "$src" "$peer" "$key" "$min_mtu" || continue
+    aggregate_ensure_path "$path_if" "$src" "$peer" "$key" "$min_mtu" "$ifc" || continue
     route_args+=(nexthop dev "$path_if" weight 1)
     keep_paths+="${keep_paths:+ }$path_if"
     expected_paths+="${expected_paths:+ }$path_if"
