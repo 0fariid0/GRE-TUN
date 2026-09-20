@@ -82,7 +82,7 @@ VIRATCP_SERVICE_TEMPLATE="/etc/systemd/system/viratcp-tunnel@.service"
 
 HAPROXY_CONFIG="/etc/haproxy/haproxy.cfg"
 HAPROXY_BACKUP_DIR="/etc/haproxy/gretun-backups"
-HAPROXY_MAXCONN=750000
+HAPROXY_MAXCONN=500000
 HAPROXY_NOFILE_LIMIT=2097152
 PERFORMANCE_SYSCTL_FILE="/etc/sysctl.d/99-gretun-performance.conf"
 HAPROXY_UDP_SERVICE_NAME="gretun-haproxy-udp.service"
