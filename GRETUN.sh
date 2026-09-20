@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + WireGuard + WSS + HAProxy tunnel manager v11.0.1
+# GRE + WireGuard + WSS + HAProxy tunnel manager v11.0.2
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
@@ -29,8 +29,9 @@ set -euo pipefail
 #   as the preferred fast path, prevents health/reset races, and adds safe capacity/performance tuning.
 # - v11.0.1 makes the WSS WireGuard UDP port deterministic (51800 + tunnel number)
 #   on both peers, removes the redundant Iran-side remote UDP-port question, and fails clearly on conflicts.
+# - v11.0.2 restores GitHub process-substitution installs by fetching the canonical GRETUN.sh filename.
 
-APP_VERSION="11.0.1"
+APP_VERSION="11.0.2"
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -50,7 +51,7 @@ DIAG_DETAIL_LOG="$DIAG_LOG_DIR/diagnostics.log"
 DIAG_SERVICE_LOG="$DIAG_LOG_DIR/services.log"
 DIAG_EVENT_MAX_BYTES=5242880
 DIAG_DETAIL_MAX_BYTES=20971520
-SELF_RAW_URL="https://raw.githubusercontent.com/0fariid0/GRE-TUN/refs/heads/main/GRETUN-v11.0.1.sh"
+SELF_RAW_URL="https://raw.githubusercontent.com/0fariid0/GRE-TUN/refs/heads/main/GRETUN.sh"
 
 WG_META_DIR="/etc/wgtun-tunnels"
 WG_KEY_DIR="$WG_META_DIR/keys"
@@ -3037,7 +3038,7 @@ wss_setup_for_wireguard() {
     err_msg "Could not install the persistent manager at $INSTALL_BIN."
     echo "Run this version from a regular local file, not bash <(curl ...), unless this exact filename exists at:"
     echo "  $SELF_RAW_URL"
-    echo "Example: chmod +x ./GRETUN-v11.0.1.sh && sudo ./GRETUN-v11.0.1.sh"
+    echo "Example: curl -fL '$SELF_RAW_URL' -o /root/GRETUN.sh && chmod +x /root/GRETUN.sh && /root/GRETUN.sh"
     return 1
   fi
   systemctl enable "$(wss_service_name "$id")" >/dev/null 2>&1 || true
