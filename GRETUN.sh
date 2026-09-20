@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + WireGuard + WSS + HAProxy tunnel manager v11.0.0
+# GRE + WireGuard + WSS + HAProxy tunnel manager v11.0.1
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
@@ -27,8 +27,10 @@ set -euo pipefail
 # - v11.0.0 removes Vira7/ViraTCP and ECMP aggregation from the manager.
 #   It adds verified WSTunnel 11.0.0 as an HTTPS/WebSocket transport for WireGuard, keeps GRE->WireGuard
 #   as the preferred fast path, prevents health/reset races, and adds safe capacity/performance tuning.
+# - v11.0.1 makes the WSS WireGuard UDP port deterministic (51800 + tunnel number)
+#   on both peers, removes the redundant Iran-side remote UDP-port question, and fails clearly on conflicts.
 
-APP_VERSION="11.0.0"
+APP_VERSION="11.0.1"
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -48,7 +50,7 @@ DIAG_DETAIL_LOG="$DIAG_LOG_DIR/diagnostics.log"
 DIAG_SERVICE_LOG="$DIAG_LOG_DIR/services.log"
 DIAG_EVENT_MAX_BYTES=5242880
 DIAG_DETAIL_MAX_BYTES=20971520
-SELF_RAW_URL="https://raw.githubusercontent.com/0fariid0/GRE-TUN/refs/heads/main/GRETUN-v11.sh"
+SELF_RAW_URL="https://raw.githubusercontent.com/0fariid0/GRE-TUN/refs/heads/main/GRETUN-v11.0.1.sh"
 
 WG_META_DIR="/etc/wgtun-tunnels"
 WG_KEY_DIR="$WG_META_DIR/keys"
@@ -2197,10 +2199,20 @@ wg_menu_config_tunnel() {
   # This prevents stale WireGuard sockets from causing "Address already in use".
   wg_safe_cleanup_runtime "$TUNNEL_ID" >/dev/null 2>&1 || true
 
-  # Fewer questions: port and AllowedIPs are generated automatically.
-  # Default is UDP 51800+N; if that port is already used by another tunnel/process,
-  # the next free UDP port is selected automatically.
-  LOCAL_WG_PORT="$(auto_select_udp_port "$(wg_default_port "$TUNNEL_ID")" "$existing_wg_port" "wireguard" "$TUNNEL_ID")" || return
+  # WSS must derive the same remote WireGuard port independently on both peers.
+  # Therefore it uses the fixed formula 51800+N and fails instead of silently
+  # selecting a different port. Direct/GRE mode can still select the next free port.
+  if [ "$force_transport" = "wss" ]; then
+    LOCAL_WG_PORT="$(wg_default_port "$TUNNEL_ID")"
+    if udp_port_is_listening "$LOCAL_WG_PORT"; then
+      err_msg "Required WSS WireGuard UDP port $LOCAL_WG_PORT is already in use."
+      echo "Stop the process using it or choose another tunnel number. Check: ss -lunp | grep ':$LOCAL_WG_PORT'"
+      return 1
+    fi
+    info_msg "WSS WireGuard UDP port is fixed from tunnel number: $LOCAL_WG_PORT"
+  else
+    LOCAL_WG_PORT="$(auto_select_udp_port "$(wg_default_port "$TUNNEL_ID")" "$existing_wg_port" "wireguard" "$TUNNEL_ID")" || return
+  fi
   REMOTE_WG_PORT="$LOCAL_WG_PORT"
   EXTRA_ALLOWED_IPS=""
 
@@ -2956,7 +2968,7 @@ wss_save_config() {
 }
 
 wss_setup_for_wireguard() {
-  local id="$1" role="$2" old_secret="" old_port="" input remote_wg_port
+  local id="$1" role="$2" old_secret="" old_port="" input
   wss_install_binary || return 1
   systemctl disable --now "$(wss_service_name "$id")" >/dev/null 2>&1 || true
   if wss_load_config "$id"; then
@@ -3011,11 +3023,8 @@ wss_setup_for_wireguard() {
     WSS_REMOTE_IP="$REMOTE_PUBLIC_IP"
     WSS_REMOTE_PORT="$input"
     WSS_LOCAL_UDP_PORT="$(auto_select_udp_port "$(wss_default_local_udp_port "$id")" "" "wss" "$id")" || return 1
-    read -rp "Remote Kharej WireGuard UDP port [$LOCAL_WG_PORT] (00=menu): " remote_wg_port
-    is_main_menu_token "$remote_wg_port" && return 99
-    remote_wg_port="${remote_wg_port:-$LOCAL_WG_PORT}"
-    validate_port "$remote_wg_port" || { err_msg "Invalid remote WireGuard UDP port."; return 1; }
-    WSS_TARGET_UDP_PORT="$remote_wg_port"
+    WSS_TARGET_UDP_PORT="$(wg_default_port "$id")"
+    info_msg "Remote Kharej WireGuard UDP port derived automatically: $WSS_TARGET_UDP_PORT"
     WG_ENDPOINT_MODE="wss-client"
     WG_ENDPOINT_IP="127.0.0.1"
     WG_TRANSPORT_IFACE=""
@@ -3024,7 +3033,13 @@ wss_setup_for_wireguard() {
 
   wss_save_config "$id"
   wss_write_service_template
-  install_manager_binary >/dev/null 2>&1 || return 1
+  if ! install_manager_binary; then
+    err_msg "Could not install the persistent manager at $INSTALL_BIN."
+    echo "Run this version from a regular local file, not bash <(curl ...), unless this exact filename exists at:"
+    echo "  $SELF_RAW_URL"
+    echo "Example: chmod +x ./GRETUN-v11.0.1.sh && sudo ./GRETUN-v11.0.1.sh"
+    return 1
+  fi
   systemctl enable "$(wss_service_name "$id")" >/dev/null 2>&1 || true
   if ! systemctl restart "$(wss_service_name "$id")"; then
     err_msg "WSS transport failed to start. Check: journalctl -u $(wss_service_name "$id") -n 80 --no-pager"
