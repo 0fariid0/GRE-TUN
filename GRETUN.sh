@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + WireGuard + WSS + HAProxy tunnel manager v11.0.2
+# GRE + GRE Plus + WireGuard + HAProxy tunnel manager v12.0.0
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
@@ -30,8 +30,11 @@ set -euo pipefail
 # - v11.0.1 makes the WSS WireGuard UDP port deterministic (51800 + tunnel number)
 #   on both peers, removes the redundant Iran-side remote UDP-port question, and fails clearly on conflicts.
 # - v11.0.2 restores GitHub process-substitution installs by fetching the canonical GRETUN.sh filename.
+# - v12.0.0 removes WSS and adds fully independent GRE Plus tunnels with greplusN interfaces,
+#   10.30.N.x addressing, separate configs/services/keys, adaptive MTU, fq scheduling,
+#   strict peer firewall rules, larger queues, and higher HAProxy/kernel capacity ceilings.
 
-APP_VERSION="11.0.2"
+APP_VERSION="12.0.0"
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -58,18 +61,17 @@ WG_KEY_DIR="$WG_META_DIR/keys"
 WG_CONFIG_DIR="/etc/wireguard"
 WG_IFACE_PREFIX="wgtun"
 
-# WSS transport for WireGuard. WSTunnel carries the WireGuard UDP socket over
-# WebSocket/HTTPS; the inner WireGuard interface then carries TCP, UDP, HTTP,
-# WebSocket, and any other IPv4 traffic without application-specific handling.
+# Legacy WSS paths are retained only for upgrade cleanup; v12 cannot create WSS.
 WSS_CONFIG_DIR="/etc/gretun-wss"
 WSS_BINARY="/usr/local/bin/wstunnel"
 WSS_SERVICE_TEMPLATE="/etc/systemd/system/gretun-wss@.service"
-WSS_VERSION="11.0.0"
-WSS_AMD64_SHA256="9708a99717b5a951453c2ff7c14c25d3418d02ca7fcb96fdb382a8f2083bab5e"
-WSS_ARM64_SHA256="b86abf73e340ed0c3ff9a77a5458aa27213784920ec65513132b36def45edc94"
-WSS_DEFAULT_MTU=1280
-WSS_DEFAULT_TCP_PORT=443
-WSS_LOCAL_UDP_BASE=45000
+
+GREPLUS_CONFIG_DIR="/etc/greplus-tunnels"
+GREPLUS_SERVICE_TEMPLATE="/etc/systemd/system/greplus-tunnel@.service"
+GREPLUS_IFACE_PREFIX="greplus"
+GREPLUS_KEY_BASE=100000
+GREPLUS_FALLBACK_MTU=1440
+GREPLUS_DEFAULT_TXQUEUELEN=10000
 
 VIRA7_CONFIG_DIR="/etc/vira7-tunnels"
 VIRA7_BINARY="/usr/local/bin/vira7-engine"
@@ -80,8 +82,8 @@ VIRATCP_SERVICE_TEMPLATE="/etc/systemd/system/viratcp-tunnel@.service"
 
 HAPROXY_CONFIG="/etc/haproxy/haproxy.cfg"
 HAPROXY_BACKUP_DIR="/etc/haproxy/gretun-backups"
-HAPROXY_MAXCONN=500000
-HAPROXY_NOFILE_LIMIT=1048576
+HAPROXY_MAXCONN=750000
+HAPROXY_NOFILE_LIMIT=2097152
 PERFORMANCE_SYSCTL_FILE="/etc/sysctl.d/99-gretun-performance.conf"
 HAPROXY_UDP_SERVICE_NAME="gretun-haproxy-udp.service"
 HAPROXY_UDP_SERVICE_UNIT="/etc/systemd/system/${HAPROXY_UDP_SERVICE_NAME}"
@@ -437,14 +439,14 @@ ask_tunnel_type() {
   echo "Select tunnel type:"
   echo "1) Normal GRE tunnel"
   echo "2) WireGuard tunnel (direct UDP or automatically over same-number GRE)"
-  echo "3) WireGuard over WebSocket/HTTPS (WSS; carries TCP/UDP/HTTP)"
+  echo "3) GRE Plus (separate high-capacity GRE, no encryption)"
   echo
   read -rp "Choose [1-3] (00=menu): " TUNNEL_TYPE_CHOICE
   if is_main_menu_token "$TUNNEL_TYPE_CHOICE"; then return_main_msg; return 99; fi
   case "$TUNNEL_TYPE_CHOICE" in
     1) SELECTED_TUNNEL_TYPE="gre" ;;
     2) SELECTED_TUNNEL_TYPE="wireguard" ;;
-    3) SELECTED_TUNNEL_TYPE="wsswireguard" ;;
+    3) SELECTED_TUNNEL_TYPE="greplus" ;;
     *) echo "Invalid tunnel type"; return 1 ;;
   esac
 }
@@ -915,7 +917,7 @@ install_health_monitor() {
 
   cat > "$HEALTH_SERVICE_UNIT" <<EOF_HEALTH_SERVICE
 [Unit]
-Description=GRE/WireGuard/WSS dependency-aware health check
+Description=GRE/GRE Plus/WireGuard dependency-aware health check
 After=network-online.target
 Wants=network-online.target
 
@@ -928,7 +930,7 @@ EOF_HEALTH_SERVICE
 
   cat > "$HEALTH_TIMER_UNIT" <<'EOF_HEALTH_TIMER'
 [Unit]
-Description=Run GRE/WireGuard/WSS health check periodically
+Description=Run GRE/GRE Plus/WireGuard health check periodically
 
 [Timer]
 OnBootSec=25s
@@ -1050,19 +1052,20 @@ tunnel_health_check_all() {
     fi
   done <<< "$ids"
 
-  # WSS transport is checked before WireGuard so the UDP-over-HTTPS relay is
-  # restored first. It has no network interface of its own.
-  ids="$(wss_collect_ids || true)"
+  # GRE Plus is independent of normal GRE and has its own interface/service.
+  ids="$(greplus_collect_ids || true)"
   while IFS= read -r id; do
     [ -n "$id" ] || continue
-    svc="$(wss_service_name "$id")"
-    systemctl is-enabled --quiet "$svc" 2>/dev/null || continue
-    if ! systemctl is-active --quiet "$svc" 2>/dev/null; then
-      restart_service_with_diagnostics "wss" "$id" "" "$svc" "" "WSS transport service inactive" || true
+    svc="$(greplus_service_name "$id")"
+    if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
+      ifc="$(greplus_iface "$id")"
+      if ! systemctl is-active --quiet "$svc" 2>/dev/null || ! tunnel_iface_is_up "$ifc"; then
+        restart_service_with_diagnostics "greplus" "$id" "$ifc" "$svc" "" "service inactive or interface missing during periodic health check" || true
+      fi
     fi
   done <<< "$ids"
 
-  # WireGuard is checked last so GRE/WSS transport is repaired first.
+  # WireGuard is checked last so its optional normal-GRE transport is repaired first.
   ids="$(wg_collect_ids || true)"
   while IFS= read -r id; do
     [ -n "$id" ] || continue
@@ -1076,9 +1079,6 @@ tunnel_health_check_all() {
     case "${WG_ENDPOINT_MODE:-public}" in
       gre)
         if ! tunnel_iface_is_up "${WG_TRANSPORT_IFACE:-}"; then transport_ok=0; fi
-        ;;
-      wss-client|wss-server)
-        if ! systemctl is-active --quiet "$(wss_service_name "$id")" 2>/dev/null; then transport_ok=0; fi
         ;;
     esac
     if [ "$transport_ok" -ne 1 ]; then
@@ -1118,7 +1118,7 @@ bootstrap_runtime_repairs() {
     migrate=1
   fi
   gre_write_service_template
-  [ -d "$WSS_CONFIG_DIR" ] && wss_write_service_template >/dev/null 2>&1 || true
+  [ -d "$GREPLUS_CONFIG_DIR" ] && greplus_write_service_template >/dev/null 2>&1 || true
   install_health_monitor
   apply_tunnel_sysctls
   systemctl daemon-reload >/dev/null 2>&1 || true
@@ -1348,6 +1348,21 @@ gre_list_tunnels() {
     else
       echo "  - tunnel $id | iface $ifc | inactive | remote public: $remote | config: $file | service: $service_state"
     fi
+  done <<< "$ids"
+  # v12 no longer runs WSS. Stop legacy instances; menu 8 can delete their files.
+  ids="$(wss_collect_ids || true)"
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    systemctl disable --now "$(wss_service_name "$id")" >/dev/null 2>&1 || true
+  done <<< "$ids"
+
+  # Convert old WireGuard-over-WSS metadata to v12 direct UDP or same-number
+  # normal GRE. This prevents an enabled wg-quick service from pointing at a
+  # stopped localhost WSS relay after the upgrade.
+  ids="$(wg_collect_ids || true)"
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    wg_migrate_legacy_wss_meta "$id" >/dev/null 2>&1 || true
   done <<< "$ids"
 }
 
@@ -1664,6 +1679,268 @@ gre_service_start() {
 }
 
 # -----------------------------
+# GRE Plus helpers (independent high-capacity GRE)
+# -----------------------------
+greplus_iface() { echo "${GREPLUS_IFACE_PREFIX}$1"; }
+greplus_config_file() { echo "$GREPLUS_CONFIG_DIR/tunnel-$1.conf"; }
+greplus_service_name() { echo "greplus-tunnel@$1.service"; }
+greplus_key() { echo $((GREPLUS_KEY_BASE + $1)); }
+
+greplus_inner_ip_for_role() {
+  local id="$1" role="$2"
+  [ "$role" = "1" ] && echo "10.30.$id.1" || echo "10.30.$id.2"
+}
+
+greplus_remote_inner_ip_for_role() {
+  local id="$1" role="$2"
+  [ "$role" = "1" ] && echo "10.30.$id.2" || echo "10.30.$id.1"
+}
+
+greplus_collect_ids() {
+  local f id
+  [ -d "$GREPLUS_CONFIG_DIR" ] || return 0
+  for f in "$GREPLUS_CONFIG_DIR"/tunnel-*.conf; do
+    [ -e "$f" ] || continue
+    id="${f##*/tunnel-}"; id="${id%.conf}"
+    validate_tunnel_id "$id" && echo "$id"
+  done | sort -n -u
+}
+
+greplus_detect_mtu() {
+  local remote_ip="$1" route parent_dev parent_mtu max_inner candidate
+  route="$(ip -4 route get "$remote_ip" 2>/dev/null | head -n1 || true)"
+  parent_dev="$(awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}' <<< "$route")"
+  parent_mtu="$(ip -o link show dev "$parent_dev" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="mtu") {print $(i+1); exit}}')"
+  [[ "$parent_mtu" =~ ^[0-9]+$ ]] || parent_mtu=1500
+  max_inner=$((parent_mtu - 28))
+  [ "$max_inner" -gt 1472 ] && max_inner=1472
+  [ "$max_inner" -lt 1280 ] && max_inner=1280
+
+  if command -v ping >/dev/null 2>&1; then
+    for candidate in "$max_inner" "$GREPLUS_FALLBACK_MTU" 1400; do
+      [ "$candidate" -le "$max_inner" ] || continue
+      if ping -4 -n -M do -c 1 -W 1 -s "$candidate" "$remote_ip" >/dev/null 2>&1; then
+        echo "$candidate"
+        return 0
+      fi
+    done
+  fi
+  [ "$max_inner" -lt "$GREPLUS_FALLBACK_MTU" ] && echo "$max_inner" || echo "$GREPLUS_FALLBACK_MTU"
+}
+
+greplus_save_config() {
+  local file
+  mkdir -p "$GREPLUS_CONFIG_DIR"
+  file="$(greplus_config_file "$TUNNEL_ID")"
+  {
+    write_var TUNNEL_TYPE "greplus"
+    write_var TUNNEL_ID "$TUNNEL_ID"
+    write_var ROLE "$ROLE"
+    write_var LOCAL_PUBLIC_IP "$LOCAL_PUBLIC_IP"
+    write_var REMOTE_PUBLIC_IP "$REMOTE_PUBLIC_IP"
+    write_var LOCAL_GREPLUS_IP "$LOCAL_GREPLUS_IP"
+    write_var REMOTE_GREPLUS_IP "$REMOTE_GREPLUS_IP"
+    write_var GREPLUS_MTU "$GREPLUS_MTU"
+    write_var GREPLUS_TUN_KEY "$GREPLUS_TUN_KEY"
+    write_var GREPLUS_TXQUEUELEN "$GREPLUS_TXQUEUELEN"
+  } > "$file"
+  chmod 600 "$file"
+  echo "Saved GRE Plus tunnel $TUNNEL_ID configuration to $file"
+}
+
+greplus_load_config() {
+  local id="$1" file
+  validate_tunnel_id "$id" || return 1
+  file="$(greplus_config_file "$id")"
+  [ -f "$file" ] || return 1
+  unset TUNNEL_TYPE TUNNEL_ID ROLE LOCAL_PUBLIC_IP REMOTE_PUBLIC_IP LOCAL_GREPLUS_IP REMOTE_GREPLUS_IP GREPLUS_MTU GREPLUS_TUN_KEY GREPLUS_TXQUEUELEN
+  # shellcheck disable=SC1090
+  source "$file"
+  [ "${TUNNEL_TYPE:-}" = "greplus" ] || return 1
+  TUNNEL_ID="$id"
+  GREPLUS_TUN_KEY="$(greplus_key "$id")"
+  GREPLUS_MTU="${GREPLUS_MTU:-$GREPLUS_FALLBACK_MTU}"
+  GREPLUS_TXQUEUELEN="${GREPLUS_TXQUEUELEN:-$GREPLUS_DEFAULT_TXQUEUELEN}"
+}
+
+greplus_apply_firewall() {
+  local id="$1" ifc
+  greplus_load_config "$id" || return 1
+  ifc="$(greplus_iface "$id")"
+  enable_ip_forward
+  if command -v iptables >/dev/null 2>&1; then
+    iptables -C INPUT -p gre -s "$REMOTE_PUBLIC_IP" -d "$LOCAL_PUBLIC_IP" -j ACCEPT 2>/dev/null || iptables -A INPUT -p gre -s "$REMOTE_PUBLIC_IP" -d "$LOCAL_PUBLIC_IP" -j ACCEPT
+    iptables -C OUTPUT -p gre -s "$LOCAL_PUBLIC_IP" -d "$REMOTE_PUBLIC_IP" -j ACCEPT 2>/dev/null || iptables -A OUTPUT -p gre -s "$LOCAL_PUBLIC_IP" -d "$REMOTE_PUBLIC_IP" -j ACCEPT
+    iptables -C INPUT -i "$ifc" -s "$REMOTE_GREPLUS_IP" -j ACCEPT 2>/dev/null || iptables -A INPUT -i "$ifc" -s "$REMOTE_GREPLUS_IP" -j ACCEPT
+    iptables -C OUTPUT -o "$ifc" -d "$REMOTE_GREPLUS_IP" -j ACCEPT 2>/dev/null || iptables -A OUTPUT -o "$ifc" -d "$REMOTE_GREPLUS_IP" -j ACCEPT
+    iptables -C FORWARD -i "$ifc" -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$ifc" -j ACCEPT
+    iptables -C FORWARD -o "$ifc" -j ACCEPT 2>/dev/null || iptables -A FORWARD -o "$ifc" -j ACCEPT
+  fi
+  if command -v ufw >/dev/null 2>&1; then
+    ufw allow proto gre from "$REMOTE_PUBLIC_IP" to "$LOCAL_PUBLIC_IP" >/dev/null 2>&1 || true
+    ufw allow in on "$ifc" from "$REMOTE_GREPLUS_IP" >/dev/null 2>&1 || true
+  fi
+}
+
+greplus_remove_firewall() {
+  local id="$1" ifc
+  greplus_load_config "$id" || return 0
+  ifc="$(greplus_iface "$id")"
+  if command -v iptables >/dev/null 2>&1; then
+    while iptables -C INPUT -p gre -s "$REMOTE_PUBLIC_IP" -d "$LOCAL_PUBLIC_IP" -j ACCEPT 2>/dev/null; do iptables -D INPUT -p gre -s "$REMOTE_PUBLIC_IP" -d "$LOCAL_PUBLIC_IP" -j ACCEPT || break; done
+    while iptables -C OUTPUT -p gre -s "$LOCAL_PUBLIC_IP" -d "$REMOTE_PUBLIC_IP" -j ACCEPT 2>/dev/null; do iptables -D OUTPUT -p gre -s "$LOCAL_PUBLIC_IP" -d "$REMOTE_PUBLIC_IP" -j ACCEPT || break; done
+    while iptables -C INPUT -i "$ifc" -s "$REMOTE_GREPLUS_IP" -j ACCEPT 2>/dev/null; do iptables -D INPUT -i "$ifc" -s "$REMOTE_GREPLUS_IP" -j ACCEPT || break; done
+    while iptables -C OUTPUT -o "$ifc" -d "$REMOTE_GREPLUS_IP" -j ACCEPT 2>/dev/null; do iptables -D OUTPUT -o "$ifc" -d "$REMOTE_GREPLUS_IP" -j ACCEPT || break; done
+    while iptables -C FORWARD -i "$ifc" -j ACCEPT 2>/dev/null; do iptables -D FORWARD -i "$ifc" -j ACCEPT || break; done
+    while iptables -C FORWARD -o "$ifc" -j ACCEPT 2>/dev/null; do iptables -D FORWARD -o "$ifc" -j ACCEPT || break; done
+  fi
+  command -v ufw >/dev/null 2>&1 && ufw delete allow proto gre from "$REMOTE_PUBLIC_IP" to "$LOCAL_PUBLIC_IP" >/dev/null 2>&1 || true
+}
+
+greplus_create_tunnel() {
+  local interactive="${1:-0}" ifc
+  validate_tunnel_id "${TUNNEL_ID:-}" || { err_msg "Invalid GRE Plus tunnel number."; return 1; }
+  ifc="$(greplus_iface "$TUNNEL_ID")"
+  GREPLUS_TUN_KEY="$(greplus_key "$TUNNEL_ID")"
+  if [ "$ROLE" = "1" ]; then
+    LOCAL_GREPLUS_IP="10.30.$TUNNEL_ID.1/30"
+    REMOTE_GREPLUS_IP="10.30.$TUNNEL_ID.2"
+  else
+    LOCAL_GREPLUS_IP="10.30.$TUNNEL_ID.2/30"
+    REMOTE_GREPLUS_IP="10.30.$TUNNEL_ID.1"
+  fi
+  local_ipv4_is_assigned "$LOCAL_PUBLIC_IP" || { err_msg "Selected local IP is not assigned: $LOCAL_PUBLIC_IP"; return 1; }
+  GREPLUS_MTU="$(greplus_detect_mtu "$REMOTE_PUBLIC_IP")"
+  GREPLUS_TXQUEUELEN="${GREPLUS_TXQUEUELEN:-$GREPLUS_DEFAULT_TXQUEUELEN}"
+  apply_tunnel_sysctls
+  ensure_public_endpoint_route "$REMOTE_PUBLIC_IP" "$LOCAL_PUBLIC_IP"
+  modprobe gre >/dev/null 2>&1 || true
+  modprobe ip_gre >/dev/null 2>&1 || true
+  ip link set "$ifc" down 2>/dev/null || true
+  ip tunnel del "$ifc" 2>/dev/null || true
+
+  if ! ip tunnel add "$ifc" mode gre local "$LOCAL_PUBLIC_IP" remote "$REMOTE_PUBLIC_IP" key "$GREPLUS_TUN_KEY" ttl 64 tos inherit; then
+    err_msg "Failed to create $ifc. Check whether protocol 47/GRE is supported and the tuple is unique."
+    return 1
+  fi
+  ip addr replace "$LOCAL_GREPLUS_IP" dev "$ifc" || { ip tunnel del "$ifc" 2>/dev/null || true; return 1; }
+  ip link set "$ifc" mtu "$GREPLUS_MTU" txqueuelen "$GREPLUS_TXQUEUELEN" up || { ip tunnel del "$ifc" 2>/dev/null || true; return 1; }
+  command -v tc >/dev/null 2>&1 && tc qdisc replace dev "$ifc" root fq >/dev/null 2>&1 || true
+  greplus_save_config
+  greplus_apply_firewall "$TUNNEL_ID" || true
+  if [ "$interactive" -eq 1 ]; then greplus_install_service "$TUNNEL_ID"; fi
+  ok_msg "GRE Plus tunnel created: $ifc"
+  echo "Local/remote inner IP: $LOCAL_GREPLUS_IP -> $REMOTE_GREPLUS_IP"
+  echo "MTU / TX queue / qdisc: $GREPLUS_MTU / $GREPLUS_TXQUEUELEN / fq"
+  echo "GRE key: $GREPLUS_TUN_KEY (separate namespace; this is not encryption)"
+}
+
+greplus_write_service_template() {
+  cat > "$GREPLUS_SERVICE_TEMPLATE" <<EOF_GREPLUS_SERVICE
+[Unit]
+Description=GRE Plus Tunnel %i High-Capacity Self-Healing Service
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/bin/bash $INSTALL_BIN --service supervise-greplus %i
+Restart=always
+RestartSec=2
+TimeoutStopSec=10
+LimitNOFILE=262144
+StandardOutput=append:$DIAG_SERVICE_LOG
+StandardError=append:$DIAG_SERVICE_LOG
+
+[Install]
+WantedBy=multi-user.target
+EOF_GREPLUS_SERVICE
+}
+
+greplus_install_service() {
+  local id="$1"
+  install_manager_binary || return 1
+  diagnostic_prepare_logs || true
+  greplus_write_service_template
+  install_health_monitor
+  systemctl daemon-reload
+  systemctl enable "$(greplus_service_name "$id")" >/dev/null
+  systemctl restart "$(greplus_service_name "$id")"
+}
+
+greplus_supervisor() {
+  local id="$1" ifc target failures=0
+  validate_tunnel_id "$id" || return 1
+  trap 'exit 0' TERM INT HUP
+  while true; do
+    greplus_load_config "$id" || return 1
+    ifc="$(greplus_iface "$id")"; target="$REMOTE_GREPLUS_IP"
+    apply_tunnel_sysctls
+    ensure_public_endpoint_route "$REMOTE_PUBLIC_IP" "$LOCAL_PUBLIC_IP"
+    greplus_apply_firewall "$id" >/dev/null 2>&1 || true
+    if ! tunnel_iface_is_up "$ifc"; then
+      diagnostic_capture "greplus" "$id" "$ifc" "$(greplus_service_name "$id")" "$target" "interface missing or down"
+      greplus_create_tunnel 0 || true
+      failures=0
+    elif quick_tunnel_ping "$ifc" "$target"; then
+      failures=0
+    else
+      failures=$((failures + 1))
+      diagnostic_event "WARN" "greplus-$id" "inner ping failed ($failures/$GRE_SUPERVISOR_FAIL_LIMIT), target=$target"
+      if [ "$failures" -ge "$GRE_SUPERVISOR_FAIL_LIMIT" ]; then
+        diagnostic_capture "greplus" "$id" "$ifc" "$(greplus_service_name "$id")" "$target" "$failures consecutive failures"
+        greplus_create_tunnel 0 || true
+        failures=0
+      fi
+    fi
+    sleep "$GRE_SUPERVISOR_INTERVAL" & wait $! || true
+  done
+}
+
+greplus_menu_config_tunnel() {
+  show_header "Configure GRE Plus Tunnel"
+  prompt_role || return
+  local selected_role="$ROLE" existing_local="" existing_remote=""
+  prompt_tunnel_id "Enter GRE Plus tunnel number [1-254]: " || return
+  if greplus_load_config "$TUNNEL_ID"; then
+    existing_local="${LOCAL_PUBLIC_IP:-}"; existing_remote="${REMOTE_PUBLIC_IP:-}"
+  fi
+  ROLE="$selected_role"
+  echo "Interface: $(greplus_iface "$TUNNEL_ID")"
+  echo "Iran/Kharej IPs: 10.30.$TUNNEL_ID.1/30 <-> 10.30.$TUNNEL_ID.2/30"
+  echo "Service: $(greplus_service_name "$TUNNEL_ID")"
+  echo "No encryption; use only when lightweight kernel GRE is desired."
+  prompt_local_tunnel_ip "${existing_local:-$(detect_local_public_ip || true)}" "Enter LOCAL public IPv4 for GRE Plus" || return
+  prompt_remote_public_ip "$existing_remote" || return
+  greplus_create_tunnel 1
+}
+
+greplus_list_tunnels() {
+  echo "GRE Plus tunnels:"
+  local ids id state
+  ids="$(greplus_collect_ids || true)"; [ -n "$ids" ] || { echo "  none"; return 0; }
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    greplus_load_config "$id" || continue
+    tunnel_iface_is_up "$(greplus_iface "$id")" && state=active || state=inactive
+    echo "  - tunnel $id | $(greplus_iface "$id") | $state | MTU $GREPLUS_MTU | peer $REMOTE_PUBLIC_IP | service $(greplus_service_name "$id")"
+  done <<< "$ids"
+}
+
+greplus_remove_one_tunnel() {
+  local id="$1" ifc
+  ifc="$(greplus_iface "$id")"
+  systemctl disable --now "$(greplus_service_name "$id")" >/dev/null 2>&1 || true
+  greplus_remove_firewall "$id" || true
+  ip link set "$ifc" down 2>/dev/null || true
+  ip tunnel del "$ifc" 2>/dev/null || ip link delete "$ifc" 2>/dev/null || true
+  rm -f "$(greplus_config_file "$id")"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  ok_msg "GRE Plus tunnel $id removed."
+}
+
+# -----------------------------
 # WireGuard helpers
 # -----------------------------
 wg_iface_name() {
@@ -1702,8 +1979,7 @@ wg_default_public_endpoint_ip() {
 
 wg_auto_endpoint_ip() {
   case "${WG_ENDPOINT_MODE:-public}" in
-    gre|wss-client) printf '%s' "${WG_ENDPOINT_IP:-}" ;;
-    wss-server) printf '%s' "" ;;
+    gre) printf '%s' "${WG_ENDPOINT_IP:-}" ;;
     *) wg_default_public_endpoint_ip ;;
   esac
 }
@@ -1755,9 +2031,8 @@ wg_print_ip_plan() {
   echo "  Iran role IP    : 10.20.$id.1/30"
   echo "  Kharej role IP  : 10.20.$id.2/30"
   echo "  GRE transport   : if gre$id is up/reachable, WireGuard can use 10.10.$id.x"
-  echo "  WSS transport   : WireGuard UDP can ride inside HTTPS/WebSocket when GRE/UDP is filtered"
   echo
-  echo "GRE uses 10.10.N.x and WireGuard uses 10.20.N.x, so they do not conflict."
+  echo "Normal GRE uses 10.10.N.x, WireGuard uses 10.20.N.x, and GRE Plus uses 10.30.N.x."
 }
 
 wg_ensure_tools() {
@@ -1947,15 +2222,13 @@ wg_write_config() {
   endpoint_mode_note="${WG_ENDPOINT_MODE:-public}"
   mtu_value="${WG_MTU:-1420}"
   case "$endpoint_mode_note" in
-    gre|wss-client|wss-server) mtu_value="${WG_MTU:-1280}" ;;
+    gre) mtu_value="${WG_MTU:-1280}" ;;
   esac
-  if [ "$endpoint_mode_note" != "wss-server" ] && [ -z "$endpoint_ip" ]; then
+  if [ -z "$endpoint_ip" ]; then
     echo "WireGuard endpoint IP is empty. Cannot write config." >&2
     return 1
   fi
-  if [ "$endpoint_mode_note" != "wss-server" ]; then
-    endpoint_line="Endpoint = $endpoint_ip:$REMOTE_WG_PORT"
-  fi
+  endpoint_line="Endpoint = $endpoint_ip:$REMOTE_WG_PORT"
   if [ -n "${EXTRA_ALLOWED_IPS:-}" ]; then
     allowed_ips="$allowed_ips, $EXTRA_ALLOWED_IPS"
   fi
@@ -1978,11 +2251,7 @@ PersistentKeepalive = 25
 EOF_CONF
   chmod 600 "$conf"
   echo "WireGuard config written: $conf"
-  if [ "$endpoint_mode_note" = "wss-server" ]; then
-    echo "WireGuard endpoint mode: WSS server (peer endpoint is learned dynamically)"
-  else
-    echo "WireGuard endpoint mode: $endpoint_mode_note -> $endpoint_ip:$REMOTE_WG_PORT"
-  fi
+  echo "WireGuard endpoint mode: $endpoint_mode_note -> $endpoint_ip:$REMOTE_WG_PORT"
   echo "WireGuard MTU: $mtu_value"
 }
 
@@ -2021,7 +2290,6 @@ wg_create_tunnel() {
   if [ -z "${WG_MTU:-}" ]; then
     case "$WG_ENDPOINT_MODE" in
       gre) WG_MTU="$(wg_mtu_for_gre "$TUNNEL_ID")" ;;
-      wss-client|wss-server) WG_MTU="$WSS_DEFAULT_MTU" ;;
       *) WG_MTU="1420" ;;
     esac
   fi
@@ -2046,8 +2314,6 @@ wg_create_tunnel() {
   echo "[*] WireGuard MTU: ${WG_MTU:-1420}"
   if [ "${WG_ENDPOINT_MODE:-public}" = "gre" ]; then
     echo "[*] WireGuard transport: inside GRE interface ${WG_TRANSPORT_IFACE:-gre$TUNNEL_ID}"
-  elif [[ "${WG_ENDPOINT_MODE:-public}" == wss-* ]]; then
-    echo "[*] WireGuard transport: HTTPS/WebSocket service $(wss_service_name "$TUNNEL_ID")"
   fi
   echo
   echo "Your LOCAL WireGuard public key for tunnel $TUNNEL_ID:"
@@ -2145,6 +2411,34 @@ wg_choose_auto_endpoint() {
   fi
 }
 
+wg_migrate_legacy_wss_meta() {
+  local id="$1" old_mode
+  wg_load_meta "$id" || return 0
+  old_mode="${WG_ENDPOINT_MODE:-public}"
+  [[ "$old_mode" == wss-* ]] || return 0
+
+  LOCAL_WG_PORT="$(wg_default_port "$id")"
+  REMOTE_WG_PORT="$LOCAL_WG_PORT"
+  WG_ENDPOINT_MODE="public"
+  WG_ENDPOINT_IP="${REMOTE_PUBLIC_IP:-}"
+  WG_TRANSPORT_IFACE=""
+  WG_MTU="1420"
+  wg_choose_auto_endpoint "$id" "${ROLE:-1}" || true
+  if [ "$WG_ENDPOINT_MODE" = "gre" ]; then
+    WG_MTU="$(wg_mtu_for_gre "$id")"
+  fi
+
+  if [ -n "${REMOTE_WG_PUBLIC_KEY:-}" ] && [ -s "$(wg_private_key_file "$id")" ]; then
+    wg_write_config "$id" >/dev/null 2>&1 || return 1
+  fi
+  wg_save_meta >/dev/null 2>&1 || return 1
+  wss_remove_one "$id" || true
+  diagnostic_event "MIGRATE" "wireguard-$id" "legacy $old_mode metadata converted to $WG_ENDPOINT_MODE transport"
+  if systemctl is-enabled --quiet "$(wg_service_name "$id")" 2>/dev/null && [ -n "${REMOTE_WG_PUBLIC_KEY:-}" ]; then
+    systemctl restart "$(wg_service_name "$id")" >/dev/null 2>&1 || true
+  fi
+}
+
 wg_mtu_for_gre() {
   local id="$1" parent_mtu="" calculated
   parent_mtu="$(ip -o link show dev "$(gre_iface "$id")" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="mtu") {print $(i+1); exit}}')"
@@ -2158,9 +2452,8 @@ wg_mtu_for_gre() {
 wg_menu_config_tunnel() {
   show_header "Configure WireGuard Tunnel"
   prompt_role || return
-  local selected_role existing_local_ip existing_remote_ip existing_peer_key force_transport
+  local selected_role existing_local_ip existing_remote_ip existing_peer_key
   selected_role="$ROLE"
-  force_transport="${FORCE_WG_TRANSPORT:-auto}"
   echo
   prompt_tunnel_id "Enter WireGuard tunnel number before IP [1-254]: " || return
 
@@ -2200,20 +2493,7 @@ wg_menu_config_tunnel() {
   # This prevents stale WireGuard sockets from causing "Address already in use".
   wg_safe_cleanup_runtime "$TUNNEL_ID" >/dev/null 2>&1 || true
 
-  # WSS must derive the same remote WireGuard port independently on both peers.
-  # Therefore it uses the fixed formula 51800+N and fails instead of silently
-  # selecting a different port. Direct/GRE mode can still select the next free port.
-  if [ "$force_transport" = "wss" ]; then
-    LOCAL_WG_PORT="$(wg_default_port "$TUNNEL_ID")"
-    if udp_port_is_listening "$LOCAL_WG_PORT"; then
-      err_msg "Required WSS WireGuard UDP port $LOCAL_WG_PORT is already in use."
-      echo "Stop the process using it or choose another tunnel number. Check: ss -lunp | grep ':$LOCAL_WG_PORT'"
-      return 1
-    fi
-    info_msg "WSS WireGuard UDP port is fixed from tunnel number: $LOCAL_WG_PORT"
-  else
-    LOCAL_WG_PORT="$(auto_select_udp_port "$(wg_default_port "$TUNNEL_ID")" "$existing_wg_port" "wireguard" "$TUNNEL_ID")" || return
-  fi
+  LOCAL_WG_PORT="$(auto_select_udp_port "$(wg_default_port "$TUNNEL_ID")" "$existing_wg_port" "wireguard" "$TUNNEL_ID")" || return
   REMOTE_WG_PORT="$LOCAL_WG_PORT"
   EXTRA_ALLOWED_IPS=""
 
@@ -2222,29 +2502,24 @@ wg_menu_config_tunnel() {
   WG_ENDPOINT_IP=""
   WG_TRANSPORT_IFACE=""
 
-  if [ "$force_transport" = "wss" ]; then
+  # Remove a legacy WSS companion for this number before configuring v12.
+  if [ -f "$(wss_config_file "$TUNNEL_ID")" ]; then
+    wss_remove_one "$TUNNEL_ID" || true
+  fi
+  wg_choose_auto_endpoint "$TUNNEL_ID" "$ROLE" || return
+  if [ "${WG_ENDPOINT_MODE:-public}" = "public" ]; then
     prompt_remote_public_ip "$existing_remote_ip" || return
-    wss_setup_for_wireguard "$TUNNEL_ID" "$ROLE" || return $?
+    WG_ENDPOINT_MODE="public"
+    WG_ENDPOINT_IP="$REMOTE_PUBLIC_IP"
+    WG_TRANSPORT_IFACE=""
   else
-    # Do not leave an old WSS service running after changing this tunnel back
-    # to direct/GRE mode.
-    [ -f "$(wss_config_file "$TUNNEL_ID")" ] && wss_remove_one "$TUNNEL_ID" || true
-    wg_choose_auto_endpoint "$TUNNEL_ID" "$ROLE" || return
-    if [ "${WG_ENDPOINT_MODE:-public}" = "public" ]; then
-      prompt_remote_public_ip "$existing_remote_ip" || return
-      WG_ENDPOINT_MODE="public"
-      WG_ENDPOINT_IP="$REMOTE_PUBLIC_IP"
-      WG_TRANSPORT_IFACE=""
-    else
-      echo "Same-number GRE tunnel exists."
-      echo "WireGuard will use GRE as its transport for the fast path."
-      REMOTE_PUBLIC_IP="${REMOTE_PUBLIC_IP:-$existing_remote_ip}"
-    fi
+    echo "Same-number normal GRE tunnel exists."
+    echo "WireGuard will use normal GRE as its transport. GRE Plus remains independent."
+    REMOTE_PUBLIC_IP="${REMOTE_PUBLIC_IP:-$existing_remote_ip}"
   fi
 
   case "${WG_ENDPOINT_MODE:-public}" in
     gre) WG_MTU="$(wg_mtu_for_gre "$TUNNEL_ID")" ;;
-    wss-client|wss-server) WG_MTU="$WSS_DEFAULT_MTU" ;;
     *) WG_MTU="1420" ;;
   esac
 
@@ -2258,8 +2533,6 @@ wg_menu_config_tunnel() {
   echo "  MTU                    : $WG_MTU"
   if [ "${WG_ENDPOINT_MODE:-public}" = "gre" ]; then
     echo "  Transport interface    : ${WG_TRANSPORT_IFACE:-gre$TUNNEL_ID}"
-  elif [[ "${WG_ENDPOINT_MODE:-public}" == wss-* ]]; then
-    echo "  WSS service            : $(wss_service_name "$TUNNEL_ID")"
   fi
   echo "  AllowedIPs             : peer /32 only"
   if [ -n "$REMOTE_WG_PUBLIC_KEY" ]; then
@@ -2300,7 +2573,6 @@ wg_check_one_tunnel() {
     echo "Remote endpoint     : ${WG_ENDPOINT_IP:-${REMOTE_PUBLIC_IP:-unknown}}:${REMOTE_WG_PORT:-$(wg_default_port "$id")}" 
     case "${WG_ENDPOINT_MODE:-public}" in
       gre) echo "Transport interface : ${WG_TRANSPORT_IFACE:-}" ;;
-      wss-client|wss-server) echo "WSS transport      : $(wss_service_name "$id")" ;;
     esac
     echo "Local UDP port      : ${LOCAL_WG_PORT:-$(wg_default_port "$id")}" 
     echo "WireGuard MTU       : ${WG_MTU:-unknown}" 
@@ -2353,8 +2625,6 @@ wg_check_one_tunnel() {
         if [ -z "$last" ] || [ "$last" = "0" ]; then
           if [ "${WG_ENDPOINT_MODE:-public}" = "gre" ]; then
             echo "Diagnosis: no WireGuard handshake yet. WireGuard is using ${WG_ENDPOINT_MODE} transport. Check that transport tunnel $id still pings, the peer public key is correct, and UDP $(wg_default_port "$id") is allowed over ${WG_TRANSPORT_IFACE:-transport interface} on both servers."
-          elif [[ "${WG_ENDPOINT_MODE:-public}" == wss-* ]]; then
-            echo "Diagnosis: no WireGuard handshake yet. Check $(wss_service_name "$id"), the WSS path secret/TCP port on both servers, and the remote public IP."
           else
             echo "Diagnosis: no WireGuard handshake yet. Check the peer public key, remote public IP, UDP port $(wg_default_port "$id"), and firewall/NAT on both servers. If public UDP/WireGuard is blocked but GRE works, re-run create/update after GRE is up; v6 will auto-use GRE as WireGuard transport."
           fi
@@ -2487,7 +2757,6 @@ wg_install_service() {
   if wg_load_meta "$id"; then
     case "${WG_ENDPOINT_MODE:-public}" in
       gre) transport_after="gre-tunnel@$id.service" ;;
-      wss-client|wss-server) transport_after="$(wss_service_name "$id")" ;;
     esac
   fi
   if [ -n "$transport_after" ]; then
@@ -2623,9 +2892,7 @@ wg_apply_firewall_rules() {
     transport_ifc="${WG_TRANSPORT_IFACE:-}"
   fi
 
-  if [[ "$endpoint_mode" != wss-* ]]; then
-    firewall_allow_udp_port_and_ip "WireGuard tunnel $id" "$port" "$endpoint_ip" "${remote_port:-$port}" "$ifc"
-  fi
+  firewall_allow_udp_port_and_ip "WireGuard tunnel $id" "$port" "$endpoint_ip" "${remote_port:-$port}" "$ifc"
   if wg_load_meta "$id"; then
     firewall_allow_ip_peer "WireGuard tunnel $id remote inner" "${REMOTE_WG_IP:-}" "$ifc"
     firewall_allow_ip_peer "WireGuard tunnel $id remote public" "${REMOTE_PUBLIC_IP:-}" "$ifc"
@@ -2638,9 +2905,7 @@ wg_apply_firewall_rules() {
   done
 
   if command -v iptables >/dev/null 2>&1; then
-    if [[ "$endpoint_mode" != wss-* ]]; then
-      iptables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || iptables -A INPUT -p udp --dport "$port" -j ACCEPT || true
-    fi
+    iptables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || iptables -A INPUT -p udp --dport "$port" -j ACCEPT || true
     iptables -C INPUT -i "$ifc" -j ACCEPT 2>/dev/null || iptables -A INPUT -i "$ifc" -j ACCEPT || true
     iptables -C OUTPUT -o "$ifc" -j ACCEPT 2>/dev/null || iptables -A OUTPUT -o "$ifc" -j ACCEPT || true
     if [ -n "$endpoint_ip" ] && [ -n "$remote_port" ]; then
@@ -2655,9 +2920,7 @@ wg_apply_firewall_rules() {
   fi
 
   if command -v ufw >/dev/null 2>&1; then
-    if [[ "$endpoint_mode" != wss-* ]]; then
-      ufw allow "$port/udp" comment "wgtun$id" >/dev/null 2>&1 || true
-    fi
+    ufw allow "$port/udp" comment "wgtun$id" >/dev/null 2>&1 || true
     ufw allow in on "$ifc" >/dev/null 2>&1 || true
     if [ "$endpoint_mode" = "gre" ] && [ -n "$transport_ifc" ]; then
       ufw allow in on "$transport_ifc" to any port "$port" proto udp >/dev/null 2>&1 || true
@@ -2665,9 +2928,7 @@ wg_apply_firewall_rules() {
   fi
 
   if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-    if [[ "$endpoint_mode" != wss-* ]]; then
-      firewall-cmd --permanent --add-port="$port/udp" >/dev/null 2>&1 || true
-    fi
+    firewall-cmd --permanent --add-port="$port/udp" >/dev/null 2>&1 || true
     firewall-cmd --permanent --add-interface="$ifc" >/dev/null 2>&1 || true
     if [ "$endpoint_mode" = "gre" ] && [ -n "$transport_ifc" ]; then
       firewall-cmd --permanent --add-interface="$transport_ifc" >/dev/null 2>&1 || true
@@ -2747,7 +3008,7 @@ wg_remove_one_tunnel() {
   # Safe cleanup only for this WireGuard tunnel. Do not touch the main route table.
   wg_safe_cleanup_runtime "$id" >/dev/null 2>&1 || true
   wg_remove_firewall_rules "$id"
-  if [[ "$endpoint_mode" == wss-* ]] || [ -f "$(wss_config_file "$id")" ]; then
+  if [ -f "$(wss_config_file "$id")" ]; then
     wss_remove_one "$id"
   fi
 
@@ -2791,11 +3052,11 @@ wg_remove_menu() {
 }
 
 # -----------------------------
-# WSTunnel HTTPS/WebSocket transport for WireGuard
+# -----------------------------
+# Legacy WSS cleanup helpers (creation/runtime removed in v12)
 # -----------------------------
 wss_config_file() { echo "$WSS_CONFIG_DIR/tunnel-$1.conf"; }
 wss_service_name() { echo "gretun-wss@$1.service"; }
-wss_default_local_udp_port() { echo $((WSS_LOCAL_UDP_BASE + $1)); }
 
 wss_collect_ids() {
   local f id
@@ -2807,268 +3068,21 @@ wss_collect_ids() {
   done | sort -n -u
 }
 
-wss_load_config() {
-  local id="$1" file
+wss_remove_one() {
+  local id="$1" file port=""
   validate_tunnel_id "$id" || return 1
   file="$(wss_config_file "$id")"
-  [ -f "$file" ] || return 1
-  unset WSS_MODE WSS_BIND_PORT WSS_REMOTE_IP WSS_REMOTE_PORT WSS_LOCAL_UDP_PORT WSS_TARGET_UDP_PORT WSS_PATH_SECRET
-  # shellcheck disable=SC1090
-  source "$file"
-  [ "${WSS_TUNNEL_ID:-}" = "$id" ] || return 1
-  case "${WSS_MODE:-}" in server|client) ;; *) return 1 ;; esac
-  validate_port "${WSS_BIND_PORT:-${WSS_REMOTE_PORT:-}}" || return 1
-  validate_port "${WSS_TARGET_UDP_PORT:-}" || return 1
-  if [ "$WSS_MODE" = "client" ]; then
-    validate_ipv4 "${WSS_REMOTE_IP:-}" || return 1
-    validate_port "${WSS_LOCAL_UDP_PORT:-}" || return 1
+  if [ -f "$file" ]; then
+    port="$(sed -n "s/^WSS_BIND_PORT=['\"]\{0,1\}\([0-9][0-9]*\)['\"]\{0,1\}$/\1/p" "$file" | head -n1)"
   fi
-  wss_validate_secret "${WSS_PATH_SECRET:-}"
-}
-
-wss_random_secret() {
-  if command -v openssl >/dev/null 2>&1; then
-    openssl rand -hex 18
-  else
-    tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 36
-    echo
-  fi
-}
-
-wss_validate_secret() {
-  [[ "${1:-}" =~ ^[A-Za-z0-9_-]{12,80}$ ]]
-}
-
-wss_install_binary() {
-  local current="" arch asset checksum url tmpdir archive found
-  if [ -x "$WSS_BINARY" ]; then
-    current="$($WSS_BINARY --version 2>/dev/null | head -n1 || true)"
-    [[ "$current" == *"$WSS_VERSION"* ]] && return 0
-  fi
-
-  ensure_feature_dependencies "wstunnel" curl:curl tar:tar sha256sum:coreutils || return 1
-  case "$(uname -m)" in
-    x86_64|amd64) arch="amd64"; checksum="$WSS_AMD64_SHA256" ;;
-    aarch64|arm64) arch="arm64"; checksum="$WSS_ARM64_SHA256" ;;
-    *) err_msg "WSTunnel is supported only on Linux amd64/arm64 by this installer."; return 1 ;;
-  esac
-
-  asset="wstunnel_${WSS_VERSION}_linux_${arch}.tar.gz"
-  url="https://github.com/erebe/wstunnel/releases/download/v${WSS_VERSION}/${asset}"
-  tmpdir="$(mktemp -d /tmp/gretun-wss.XXXXXX)" || return 1
-  archive="$tmpdir/$asset"
-  info_msg "Downloading verified WSTunnel v$WSS_VERSION for linux/$arch..."
-  if ! curl -fL --retry 3 --connect-timeout 15 "$url" -o "$archive"; then
-    rm -rf "$tmpdir"
-    err_msg "WSTunnel download failed."
-    return 1
-  fi
-  if ! printf '%s  %s\n' "$checksum" "$archive" | sha256sum -c - >/dev/null 2>&1; then
-    rm -rf "$tmpdir"
-    err_msg "WSTunnel SHA-256 verification failed; the binary was NOT installed."
-    return 1
-  fi
-  if ! tar -xzf "$archive" -C "$tmpdir"; then
-    rm -rf "$tmpdir"
-    err_msg "Could not extract WSTunnel archive."
-    return 1
-  fi
-  found="$(find "$tmpdir" -type f -name wstunnel -print -quit 2>/dev/null || true)"
-  if [ -z "$found" ]; then
-    rm -rf "$tmpdir"
-    err_msg "WSTunnel executable was not found in the verified archive."
-    return 1
-  fi
-  install -m 0755 "$found" "$WSS_BINARY"
-  rm -rf "$tmpdir"
-  ok_msg "Installed $($WSS_BINARY --version 2>/dev/null | head -n1 || echo WSTunnel)."
-}
-
-wss_write_service_template() {
-  diagnostic_prepare_logs || true
-  cat > "$WSS_SERVICE_TEMPLATE" <<EOF_WSS_SERVICE
-[Unit]
-Description=WireGuard over HTTPS/WebSocket transport %i
-After=network-online.target
-Wants=network-online.target
-StartLimitIntervalSec=0
-
-[Service]
-Type=simple
-ExecStart=/bin/bash $INSTALL_BIN --service start-wss %i
-Restart=always
-RestartSec=2
-LimitNOFILE=1048576
-StandardOutput=append:$DIAG_SERVICE_LOG
-StandardError=append:$DIAG_SERVICE_LOG
-
-[Install]
-WantedBy=multi-user.target
-EOF_WSS_SERVICE
-  systemctl daemon-reload >/dev/null 2>&1 || true
-}
-
-wss_open_server_firewall() {
-  local port="$1"
-  validate_port "$port" || return 1
-  if command -v iptables >/dev/null 2>&1; then
-    iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || iptables -A INPUT -p tcp --dport "$port" -j ACCEPT || true
-  fi
-  command -v ufw >/dev/null 2>&1 && ufw allow "$port/tcp" comment "gretun-wss" >/dev/null 2>&1 || true
-  if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-    firewall-cmd --permanent --add-port="$port/tcp" >/dev/null 2>&1 || true
-    firewall-cmd --reload >/dev/null 2>&1 || true
-  fi
-}
-
-wss_run_service() {
-  local id="$1" workers
-  wss_load_config "$id" || { echo "Invalid WSS config for tunnel $id" >&2; return 1; }
-  [ -x "$WSS_BINARY" ] || { echo "Missing WSTunnel binary: $WSS_BINARY" >&2; return 1; }
-  workers="$(nproc 2>/dev/null || echo 1)"
-  [ "$workers" -gt 8 ] && workers=8
-  [ "$workers" -ge 1 ] || workers=1
-
-  if [ "$WSS_MODE" = "server" ]; then
-    exec "$WSS_BINARY" server \
-      --restrict-to "127.0.0.1:$WSS_TARGET_UDP_PORT" \
-      --restrict-http-upgrade-path-prefix "$WSS_PATH_SECRET" \
-      --websocket-ping-frequency 15s \
-      --nb-worker-threads "$workers" \
-      --log-lvl INFO \
-      "wss://0.0.0.0:$WSS_BIND_PORT"
-  fi
-
-  ensure_public_endpoint_route "$WSS_REMOTE_IP" "$(detect_local_public_ip || true)"
-  exec "$WSS_BINARY" client \
-    -L "udp://127.0.0.1:$WSS_LOCAL_UDP_PORT:127.0.0.1:$WSS_TARGET_UDP_PORT?timeout_sec=0" \
-    -P "$WSS_PATH_SECRET" \
-    --websocket-ping-frequency 15s \
-    --connection-retry-max-backoff 10s \
-    --nb-worker-threads "$workers" \
-    --log-lvl INFO \
-    "wss://$WSS_REMOTE_IP:$WSS_REMOTE_PORT"
-}
-
-wss_save_config() {
-  local id="$1" file
-  mkdir -p "$WSS_CONFIG_DIR"
-  chmod 700 "$WSS_CONFIG_DIR" 2>/dev/null || true
-  file="$(wss_config_file "$id")"
-  {
-    write_var WSS_TUNNEL_ID "$id"
-    write_var WSS_MODE "$WSS_MODE"
-    write_var WSS_BIND_PORT "${WSS_BIND_PORT:-}"
-    write_var WSS_REMOTE_IP "${WSS_REMOTE_IP:-}"
-    write_var WSS_REMOTE_PORT "${WSS_REMOTE_PORT:-}"
-    write_var WSS_LOCAL_UDP_PORT "${WSS_LOCAL_UDP_PORT:-}"
-    write_var WSS_TARGET_UDP_PORT "$WSS_TARGET_UDP_PORT"
-    write_var WSS_PATH_SECRET "$WSS_PATH_SECRET"
-  } > "$file"
-  chmod 600 "$file"
-}
-
-wss_setup_for_wireguard() {
-  local id="$1" role="$2" old_secret="" old_port="" input
-  wss_install_binary || return 1
   systemctl disable --now "$(wss_service_name "$id")" >/dev/null 2>&1 || true
-  if wss_load_config "$id"; then
-    old_secret="${WSS_PATH_SECRET:-}"
-    old_port="${WSS_BIND_PORT:-${WSS_REMOTE_PORT:-}}"
-  fi
-
-  echo
-  echo "WSS transports WireGuard UDP inside HTTPS/WebSocket."
-  echo "Use the same TCP port and secret on both servers. Port 443 is preferred when free."
-  read -rp "WSS TCP port [${old_port:-$WSS_DEFAULT_TCP_PORT}] (00=menu): " input
-  is_main_menu_token "$input" && return 99
-  input="${input:-${old_port:-$WSS_DEFAULT_TCP_PORT}}"
-  validate_port "$input" || { err_msg "Invalid WSS TCP port."; return 1; }
-
-  if [ -n "$old_secret" ]; then
-    read -rp "WSS secret [Enter=keep, NEW=generate, or paste same secret] (00=menu): " WSS_PATH_SECRET
-    is_main_menu_token "$WSS_PATH_SECRET" && return 99
-    case "${WSS_PATH_SECRET^^}" in NEW) WSS_PATH_SECRET="$(wss_random_secret)" ;; "") WSS_PATH_SECRET="$old_secret" ;; esac
-  else
-    if [ "$role" = "2" ]; then
-      WSS_PATH_SECRET="$(wss_random_secret)"
-      echo "Generated WSS secret. Copy it exactly to the Iran server:"
-      echo "$WSS_PATH_SECRET"
-    else
-      read -rp "Paste WSS secret generated on the Kharej server (00=menu): " WSS_PATH_SECRET
-      is_main_menu_token "$WSS_PATH_SECRET" && return 99
-    fi
-  fi
-  wss_validate_secret "$WSS_PATH_SECRET" || { err_msg "WSS secret must be 12-80 characters: letters, numbers, _ or -."; return 1; }
-
-  WSS_TARGET_UDP_PORT="$LOCAL_WG_PORT"
-  WSS_BIND_PORT=""
-  WSS_REMOTE_IP=""
-  WSS_REMOTE_PORT=""
-  WSS_LOCAL_UDP_PORT=""
-  if [ "$role" = "2" ]; then
-    # Kharej receives WSS/TCP and delivers the inner UDP packets to local WireGuard.
-    WSS_MODE="server"
-    WSS_BIND_PORT="$input"
-    if ss -H -ltn "sport = :$WSS_BIND_PORT" 2>/dev/null | grep -q .; then
-      err_msg "TCP port $WSS_BIND_PORT is already in use on this server. Choose another port (for example 8443 or 2053)."
-      return 1
-    fi
-    wss_open_server_firewall "$WSS_BIND_PORT"
-    WG_ENDPOINT_MODE="wss-server"
-    WG_ENDPOINT_IP=""
-    WG_TRANSPORT_IFACE=""
-  else
-    # Iran originates WSS and points WireGuard to a local UDP relay.
-    WSS_MODE="client"
-    WSS_REMOTE_IP="$REMOTE_PUBLIC_IP"
-    WSS_REMOTE_PORT="$input"
-    WSS_LOCAL_UDP_PORT="$(auto_select_udp_port "$(wss_default_local_udp_port "$id")" "" "wss" "$id")" || return 1
-    WSS_TARGET_UDP_PORT="$(wg_default_port "$id")"
-    info_msg "Remote Kharej WireGuard UDP port derived automatically: $WSS_TARGET_UDP_PORT"
-    WG_ENDPOINT_MODE="wss-client"
-    WG_ENDPOINT_IP="127.0.0.1"
-    WG_TRANSPORT_IFACE=""
-    REMOTE_WG_PORT="$WSS_LOCAL_UDP_PORT"
-  fi
-
-  wss_save_config "$id"
-  wss_write_service_template
-  if ! install_manager_binary; then
-    err_msg "Could not install the persistent manager at $INSTALL_BIN."
-    echo "Run this version from a regular local file, not bash <(curl ...), unless this exact filename exists at:"
-    echo "  $SELF_RAW_URL"
-    echo "Example: curl -fL '$SELF_RAW_URL' -o /root/GRETUN.sh && chmod +x /root/GRETUN.sh && /root/GRETUN.sh"
-    return 1
-  fi
-  systemctl enable "$(wss_service_name "$id")" >/dev/null 2>&1 || true
-  if ! systemctl restart "$(wss_service_name "$id")"; then
-    err_msg "WSS transport failed to start. Check: journalctl -u $(wss_service_name "$id") -n 80 --no-pager"
-    return 1
-  fi
-  ok_msg "WSS transport $id started in $WSS_MODE mode."
-  echo "WSS secret: $WSS_PATH_SECRET"
-}
-
-wss_remove_one() {
-  local id="$1" port=""
-  if wss_load_config "$id"; then port="${WSS_BIND_PORT:-}"; fi
-  systemctl disable --now "$(wss_service_name "$id")" >/dev/null 2>&1 || true
-  rm -f "$(wss_config_file "$id")"
-  if [ -n "$port" ] && command -v iptables >/dev/null 2>&1; then
+  rm -f "$file"
+  if validate_port "$port" && command -v iptables >/dev/null 2>&1; then
     while iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null; do iptables -D INPUT -p tcp --dport "$port" -j ACCEPT || break; done
   fi
-  if [ -n "$port" ] && command -v ufw >/dev/null 2>&1; then
-    ufw delete allow "$port/tcp" >/dev/null 2>&1 || true
-  fi
-  if [ -n "$port" ] && command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-    firewall-cmd --permanent --remove-port="$port/tcp" >/dev/null 2>&1 || true
-    firewall-cmd --reload >/dev/null 2>&1 || true
-  fi
-  systemctl daemon-reload >/dev/null 2>&1 || true
+  validate_port "$port" && command -v ufw >/dev/null 2>&1 && ufw delete allow "$port/tcp" >/dev/null 2>&1 || true
 }
 
-# -----------------------------
 # Legacy v10 Vira cleanup helpers. v11 cannot create or start Vira tunnels.
 vira7_iface_name() { echo "vira7$1"; }
 vira7_config_file() { echo "$VIRA7_CONFIG_DIR/tunnel-$1.conf"; }
@@ -3163,6 +3177,21 @@ build_tunnel_inventory() {
     INV_TYPE+=("gre"); INV_ID+=("$id"); INV_IFACE+=("$ifc"); INV_LOCAL+=("$local_ip"); INV_TARGET+=("$target"); INV_LOCAL_PUBLIC+=("$local_pub"); INV_REMOTE_PUBLIC+=("$remote_pub"); INV_STATE+=("$state"); INV_DESC+=("$desc")
   done <<< "$ids"
 
+  ids="$(greplus_collect_ids || true)"
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    ifc="$(greplus_iface "$id")"
+    local_ip=""; target=""; local_pub=""; remote_pub=""; desc="GRE Plus"
+    if greplus_load_config "$id"; then
+      local_ip="${LOCAL_GREPLUS_IP:-}"
+      target="${REMOTE_GREPLUS_IP:-}"
+      local_pub="${LOCAL_PUBLIC_IP:-}"
+      remote_pub="${REMOTE_PUBLIC_IP:-}"
+    fi
+    if tunnel_iface_is_up "$ifc"; then state="active"; else state="inactive"; fi
+    INV_TYPE+=("greplus"); INV_ID+=("$id"); INV_IFACE+=("$ifc"); INV_LOCAL+=("$local_ip"); INV_TARGET+=("$target"); INV_LOCAL_PUBLIC+=("$local_pub"); INV_REMOTE_PUBLIC+=("$remote_pub"); INV_STATE+=("$state"); INV_DESC+=("$desc")
+  done <<< "$ids"
+
   ids="$(wg_collect_ids || true)"
   while IFS= read -r id; do
     [ -n "$id" ] || continue
@@ -3213,6 +3242,7 @@ remove_inventory_item() {
   local id="${INV_ID[$i]}"
   case "$type" in
     gre) gre_remove_one_tunnel "$id" ;;
+    greplus) greplus_remove_one_tunnel "$id" ;;
     wireguard) wg_remove_one_tunnel "$id" ;;
   esac
 }
@@ -3224,6 +3254,7 @@ ping_inventory_item() {
   local id="${INV_ID[$i]}"
   case "$type" in
     gre) test_gre_tunnel_ping "$id" ;;
+    greplus) test_greplus_tunnel_ping "$id" ;;
     wireguard) test_wg_tunnel_ping "$id" ;;
   esac
 }
@@ -3333,6 +3364,20 @@ heal_remaining_tunnels_after_remove() {
     fi
   done <<< "$ids"
 
+  ids="$(greplus_collect_ids || true)"
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    if greplus_load_config "$id"; then
+      ifc="$(greplus_iface "$id")"
+      greplus_apply_firewall "$id" || true
+      svc="$(greplus_service_name "$id")"
+      if command -v systemctl >/dev/null 2>&1 && systemctl is-enabled --quiet "$svc" 2>/dev/null && ! ip link show "$ifc" >/dev/null 2>&1; then
+        warn_msg "Remaining GRE Plus tunnel $id is enabled but inactive; restarting only this tunnel."
+        systemctl restart "$svc" 2>/dev/null || greplus_create_tunnel 0 || true
+      fi
+    fi
+  done <<< "$ids"
+
   ids="$(wg_collect_ids || true)"
   while IFS= read -r id; do
     [ -n "$id" ] || continue
@@ -3356,15 +3401,9 @@ menu_config_tunnel() {
   case "$SELECTED_TUNNEL_TYPE" in
     gre) gre_menu_config_tunnel ;;
     wireguard)
-      FORCE_WG_TRANSPORT="auto"
       wg_menu_config_tunnel
-      unset FORCE_WG_TRANSPORT
       ;;
-    wsswireguard)
-      FORCE_WG_TRANSPORT="wss"
-      wg_menu_config_tunnel
-      unset FORCE_WG_TRANSPORT
-      ;;
+    greplus) greplus_menu_config_tunnel ;;
   esac
 }
 
@@ -3373,6 +3412,7 @@ status_check() {
   ask_tunnel_type || return
   case "$SELECTED_TUNNEL_TYPE" in
     gre) gre_status_check ;;
+    greplus) greplus_list_tunnels ;;
     wireguard) wg_status_check ;;
   esac
 }
@@ -3393,16 +3433,18 @@ remove_tun() {
 
   if [ "$selected" = "88" ]; then
     echo
-    echo -e "${C_RED}${C_BOLD}WARNING:${C_RESET} this will remove ALL managed GRE, WireGuard, and WSS transport tunnels."
+    echo -e "${C_RED}${C_BOLD}WARNING:${C_RESET} this will remove ALL managed GRE, GRE Plus, and WireGuard tunnels."
     if ! confirm_yes "Are you sure?"; then
       echo "Cancelled."
       return
     fi
 
     local ids id
-    # Removing WireGuard also removes its matching WSS transport. GRE stays last.
+    # Remove WireGuard first because it may depend on normal GRE. GRE Plus is independent.
     ids="$(wg_collect_ids || true)"
     while IFS= read -r id; do [ -n "$id" ] && wg_remove_one_tunnel "$id"; done <<< "$ids"
+    ids="$(greplus_collect_ids || true)"
+    while IFS= read -r id; do [ -n "$id" ] && greplus_remove_one_tunnel "$id"; done <<< "$ids"
     ids="$(gre_collect_ids || true)"
     while IFS= read -r id; do [ -n "$id" ] && gre_remove_one_tunnel "$id"; done <<< "$ids"
     ok_msg "All tunnels removed."
@@ -3458,7 +3500,7 @@ remove_tun() {
   fi
 
   # Remove in dependency-safe order: WireGuard before its GRE transport.
-  for phase in wireguard gre; do
+  for phase in wireguard greplus gre; do
     for idx in "${SELECTED_INDEXES[@]}"; do
       i=$((idx - 1))
       if [ "${INV_TYPE[$i]}" = "$phase" ]; then
@@ -3480,6 +3522,8 @@ remove_tun() {
 list_saved_tunnels() {
   show_header "Saved / Active Tunnels"
   gre_list_tunnels
+  echo
+  greplus_list_tunnels
   echo
   wg_list_tunnels
 }
@@ -3542,6 +3586,23 @@ test_gre_tunnel_ping() {
   ping4_target "GRE tunnel $id ($ifc) remote inner IP" "$target" "$ifc"
 }
 
+test_greplus_tunnel_ping() {
+  local id="$1" ifc svc target
+  if ! greplus_load_config "$id"; then
+    echo "[SKIP] GRE Plus tunnel $id: no saved config"
+    return 1
+  fi
+  target="${REMOTE_GREPLUS_IP:-}"
+  ifc="$(greplus_iface "$id")"
+  svc="$(greplus_service_name "$id")"
+  if ! tunnel_iface_is_up "$ifc"; then
+    echo "[REPAIR] $ifc is inactive; restarting its independent service..."
+    systemctl restart "$svc" >/dev/null 2>&1 || greplus_create_tunnel 0 || true
+    sleep 2
+  fi
+  ping4_target "GRE Plus tunnel $id ($ifc) remote inner IP" "$target" "$ifc"
+}
+
 test_wg_tunnel_ping() {
   local id="$1"
   if ! wg_load_meta "$id"; then
@@ -3562,7 +3623,8 @@ test_one_tunnel_ping_menu() {
   prompt_tunnel_id "Enter tunnel number to test [1-254]: " || return
   case "$SELECTED_TUNNEL_TYPE" in
     gre) test_gre_tunnel_ping "$TUNNEL_ID" ;;
-    wireguard|wsswireguard) test_wg_tunnel_ping "$TUNNEL_ID" ;;
+    greplus) test_greplus_tunnel_ping "$TUNNEL_ID" ;;
+    wireguard) test_wg_tunnel_ping "$TUNNEL_ID" ;;
   esac
 }
 
@@ -3576,6 +3638,15 @@ test_all_tunnels_ping() {
     [ -n "$id" ] || continue
     total=$((total + 1))
     if test_gre_tunnel_ping "$id"; then ok=$((ok + 1)); else fail=$((fail + 1)); fi
+  done <<< "$ids"
+
+  echo
+  echo "Testing all saved GRE Plus tunnels..."
+  ids="$(greplus_collect_ids || true)"
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    total=$((total + 1))
+    if test_greplus_tunnel_ping "$id"; then ok=$((ok + 1)); else fail=$((fail + 1)); fi
   done <<< "$ids"
 
   echo
@@ -3723,7 +3794,7 @@ test_tunnels_menu() {
 
 reset_all_tunnels() {
   show_header "Reset All Tunnels"
-  echo "This will restart/recreate all saved GRE, WSS transport, and WireGuard tunnels from their saved configs."
+  echo "This will restart/recreate all saved normal GRE, GRE Plus, and WireGuard tunnels from their saved configs."
   echo "It will also re-enable their systemd services for boot."
   echo
   if ! confirm_yes "Continue with reset all tunnels?"; then
@@ -3734,7 +3805,7 @@ reset_all_tunnels() {
   diagnostic_event "MANUAL" "manager" "manual reset-all started by operator"
 
   echo
-  echo "Stopping WireGuard and WSS transport first..."
+  echo "Stopping WireGuard first..."
   local ids id
 
   ids="$(wg_collect_ids || true)"
@@ -3745,13 +3816,15 @@ reset_all_tunnels() {
     ip link delete "$(wg_iface_name "$id")" 2>/dev/null || true
   done <<< "$ids"
 
-  ids="$(wss_collect_ids || true)"
+  echo "Stopping GRE Plus and normal GRE tunnels..."
+  ids="$(greplus_collect_ids || true)"
   while IFS= read -r id; do
     [ -n "$id" ] || continue
-    systemctl stop "$(wss_service_name "$id")" 2>/dev/null || true
+    systemctl stop "$(greplus_service_name "$id")" 2>/dev/null || true
+    ip link set dev "$(greplus_iface "$id")" down 2>/dev/null || true
+    ip tunnel del "$(greplus_iface "$id")" 2>/dev/null || true
   done <<< "$ids"
 
-  echo "Stopping GRE tunnels..."
   ids="$(gre_collect_ids || true)"
   while IFS= read -r id; do
     [ -n "$id" ] || continue
@@ -3775,14 +3848,16 @@ reset_all_tunnels() {
   done <<< "$ids"
 
   echo
-  echo "Starting WSS transports..."
-  ids="$(wss_collect_ids || true)"
+  echo "Starting GRE Plus tunnels..."
+  ids="$(greplus_collect_ids || true)"
   while IFS= read -r id; do
     [ -n "$id" ] || continue
-    if systemctl enable --now "$(wss_service_name "$id")" >/dev/null 2>&1; then
-      echo "[OK] WSS transport $id reset"
-    else
-      echo "[WARN] WSS transport $id reset failed"
+    if greplus_load_config "$id"; then
+      if greplus_create_tunnel 0 && greplus_install_service "$id"; then
+        echo "[OK] GRE Plus tunnel $id reset"
+      else
+        echo "[WARN] GRE Plus tunnel $id reset failed"
+      fi
     fi
   done <<< "$ids"
 
@@ -3823,6 +3898,7 @@ diagnostics_collect_current() {
     kind="${INV_TYPE[$i]}"; id="${INV_ID[$i]}"; ifc="${INV_IFACE[$i]}"; target="${INV_TARGET[$i]:-}"
     case "$kind" in
       gre) svc="$(gre_service_name "$id")" ;;
+      greplus) svc="$(greplus_service_name "$id")" ;;
       wireguard) svc="$(wg_service_name "$id")" ;;
       *) svc="" ;;
     esac
@@ -3968,7 +4044,10 @@ defaults
     option dontlognull
     option clitcpka
     option srvtcpka
-    timeout connect 10s
+    option tcp-smart-accept
+    option tcp-smart-connect
+    retries 3
+    timeout connect 5s
     timeout http-request 15s
     timeout queue 30s
     timeout client 2h
@@ -4030,15 +4109,21 @@ root hard nofile ${HAPROXY_NOFILE_LIMIT}
 EOF_SECURITY
 
   cat > /etc/sysctl.d/99-gretun-haproxy.conf <<EOF_SYSCTL
-fs.file-max = 2097152
-net.core.somaxconn = 65535
-net.ipv4.tcp_max_syn_backlog = 65535
+fs.file-max = 8388608
+net.core.somaxconn = 131072
+net.core.netdev_max_backlog = 131072
+net.core.rmem_max = 33554432
+net.core.wmem_max = 33554432
+net.ipv4.tcp_rmem = 4096 131072 33554432
+net.ipv4.tcp_wmem = 4096 131072 33554432
+net.ipv4.tcp_max_syn_backlog = 131072
 net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.tcp_max_tw_buckets = 2000000
 net.ipv4.tcp_keepalive_time = 300
 net.ipv4.tcp_keepalive_intvl = 30
 net.ipv4.tcp_keepalive_probes = 5
 net.ipv4.tcp_tw_reuse = 1
-net.netfilter.nf_conntrack_max = 1048576
+net.netfilter.nf_conntrack_max = 2097152
 EOF_SYSCTL
   sysctl -p /etc/sysctl.d/99-gretun-haproxy.conf >/dev/null 2>&1 || true
   systemctl daemon-reload >/dev/null 2>&1 || true
@@ -4614,6 +4699,7 @@ backend ws_${port}_out
     mode http
     no log
     option http-keep-alive
+    http-reuse safe
     server foreign_${port} ${ip}:${tport}
 EOF_BLOCK
       fi
@@ -5029,21 +5115,24 @@ performance_status() {
   echo
   echo "Note: HAProxy maxconn is a ceiling, not guaranteed capacity; RAM, CPU, file descriptors,"
   echo "conntrack, backend capacity, RTT, and packet loss determine the real limit."
+  echo "A single backend IP:port can also hit the local ephemeral-port ceiling; use multiple"
+  echo "backend IPs or source IPs when you truly need more than about 60k concurrent backend sockets."
 }
 
 apply_capacity_profile() {
   mkdir -p /etc/sysctl.d /etc/systemd/system/haproxy.service.d 2>/dev/null || true
   cat > "$PERFORMANCE_SYSCTL_FILE" <<'EOF_PERFORMANCE'
-# GRETUN v11 balanced high-capacity profile. Buffer values are maxima, not pre-allocation.
-fs.file-max = 4194304
-net.core.somaxconn = 65535
-net.core.netdev_max_backlog = 65536
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-net.ipv4.tcp_rmem = 4096 131072 16777216
-net.ipv4.tcp_wmem = 4096 131072 16777216
-net.ipv4.tcp_max_syn_backlog = 65535
+# GRETUN v12 balanced high-capacity profile. Buffer values are maxima, not pre-allocation.
+fs.file-max = 8388608
+net.core.somaxconn = 131072
+net.core.netdev_max_backlog = 131072
+net.core.rmem_max = 33554432
+net.core.wmem_max = 33554432
+net.ipv4.tcp_rmem = 4096 131072 33554432
+net.ipv4.tcp_wmem = 4096 131072 33554432
+net.ipv4.tcp_max_syn_backlog = 131072
 net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.tcp_max_tw_buckets = 2000000
 net.ipv4.tcp_fin_timeout = 20
 net.ipv4.tcp_keepalive_time = 300
 net.ipv4.tcp_keepalive_intvl = 30
@@ -5051,7 +5140,7 @@ net.ipv4.tcp_keepalive_probes = 5
 net.ipv4.tcp_tw_reuse = 1
 EOF_PERFORMANCE
   if [ -e /proc/sys/net/netfilter/nf_conntrack_max ]; then
-    echo 'net.netfilter.nf_conntrack_max = 1048576' >> "$PERFORMANCE_SYSCTL_FILE"
+    echo 'net.netfilter.nf_conntrack_max = 2097152' >> "$PERFORMANCE_SYSCTL_FILE"
   fi
   sysctl -p "$PERFORMANCE_SYSCTL_FILE" >/dev/null 2>&1 || true
   apply_tunnel_sysctls
@@ -5076,12 +5165,12 @@ EOF_BBR
     err_msg "Kernel rejected BBR settings; inspect /etc/sysctl.d/99-gretun-bbr.conf."
     return 1
   fi
-  ok_msg "BBR + fq enabled for TCP traffic (HAProxy/WSS). GRE/WireGuard UDP itself does not use TCP congestion control."
+  ok_msg "BBR + fq enabled for TCP traffic (including HAProxy). GRE and WireGuard encapsulation do not use TCP congestion control."
 }
 
 cleanup_removed_v11_features() {
-  echo "This removes legacy Vira7, ViraTCP, and aggregate services/configs from this server."
-  echo "GRE, WireGuard, WSS, HAProxy, and their logs are not removed."
+  echo "This removes legacy WSS, Vira7, ViraTCP, and aggregate services/configs from this server."
+  echo "Normal GRE, GRE Plus, WireGuard, HAProxy, and their logs are not removed."
   if ! confirm_yes "Continue with legacy cleanup?"; then
     echo "Cancelled."
     return 0
@@ -5094,19 +5183,21 @@ cleanup_removed_v11_features() {
   while IFS= read -r id; do [ -n "$id" ] && viratcp_remove_one_tunnel "$id"; done <<< "$ids"
   ids="$(aggregate_collect_ids || true)"
   while IFS= read -r id; do [ -n "$id" ] && aggregate_remove_profile "$id"; done <<< "$ids"
+  ids="$(wss_collect_ids || true)"
+  while IFS= read -r id; do [ -n "$id" ] && wss_remove_one "$id"; done <<< "$ids"
 
   while read -r unit _; do
-    [[ "$unit" == vira7-tunnel@*.service || "$unit" == viratcp-tunnel@*.service || "$unit" == gretun-aggregate@*.service ]] || continue
+    [[ "$unit" == vira7-tunnel@*.service || "$unit" == viratcp-tunnel@*.service || "$unit" == gretun-aggregate@*.service || "$unit" == gretun-wss@*.service ]] || continue
     systemctl disable --now "$unit" >/dev/null 2>&1 || true
-  done < <(systemctl list-units --all --plain --no-legend 'vira7-tunnel@*.service' 'viratcp-tunnel@*.service' 'gretun-aggregate@*.service' 2>/dev/null || true)
+  done < <(systemctl list-units --all --plain --no-legend 'vira7-tunnel@*.service' 'viratcp-tunnel@*.service' 'gretun-aggregate@*.service' 'gretun-wss@*.service' 2>/dev/null || true)
 
   for ifc in $(ip -o link show 2>/dev/null | awk -F': ' '$2 ~ /^(vira7|viratcp|ga|gtagg)[0-9]+(@|$)/ {sub(/@.*/, "", $2); print $2}'); do
     ip link delete "$ifc" >/dev/null 2>&1 || true
   done
-  rm -f "$VIRA7_SERVICE_TEMPLATE" "$VIRATCP_SERVICE_TEMPLATE" "$AGG_SERVICE_TEMPLATE" "$VIRA7_BINARY" "$VIRATCP_BINARY"
-  rm -rf "$VIRA7_CONFIG_DIR" "$VIRATCP_CONFIG_DIR" "$AGG_CONFIG_DIR"
+  rm -f "$VIRA7_SERVICE_TEMPLATE" "$VIRATCP_SERVICE_TEMPLATE" "$AGG_SERVICE_TEMPLATE" "$VIRA7_BINARY" "$VIRATCP_BINARY" "$WSS_SERVICE_TEMPLATE" "$WSS_BINARY"
+  rm -rf "$VIRA7_CONFIG_DIR" "$VIRATCP_CONFIG_DIR" "$AGG_CONFIG_DIR" "$WSS_CONFIG_DIR"
   systemctl daemon-reload >/dev/null 2>&1 || true
-  ok_msg "Legacy Vira and aggregate installation files were removed."
+  ok_msg "Legacy WSS, Vira, and aggregate installation files were removed."
 }
 
 performance_menu() {
@@ -5115,7 +5206,7 @@ performance_menu() {
     echo "1) show current capacity status"
     echo "2) apply balanced high-capacity profile"
     echo "3) enable BBR + fq for TCP (when kernel supports it)"
-    echo "4) remove legacy Vira / aggregate installation"
+    echo "4) remove legacy WSS / Vira / aggregate installation"
     echo "00) back to main menu"
     echo
     local choice
@@ -5132,7 +5223,7 @@ performance_menu() {
 }
 
 show_menu() {
-  show_header "GRE + WireGuard + WSS Management v${APP_VERSION}"
+  show_header "GRE + GRE Plus + WireGuard Management v${APP_VERSION}"
   echo -e "${C_BOLD}${C_WHITE}Main Menu${C_RESET}"
   echo -e "  ${C_GREEN}1)${C_RESET} create/update tunnel"
   echo -e "  ${C_RED}2)${C_RESET} remove tunnel"
@@ -5174,6 +5265,11 @@ if [[ "${1:-}" == "--service" ]]; then
       gre_supervisor "${3:-}"
       exit $?
       ;;
+    supervise-greplus)
+      ensure_root
+      greplus_supervisor "${3:-}"
+      exit $?
+      ;;
     health-check-all)
       ensure_root
       tunnel_health_check_all
@@ -5190,11 +5286,6 @@ if [[ "${1:-}" == "--service" ]]; then
       wg_apply_firewall_rules "${3:-}"
       exit $?
       ;;
-    start-wss)
-      ensure_root
-      wss_run_service "${3:-}"
-      exit $?
-      ;;
     haproxy-udp-sync)
       ensure_root
       haproxy_sync_udp_rules
@@ -5206,7 +5297,7 @@ if [[ "${1:-}" == "--service" ]]; then
       exit $?
       ;;
     *)
-      echo "Unknown service command. Use --service supervise-gre <id>, start-wss <id>, health-check-all, haproxy-udp-sync, or haproxy-udp-repair." >&2
+      echo "Unknown service command. Use --service supervise-gre <id>, supervise-greplus <id>, health-check-all, haproxy-udp-sync, or haproxy-udp-repair." >&2
       exit 1
       ;;
   esac
