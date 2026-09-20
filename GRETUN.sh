@@ -32,7 +32,9 @@ set -euo pipefail
 # - v11.0.2 restores GitHub process-substitution installs by fetching the canonical GRETUN.sh filename.
 # - v12.0.0 removes WSS and adds fully independent GRE Plus tunnels with greplusN interfaces,
 #   10.30.N.x addressing, separate configs/services/keys, adaptive MTU, fq scheduling,
-#   strict peer firewall rules, larger queues, and higher HAProxy/kernel capacity ceilings.
+#   strict peer firewall rules and larger queues.
+# - HAProxy fix: preserve an existing global maxconn, use the known-working defaults,
+#   and stop changing system limits or restarting HAProxy simply by opening its menu.
 
 APP_VERSION="12.0.0"
 
@@ -83,7 +85,6 @@ VIRATCP_SERVICE_TEMPLATE="/etc/systemd/system/viratcp-tunnel@.service"
 HAPROXY_CONFIG="/etc/haproxy/haproxy.cfg"
 HAPROXY_BACKUP_DIR="/etc/haproxy/gretun-backups"
 HAPROXY_MAXCONN=500000
-HAPROXY_NOFILE_LIMIT=2097152
 PERFORMANCE_SYSCTL_FILE="/etc/sysctl.d/99-gretun-performance.conf"
 HAPROXY_UDP_SERVICE_NAME="gretun-haproxy-udp.service"
 HAPROXY_UDP_SERVICE_UNIT="/etc/systemd/system/${HAPROXY_UDP_SERVICE_NAME}"
@@ -4028,14 +4029,33 @@ diagnostics_menu() {
 # - UDP rules live in dedicated iptables chains and are rebuilt from HAProxy state
 # - changing TCP <-> HTTP, deleting a port, or changing its target automatically
 #   adds/removes/updates the managed UDP forwarding rules
+haproxy_configured_maxconn() {
+  # Only the global setting applies here; frontend/defaults maxconn must not be rewritten.
+  [ -f "$HAPROXY_CONFIG" ] || return 0
+  awk '
+    /^[[:space:]]*global([[:space:]]|$)/ { in_global=1; next }
+    in_global && /^[^[:space:]#]/ { exit }
+    in_global && /^[[:space:]]*maxconn[[:space:]]+[0-9]+([[:space:]#]|$)/ {
+      print $2; exit
+    }
+  ' "$HAPROXY_CONFIG"
+}
+
 haproxy_base_header() {
   # Silent WebSocket-safe profile:
   # - no access logging by default, so HAProxy does not spam journald/syslog for every WS request
   # - keep HTTP mode for WebSocket forwarding
   # - longer tunnel timeout + TCP keepalive to avoid random long-lived WS drops
+  local maxconn_line="" existing_maxconn=""
+  if [ -f "$HAPROXY_CONFIG" ]; then
+    existing_maxconn="$(haproxy_configured_maxconn)"
+  else
+    existing_maxconn="$HAPROXY_MAXCONN"
+  fi
+  [ -z "$existing_maxconn" ] || maxconn_line="    maxconn $existing_maxconn"
   cat <<EOF_HEADER
 global
-    maxconn ${HAPROXY_MAXCONN}
+${maxconn_line}
     daemon
     stats socket /run/haproxy/admin.sock mode 660 level admin
 
@@ -4044,10 +4064,7 @@ defaults
     option dontlognull
     option clitcpka
     option srvtcpka
-    option tcp-smart-accept
-    option tcp-smart-connect
-    retries 3
-    timeout connect 5s
+    timeout connect 10s
     timeout http-request 15s
     timeout queue 30s
     timeout client 2h
@@ -4090,58 +4107,13 @@ haproxy_install_package() {
   ok_msg "HAProxy installed."
 }
 
-haproxy_apply_high_limits() {
-  # HAProxy cannot truly have an unlimited connection count; it is bound by RAM, CPU,
-  # kernel limits, and available file descriptors. Use a high practical limit instead.
-  mkdir -p /etc/systemd/system/haproxy.service.d /etc/security/limits.d /etc/sysctl.d 2>/dev/null || true
-
-  cat > /etc/systemd/system/haproxy.service.d/99-gretun-limits.conf <<EOF_LIMIT
-[Service]
-LimitNOFILE=${HAPROXY_NOFILE_LIMIT}
-TasksMax=infinity
-EOF_LIMIT
-
-  cat > /etc/security/limits.d/99-gretun-haproxy.conf <<EOF_SECURITY
-* soft nofile ${HAPROXY_NOFILE_LIMIT}
-* hard nofile ${HAPROXY_NOFILE_LIMIT}
-root soft nofile ${HAPROXY_NOFILE_LIMIT}
-root hard nofile ${HAPROXY_NOFILE_LIMIT}
-EOF_SECURITY
-
-  cat > /etc/sysctl.d/99-gretun-haproxy.conf <<EOF_SYSCTL
-fs.file-max = 8388608
-net.core.somaxconn = 131072
-net.core.netdev_max_backlog = 131072
-net.core.rmem_max = 33554432
-net.core.wmem_max = 33554432
-net.ipv4.tcp_rmem = 4096 131072 33554432
-net.ipv4.tcp_wmem = 4096 131072 33554432
-net.ipv4.tcp_max_syn_backlog = 131072
-net.ipv4.ip_local_port_range = 1024 65535
-net.ipv4.tcp_max_tw_buckets = 2000000
-net.ipv4.tcp_keepalive_time = 300
-net.ipv4.tcp_keepalive_intvl = 30
-net.ipv4.tcp_keepalive_probes = 5
-net.ipv4.tcp_tw_reuse = 1
-net.netfilter.nf_conntrack_max = 2097152
-EOF_SYSCTL
-  sysctl -p /etc/sysctl.d/99-gretun-haproxy.conf >/dev/null 2>&1 || true
-  systemctl daemon-reload >/dev/null 2>&1 || true
-}
-
-haproxy_ensure_maxconn_in_config() {
-  [ -f "$HAPROXY_CONFIG" ] || return 0
-
-  if grep -Eq '^[[:space:]]*maxconn[[:space:]]+' "$HAPROXY_CONFIG"; then
-    sed -i -E "s/^[[:space:]]*maxconn[[:space:]]+[0-9]+/    maxconn ${HAPROXY_MAXCONN}/" "$HAPROXY_CONFIG" || true
-  else
-    awk -v mc="$HAPROXY_MAXCONN" '
-      BEGIN { in_global=0; inserted=0 }
-      /^[[:space:]]*global[[:space:]]*$/ { print; in_global=1; next }
-      in_global && !inserted && /^[[:space:]]*defaults[[:space:]]*$/ { print "    maxconn " mc; inserted=1; in_global=0; print; next }
-      { print }
-      END { if (in_global && !inserted) print "    maxconn " mc }
-    ' "$HAPROXY_CONFIG" > "$HAPROXY_CONFIG.tmp.$$" && mv -f "$HAPROXY_CONFIG.tmp.$$" "$HAPROXY_CONFIG"
+haproxy_cleanup_legacy_limits() {
+  # Remove only the exact systemd override created by older GRETUN versions.
+  # A custom administrator override is left alone.
+  local override="/etc/systemd/system/haproxy.service.d/99-gretun-limits.conf"
+  if [ -f "$override" ] && printf '[Service]\nLimitNOFILE=2097152\nTasksMax=infinity\n' | cmp -s - "$override"; then
+    rm -f "$override"
+    systemctl daemon-reload
   fi
 }
 
@@ -4633,7 +4605,7 @@ haproxy_open_firewall_tcp() {
 }
 
 haproxy_validate_and_restart() {
-  local tmp="$1"
+  local tmp="$1" backup=""
   # Validate quietly first so HAProxy NOTICE/WARNING lines do not confuse the menu output.
   # If validation fails, run it again without -q to print the real error.
   if ! haproxy -c -q -f "$tmp" >/dev/null 2>&1; then
@@ -4644,17 +4616,29 @@ haproxy_validate_and_restart() {
   fi
   mkdir -p "$HAPROXY_BACKUP_DIR"
   if [ -f "$HAPROXY_CONFIG" ]; then
-    cp -f "$HAPROXY_CONFIG" "$HAPROXY_BACKUP_DIR/haproxy.cfg.$(date +%Y%m%d-%H%M%S).bak" 2>/dev/null || true
+    backup="$(mktemp "$HAPROXY_BACKUP_DIR/haproxy.cfg.XXXXXXXX.bak")"
+    if ! cp -p "$HAPROXY_CONFIG" "$backup"; then
+      rm -f "$backup" "$tmp"
+      err_msg "Could not back up the existing HAProxy config. Nothing changed."
+      return 1
+    fi
   fi
   mv -f "$tmp" "$HAPROXY_CONFIG"
-  haproxy_apply_high_limits
-  haproxy_ensure_maxconn_in_config
+  haproxy_cleanup_legacy_limits
   systemctl enable haproxy >/dev/null 2>&1 || true
   if systemctl restart haproxy; then
     ok_msg "HAProxy restarted successfully."
     return 0
   fi
   err_msg "HAProxy restart failed. Check: journalctl -u haproxy -n 50 --no-pager"
+  if [ -n "$backup" ]; then
+    cp -p "$backup" "$HAPROXY_CONFIG"
+    if systemctl restart haproxy; then
+      warn_msg "Previous HAProxy config restored and service started."
+    else
+      err_msg "Previous config restored, but HAProxy still did not start. Check the journal."
+    fi
+  fi
   return 1
 }
 
@@ -4724,14 +4708,25 @@ haproxy_entries_tmp() {
 
 haproxy_ensure_ready() {
   haproxy_install_package || return 1
-  haproxy_apply_high_limits
+  haproxy_cleanup_legacy_limits
   mkdir -p /etc/haproxy "$HAPROXY_BACKUP_DIR"
   if [ ! -f "$HAPROXY_CONFIG" ]; then
-    haproxy_base_header > "$HAPROXY_CONFIG"
-  else
-    haproxy_ensure_maxconn_in_config
+    local new_config
+    new_config="$(mktemp)"
+    haproxy_base_header > "$new_config"
+    if ! haproxy -c -f "$new_config"; then
+      rm -f "$new_config"
+      err_msg "HAProxy configuration validation failed. No config was installed."
+      return 1
+    fi
+    mv -f "$new_config" "$HAPROXY_CONFIG"
   fi
-  systemctl restart haproxy >/dev/null 2>&1 || true
+  if ! systemctl is-active --quiet haproxy; then
+    if ! haproxy -c -f "$HAPROXY_CONFIG" || ! systemctl start haproxy; then
+      err_msg "HAProxy did not start. Check: journalctl -u haproxy -n 50 --no-pager"
+      return 1
+    fi
+  fi
   haproxy_install_udp_service
   haproxy_sync_udp_rules >/dev/null 2>&1 || true
 }
@@ -5097,10 +5092,12 @@ haproxy_menu() {
 # Performance, capacity, and v11 migration tools
 # -----------------------------
 performance_status() {
-  local mem_kb cpu_count nofile conntrack_now="N/A" conntrack_max="N/A" congestion="N/A" qdisc="N/A"
+  local mem_kb cpu_count nofile configured_maxconn conntrack_now="N/A" conntrack_max="N/A" congestion="N/A" qdisc="N/A"
   mem_kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
   cpu_count="$(nproc 2>/dev/null || echo 1)"
   nofile="$(ulimit -n 2>/dev/null || echo unknown)"
+  configured_maxconn="$(haproxy_configured_maxconn)"
+  configured_maxconn="${configured_maxconn:-automatic / not set}"
   [ -r /proc/sys/net/netfilter/nf_conntrack_count ] && conntrack_now="$(cat /proc/sys/net/netfilter/nf_conntrack_count)"
   [ -r /proc/sys/net/netfilter/nf_conntrack_max ] && conntrack_max="$(cat /proc/sys/net/netfilter/nf_conntrack_max)"
   [ -r /proc/sys/net/ipv4/tcp_congestion_control ] && congestion="$(cat /proc/sys/net/ipv4/tcp_congestion_control)"
@@ -5109,7 +5106,7 @@ performance_status() {
   printf "CPU cores                 : %s\n" "$cpu_count"
   printf "RAM                       : %s MiB\n" "$((mem_kb / 1024))"
   printf "Current shell open files  : %s\n" "$nofile"
-  printf "HAProxy configured maxconn: %s\n" "$HAPROXY_MAXCONN"
+  printf "HAProxy configured maxconn: %s\n" "$configured_maxconn"
   printf "Conntrack usage           : %s / %s\n" "$conntrack_now" "$conntrack_max"
   printf "TCP congestion / qdisc    : %s / %s\n" "$congestion" "$qdisc"
   echo
@@ -5144,7 +5141,6 @@ EOF_PERFORMANCE
   fi
   sysctl -p "$PERFORMANCE_SYSCTL_FILE" >/dev/null 2>&1 || true
   apply_tunnel_sysctls
-  haproxy_apply_high_limits
   systemctl daemon-reload >/dev/null 2>&1 || true
   if systemctl is-active --quiet haproxy 2>/dev/null; then
     systemctl reload haproxy >/dev/null 2>&1 || systemctl restart haproxy >/dev/null 2>&1 || true
