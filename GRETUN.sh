@@ -1,14 +1,14 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + WireGuard + ViraTCP + HAProxy multi-tunnel manager v10.1.0
+# GRE + WireGuard + WSS + HAProxy tunnel manager v11.0.0
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
 # - Local tunnel/bind IPv4 can be selected manually for servers with multiple IPs
 # - v8.5-safe-remove-heal prevents removing active transports used by WireGuard and re-heals remaining tunnels after deletion
 # - v8.6-self-heal keeps GRE under a persistent supervisor, disables rp_filter for encapsulated paths,
-#   pins public peer routes to the physical uplink, and repairs GRE/Vira7/WireGuard in dependency order
+#   pins public peer routes to the physical uplink, and repairs GRE/WireGuard in dependency order
 # - v8.6.1 fixes execution through bash <(curl ...) without consuming the script pipe
 # - v8.6.2 fixes GRE creation on kernels that reject fixed TTL together with nopmtudisc
 # - v8.6.3 displays the installed script version in the main menu header
@@ -20,24 +20,15 @@ set -euo pipefail
 #   rebuilds its UDP companion rules, and verifies DNAT/SNAT/FORWARD installation per port
 # - v8.8.3 adds HAProxy UDP auto-heal: the existing 20s health monitor detects missing managed UDP rules
 #   and repairs them immediately, while an hourly systemd timer force-runs the same repair as HAProxy option 8
-# - v8.8.4 adds iperf3 tunnel throughput tests and optional ECMP multipath routes across active tunnel interfaces
-# - v9.0.0 separates ping, throughput, and aggregation menus; replaces the temporary ECMP action with
-#   persistent, health-aware aggregation profiles that expose a stable local virtual IPv4 on both peers.
-#   Concurrent TCP/UDP flows to the peer aggregate IPv4 are distributed across every healthy selected tunnel.
-#   Dependencies are checked on every use but installed only when a required command is actually missing.
-# - v9.1.0 exposes aggregate profiles in the unified ping, throughput, and removal lists; accepts both
-#   comma- and space-separated aggregate member selections; asks for the local role before tunnel selection;
-#   and makes iperf3 return safely to the menu after a one-shot server or a failed/interrupted test.
-# - v9.1.1 strips CIDR prefixes from local/remote throughput-test addresses before passing them to iperf3.
-# - v10.0.0 rewrites aggregation as isolated per-member GRE paths. Aggregate destinations are no longer
-#   injected into WireGuard AllowedIPs, so wg-quick restarts cannot replace ECMP routes or disturb handshakes.
-#   Route updates are idempotent and health-aware with failure hysteresis. Fresh WireGuard handshakes also
-#   suppress destructive GRE/WireGuard restarts when ICMP probes are lost under load.
+# - v8.8.4 adds iperf3 tunnel throughput tests.
 # - v10.1.0 removes aggregation from the main menu and adds persistent disconnect/error diagnostics.
 #   Health failures, automatic/manual restarts, service state, interface state, routes, and recent journal
 #   messages are retained under /var/log/gretun-manager for troubleshooting short interruptions.
+# - v11.0.0 removes Vira7/ViraTCP and ECMP aggregation from the manager.
+#   It adds verified WSTunnel 11.0.0 as an HTTPS/WebSocket transport for WireGuard, keeps GRE->WireGuard
+#   as the preferred fast path, prevents health/reset races, and adds safe capacity/performance tuning.
 
-APP_VERSION="10.1.0"
+APP_VERSION="11.0.0"
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -50,54 +41,45 @@ HEALTH_SERVICE_UNIT="/etc/systemd/system/gretun-health.service"
 HEALTH_TIMER_UNIT="/etc/systemd/system/gretun-health.timer"
 HEALTH_STATE_DIR="/run/gretun-health"
 HEALTH_FAIL_LIMIT=3
+MAINTENANCE_FLAG="/run/gretun-manager.maintenance"
 DIAG_LOG_DIR="/var/log/gretun-manager"
 DIAG_EVENT_LOG="$DIAG_LOG_DIR/events.log"
 DIAG_DETAIL_LOG="$DIAG_LOG_DIR/diagnostics.log"
 DIAG_SERVICE_LOG="$DIAG_LOG_DIR/services.log"
 DIAG_EVENT_MAX_BYTES=5242880
 DIAG_DETAIL_MAX_BYTES=20971520
-SELF_RAW_URL="https://raw.githubusercontent.com/0fariid0/GRE-TUN/refs/heads/main/GRETUN.sh"
+SELF_RAW_URL="https://raw.githubusercontent.com/0fariid0/GRE-TUN/refs/heads/main/GRETUN-v11.sh"
 
 WG_META_DIR="/etc/wgtun-tunnels"
 WG_KEY_DIR="$WG_META_DIR/keys"
 WG_CONFIG_DIR="/etc/wireguard"
 WG_IFACE_PREFIX="wgtun"
 
+# WSS transport for WireGuard. WSTunnel carries the WireGuard UDP socket over
+# WebSocket/HTTPS; the inner WireGuard interface then carries TCP, UDP, HTTP,
+# WebSocket, and any other IPv4 traffic without application-specific handling.
+WSS_CONFIG_DIR="/etc/gretun-wss"
+WSS_BINARY="/usr/local/bin/wstunnel"
+WSS_SERVICE_TEMPLATE="/etc/systemd/system/gretun-wss@.service"
+WSS_VERSION="11.0.0"
+WSS_AMD64_SHA256="9708a99717b5a951453c2ff7c14c25d3418d02ca7fcb96fdb382a8f2083bab5e"
+WSS_ARM64_SHA256="b86abf73e340ed0c3ff9a77a5458aa27213784920ec65513132b36def45edc94"
+WSS_DEFAULT_MTU=1280
+WSS_DEFAULT_TCP_PORT=443
+WSS_LOCAL_UDP_BASE=45000
+
 VIRA7_CONFIG_DIR="/etc/vira7-tunnels"
 VIRA7_BINARY="/usr/local/bin/vira7-engine"
-VIRA7_SOURCE="$VIRA7_CONFIG_DIR/vira7_engine.c"
 VIRA7_SERVICE_TEMPLATE="/etc/systemd/system/vira7-tunnel@.service"
-VIRA7_IFACE_PREFIX="vira7"
-VIRA7_DEFAULT_MTU=1400
-VIRA7_DEFAULT_PORT_BASE=5571
-VIRA7_DEFAULT_KEEPALIVE=5
-VIRA7_DEFAULT_BUFFER_SIZE=2097152
-VIRA7_DEFAULT_QUEUE_LEN=1000
-# Vira7 CPU optimization defaults:
-# checksum=1 keeps packet format compatible with older engines.
-# verify_checksum=0 trusts UDP checksum and skips expensive userspace checksum validation on receive.
-# batch=128 drains packet bursts per select() wakeup and reduces syscall/loop overhead.
-VIRA7_DEFAULT_CHECKSUM=1
-VIRA7_DEFAULT_VERIFY_CHECKSUM=0
-VIRA7_DEFAULT_BATCH=128
-
-# ViraTCP: encrypted TCP based TUN. Iran initiates the outbound TCP connection
-# and Kharej listens, which is useful where GRE/UDP paths are short-lived or filtered.
 VIRATCP_CONFIG_DIR="/etc/viratcp-tunnels"
 VIRATCP_BINARY="/usr/local/bin/viratcp-engine"
-VIRATCP_SOURCE="$VIRATCP_CONFIG_DIR/viratcp_engine.c"
 VIRATCP_SERVICE_TEMPLATE="/etc/systemd/system/viratcp-tunnel@.service"
-VIRATCP_IFACE_PREFIX="viratcp"
-VIRATCP_DEFAULT_PORT=443
-VIRATCP_DEFAULT_MTU=1280
-VIRATCP_DEFAULT_KEEPALIVE=10
-VIRATCP_DEFAULT_RECONNECT=3
-VIRATCP_DEFAULT_TCP_USER_TIMEOUT=20000
 
 HAPROXY_CONFIG="/etc/haproxy/haproxy.cfg"
 HAPROXY_BACKUP_DIR="/etc/haproxy/gretun-backups"
 HAPROXY_MAXCONN=500000
 HAPROXY_NOFILE_LIMIT=1048576
+PERFORMANCE_SYSCTL_FILE="/etc/sysctl.d/99-gretun-performance.conf"
 HAPROXY_UDP_SERVICE_NAME="gretun-haproxy-udp.service"
 HAPROXY_UDP_SERVICE_UNIT="/etc/systemd/system/${HAPROXY_UDP_SERVICE_NAME}"
 HAPROXY_UDP_REPAIR_SERVICE_NAME="gretun-haproxy-udp-repair.service"
@@ -280,6 +262,38 @@ run_logged_tunnel_engine() {
 is_main_menu_token() { [ "${1:-}" = "00" ]; }
 return_main_msg() { echo -e "${C_CYAN}Returning to main menu...${C_RESET}"; }
 
+maintenance_begin() {
+  printf '%s %s\n' "$$" "$(date +%s)" > "$MAINTENANCE_FLAG" 2>/dev/null || true
+}
+
+maintenance_end() {
+  rm -f "$MAINTENANCE_FLAG" 2>/dev/null || true
+}
+
+maintenance_is_active() {
+  local started now
+  [ -f "$MAINTENANCE_FLAG" ] || return 1
+  started="$(awk 'NR==1{print $2}' "$MAINTENANCE_FLAG" 2>/dev/null || echo 0)"
+  now="$(date +%s)"
+  [[ "$started" =~ ^[0-9]+$ ]] || started=0
+  if [ "$started" -gt 0 ] && [ $((now - started)) -lt 900 ]; then
+    return 0
+  fi
+  rm -f "$MAINTENANCE_FLAG" 2>/dev/null || true
+  return 1
+}
+
+run_maintenance_action() {
+  local rc
+  maintenance_begin
+  set +e
+  "$@"
+  rc=$?
+  set -e
+  maintenance_end
+  return "$rc"
+}
+
 ensure_root() {
   if [ "$(id -u)" -ne 0 ]; then
     echo "This script must be run as root" >&2
@@ -419,15 +433,15 @@ prompt_role() {
 ask_tunnel_type() {
   echo "Select tunnel type:"
   echo "1) Normal GRE tunnel"
-  echo "2) WireGuard tunnel"
-  echo "3) ViraTCP encrypted TCP-TUN (anti UDP/GRE filtering)"
+  echo "2) WireGuard tunnel (direct UDP or automatically over same-number GRE)"
+  echo "3) WireGuard over WebSocket/HTTPS (WSS; carries TCP/UDP/HTTP)"
   echo
   read -rp "Choose [1-3] (00=menu): " TUNNEL_TYPE_CHOICE
   if is_main_menu_token "$TUNNEL_TYPE_CHOICE"; then return_main_msg; return 99; fi
   case "$TUNNEL_TYPE_CHOICE" in
     1) SELECTED_TUNNEL_TYPE="gre" ;;
     2) SELECTED_TUNNEL_TYPE="wireguard" ;;
-    3) SELECTED_TUNNEL_TYPE="viratcp" ;;
+    3) SELECTED_TUNNEL_TYPE="wsswireguard" ;;
     *) echo "Invalid tunnel type"; return 1 ;;
   esac
 }
@@ -595,7 +609,6 @@ udp_port_in_saved_configs() {
     for f in "$VIRA7_CONFIG_DIR"/tunnel-*.conf; do
       [ -e "$f" ] || continue
       id="${f##*/tunnel-}"; id="${id%.conf}"
-      [ "$current_type" = "vira7" ] && [ "$id" = "$current_id" ] && continue
       (
         # shellcheck disable=SC1090
         source "$f" 2>/dev/null || exit 1
@@ -754,7 +767,7 @@ apply_tunnel_sysctls() {
   mkdir -p /etc/sysctl.d 2>/dev/null || true
   if [ ! -f "$sysctl_file" ] || ! grep -q 'gretun-self-heal' "$sysctl_file" 2>/dev/null; then
     cat > "$sysctl_file" <<'EOF_SYSCTL'
-# gretun-self-heal: stable settings for GRE/WireGuard/UDP-TUN encapsulation
+# gretun-self-heal: stable settings for GRE/WireGuard encapsulation
 net.ipv4.ip_forward=1
 net.ipv4.conf.all.rp_filter=0
 net.ipv4.conf.default.rp_filter=0
@@ -794,7 +807,7 @@ ensure_public_endpoint_route() {
   gateway="$(awk '{for(i=1;i<=NF;i++) if($i=="via") {print $(i+1); exit}}' <<< "$route")"
 
   case "$dev" in
-    gre*|wgtun*|vira7*|viratcp*|ga*|gtagg*|"")
+    gre*|wgtun*|ga*|gtagg*|"")
       route="$(ip -4 route get 1.1.1.1 from "$local_ip" 2>/dev/null | head -n 1 || true)"
       dev="$(awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}' <<< "$route")"
       gateway="$(awk '{for(i=1;i<=NF;i++) if($i=="via") {print $(i+1); exit}}' <<< "$route")"
@@ -802,7 +815,7 @@ ensure_public_endpoint_route() {
   esac
 
   [ -n "$dev" ] || return 0
-  case "$dev" in gre*|wgtun*|vira7*|viratcp*|ga*|gtagg*) return 0 ;; esac
+  case "$dev" in gre*|wgtun*|ga*|gtagg*) return 0 ;; esac
   if [ -n "$gateway" ]; then
     ip -4 route replace "$remote_ip/32" via "$gateway" dev "$dev" src "$local_ip" metric 5 2>/dev/null || true
   else
@@ -899,7 +912,7 @@ install_health_monitor() {
 
   cat > "$HEALTH_SERVICE_UNIT" <<EOF_HEALTH_SERVICE
 [Unit]
-Description=GRE/WireGuard/Vira7/ViraTCP dependency-aware health check
+Description=GRE/WireGuard/WSS dependency-aware health check
 After=network-online.target
 Wants=network-online.target
 
@@ -912,7 +925,7 @@ EOF_HEALTH_SERVICE
 
   cat > "$HEALTH_TIMER_UNIT" <<'EOF_HEALTH_TIMER'
 [Unit]
-Description=Run GRE/WireGuard/Vira7/ViraTCP health check periodically
+Description=Run GRE/WireGuard/WSS health check periodically
 
 [Timer]
 OnBootSec=25s
@@ -1000,6 +1013,7 @@ ExecStart=/bin/bash $INSTALL_BIN --service supervise-gre %i
 Restart=always
 RestartSec=2
 TimeoutStopSec=10
+LimitNOFILE=262144
 StandardOutput=append:$DIAG_SERVICE_LOG
 StandardError=append:$DIAG_SERVICE_LOG
 
@@ -1009,6 +1023,9 @@ EOF_SERVICE
 }
 
 tunnel_health_check_all() {
+  # Do not fight a manual create/remove/reset operation. The flag self-expires
+  # after 15 minutes so an interrupted SSH session cannot disable healing forever.
+  maintenance_is_active && return 0
   local lockdir="/run/gretun-health.lock"
   mkdir "$lockdir" 2>/dev/null || return 0
   trap 'rmdir /run/gretun-health.lock 2>/dev/null || true' EXIT
@@ -1030,67 +1047,19 @@ tunnel_health_check_all() {
     fi
   done <<< "$ids"
 
-  # Vira7 can stay alive while its UDP path is stale. Restart only after three
-  # consecutive failed inner pings, then refresh dependent WireGuard tunnels.
-  ids="$(vira7_collect_ids || true)"
+  # WSS transport is checked before WireGuard so the UDP-over-HTTPS relay is
+  # restored first. It has no network interface of its own.
+  ids="$(wss_collect_ids || true)"
   while IFS= read -r id; do
     [ -n "$id" ] || continue
-    svc="$(vira7_service_name "$id")"
+    svc="$(wss_service_name "$id")"
     systemctl is-enabled --quiet "$svc" 2>/dev/null || continue
-    vira7_load_config "$id" || continue
-    ifc="$(vira7_iface_name "$id")"
-    target="${REMOTE_VIRA7_IP:-${remote_priv:-}}"
-    ensure_public_endpoint_route "${REMOTE_PUBLIC_IP:-${remote_ip:-}}" "${LOCAL_PUBLIC_IP:-${bind_ip:-}}"
-    vira7_apply_firewall_rules "$id" >/dev/null 2>&1 || true
-
-    if ! systemctl is-active --quiet "$svc" 2>/dev/null || ! tunnel_iface_is_up "$ifc"; then
-      restart_service_with_diagnostics "vira7" "$id" "$ifc" "$svc" "$target" "service inactive or interface missing" || true
-      health_counter_reset vira7 "$id"
-      sleep 1
-      restart_wg_dependents_for_transport vira7 "$id"
-    elif quick_tunnel_ping "$ifc" "$target"; then
-      health_counter_reset vira7 "$id"
-    else
-      count="$(health_counter_fail vira7 "$id")"
-      diagnostic_event "WARN" "vira7-$id" "inner ping failed ($count/$HEALTH_FAIL_LIMIT), interface=$ifc target=$target"
-      if [ "$count" -ge "$HEALTH_FAIL_LIMIT" ]; then
-        restart_service_with_diagnostics "vira7" "$id" "$ifc" "$svc" "$target" "$count consecutive inner ping failures" || true
-        health_counter_reset vira7 "$id"
-        sleep 1
-        restart_wg_dependents_for_transport vira7 "$id"
-      fi
+    if ! systemctl is-active --quiet "$svc" 2>/dev/null; then
+      restart_service_with_diagnostics "wss" "$id" "" "$svc" "" "WSS transport service inactive" || true
     fi
   done <<< "$ids"
 
-  # ViraTCP maintains a reconnecting TCP session itself. The health timer only
-  # restarts it after repeated inner-path failures or if the service/interface disappeared.
-  ids="$(viratcp_collect_ids || true)"
-  while IFS= read -r id; do
-    [ -n "$id" ] || continue
-    svc="$(viratcp_service_name "$id")"
-    systemctl is-enabled --quiet "$svc" 2>/dev/null || continue
-    viratcp_load_config "$id" || continue
-    ifc="$(viratcp_iface_name "$id")"
-    target="${REMOTE_VIRATCP_IP:-${remote_priv:-}}"
-    ensure_public_endpoint_route "${REMOTE_PUBLIC_IP:-${remote_ip:-}}" "${LOCAL_PUBLIC_IP:-${bind_ip:-}}"
-    viratcp_apply_firewall_rules "$id" >/dev/null 2>&1 || true
-    if ! systemctl is-active --quiet "$svc" 2>/dev/null || ! tunnel_iface_is_up "$ifc"; then
-      restart_service_with_diagnostics "viratcp" "$id" "$ifc" "$svc" "$target" "service inactive or interface missing" || true
-      health_counter_reset viratcp "$id"
-    elif quick_tunnel_ping "$ifc" "$target"; then
-      health_counter_reset viratcp "$id"
-    else
-      count="$(health_counter_fail viratcp "$id")"
-      diagnostic_event "WARN" "viratcp-$id" "inner ping failed ($count/$HEALTH_FAIL_LIMIT), interface=$ifc target=$target"
-      if [ "$count" -ge "$HEALTH_FAIL_LIMIT" ]; then
-        restart_service_with_diagnostics "viratcp" "$id" "$ifc" "$svc" "$target" "$count consecutive inner ping failures" || true
-        health_counter_reset viratcp "$id"
-      fi
-    fi
-  done <<< "$ids"
-
-  # WireGuard is checked last so its selected GRE/Vira7 transport is repaired
-  # before the overlay is touched.
+  # WireGuard is checked last so GRE/WSS transport is repaired first.
   ids="$(wg_collect_ids || true)"
   while IFS= read -r id; do
     [ -n "$id" ] || continue
@@ -1102,8 +1071,11 @@ tunnel_health_check_all() {
     target="${REMOTE_WG_IP:-}"
     transport_ok=1
     case "${WG_ENDPOINT_MODE:-public}" in
-      gre|vira7)
+      gre)
         if ! tunnel_iface_is_up "${WG_TRANSPORT_IFACE:-}"; then transport_ok=0; fi
+        ;;
+      wss-client|wss-server)
+        if ! systemctl is-active --quiet "$(wss_service_name "$id")" 2>/dev/null; then transport_ok=0; fi
         ;;
     esac
     if [ "$transport_ok" -ne 1 ]; then
@@ -1143,11 +1115,34 @@ bootstrap_runtime_repairs() {
     migrate=1
   fi
   gre_write_service_template
-  [ -d "$VIRA7_CONFIG_DIR" ] && vira7_write_service_template >/dev/null 2>&1 || true
-  [ -d "$VIRATCP_CONFIG_DIR" ] && viratcp_write_service_template >/dev/null 2>&1 || true
+  [ -d "$WSS_CONFIG_DIR" ] && wss_write_service_template >/dev/null 2>&1 || true
   install_health_monitor
   apply_tunnel_sysctls
   systemctl daemon-reload >/dev/null 2>&1 || true
+
+  # v11 does not run removed tunnel engines. Stop legacy instances during
+  # migration; menu 8 offers explicit deletion of their files after confirmation.
+  ids="$(vira7_collect_ids || true)"
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    systemctl disable --now "$(vira7_service_name "$id")" >/dev/null 2>&1 || true
+    ip link delete "$(vira7_iface_name "$id")" >/dev/null 2>&1 || true
+  done <<< "$ids"
+  ids="$(viratcp_collect_ids || true)"
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    systemctl disable --now "$(viratcp_service_name "$id")" >/dev/null 2>&1 || true
+    ip link delete "$(viratcp_iface_name "$id")" >/dev/null 2>&1 || true
+  done <<< "$ids"
+  ids="$(aggregate_collect_ids || true)"
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    systemctl disable --now "$(aggregate_service_name "$id")" >/dev/null 2>&1 || true
+    ip link delete "$(aggregate_iface_name "$id")" >/dev/null 2>&1 || true
+  done <<< "$ids"
+  for ifc in $(ip -o link show 2>/dev/null | awk -F': ' '$2 ~ /^(vira7|viratcp|ga|gtagg)[0-9]+(@|$)/ {sub(/@.*/, "", $2); print $2}'); do
+    ip link delete "$ifc" >/dev/null 2>&1 || true
+  done
 
   ids="$(gre_collect_ids || true)"
   while IFS= read -r id; do
@@ -1704,7 +1699,8 @@ wg_default_public_endpoint_ip() {
 
 wg_auto_endpoint_ip() {
   case "${WG_ENDPOINT_MODE:-public}" in
-    gre|vira7) printf '%s' "${WG_ENDPOINT_IP:-}" ;;
+    gre|wss-client) printf '%s' "${WG_ENDPOINT_IP:-}" ;;
+    wss-server) printf '%s' "" ;;
     *) wg_default_public_endpoint_ip ;;
   esac
 }
@@ -1756,9 +1752,9 @@ wg_print_ip_plan() {
   echo "  Iran role IP    : 10.20.$id.1/30"
   echo "  Kharej role IP  : 10.20.$id.2/30"
   echo "  GRE transport   : if gre$id is up/reachable, WireGuard can use 10.10.$id.x"
-  echo "  Vira7 transport : if vira7$id is up/reachable, WireGuard can use 10.71.$id.x"
+  echo "  WSS transport   : WireGuard UDP can ride inside HTTPS/WebSocket when GRE/UDP is filtered"
   echo
-  echo "GRE uses 10.10.N.x, WireGuard uses 10.20.N.x, Vira7 uses 10.71.N.x, so they do not conflict."
+  echo "GRE uses 10.10.N.x and WireGuard uses 10.20.N.x, so they do not conflict."
 }
 
 wg_ensure_tools() {
@@ -1939,23 +1935,23 @@ wg_list_tunnels() {
 
 wg_write_config() {
   local id="$1"
-  local private_file conf allowed_ips private_key endpoint_ip endpoint_mode_note mtu_value
+  local private_file conf allowed_ips private_key endpoint_ip endpoint_mode_note mtu_value endpoint_line=""
   private_file="$(wg_private_key_file "$id")"
   conf="$(wg_config_file "$id")"
   private_key="$(cat "$private_file")"
-  # Aggregate traffic uses isolated GRE-over-member paths in v10.  Keeping the
-  # peer list limited to its real WireGuard addresses prevents wg-quick from
-  # creating competing routes for an aggregate /32 on multiple interfaces.
   allowed_ips="${REMOTE_WG_IP%%/*}/32"
   endpoint_ip="$(wg_auto_endpoint_ip)"
   endpoint_mode_note="${WG_ENDPOINT_MODE:-public}"
   mtu_value="${WG_MTU:-1420}"
   case "$endpoint_mode_note" in
-    gre|vira7) mtu_value="${WG_MTU:-1280}" ;;
+    gre|wss-client|wss-server) mtu_value="${WG_MTU:-1280}" ;;
   esac
-  if [ -z "$endpoint_ip" ]; then
+  if [ "$endpoint_mode_note" != "wss-server" ] && [ -z "$endpoint_ip" ]; then
     echo "WireGuard endpoint IP is empty. Cannot write config." >&2
     return 1
+  fi
+  if [ "$endpoint_mode_note" != "wss-server" ]; then
+    endpoint_line="Endpoint = $endpoint_ip:$REMOTE_WG_PORT"
   fi
   if [ -n "${EXTRA_ALLOWED_IPS:-}" ]; then
     allowed_ips="$allowed_ips, $EXTRA_ALLOWED_IPS"
@@ -1973,13 +1969,17 @@ MTU = $mtu_value
 
 [Peer]
 PublicKey = $REMOTE_WG_PUBLIC_KEY
-Endpoint = $endpoint_ip:$REMOTE_WG_PORT
+$endpoint_line
 AllowedIPs = $allowed_ips
 PersistentKeepalive = 25
 EOF_CONF
   chmod 600 "$conf"
   echo "WireGuard config written: $conf"
-  echo "WireGuard endpoint mode: $endpoint_mode_note -> $endpoint_ip:$REMOTE_WG_PORT"
+  if [ "$endpoint_mode_note" = "wss-server" ]; then
+    echo "WireGuard endpoint mode: WSS server (peer endpoint is learned dynamically)"
+  else
+    echo "WireGuard endpoint mode: $endpoint_mode_note -> $endpoint_ip:$REMOTE_WG_PORT"
+  fi
   echo "WireGuard MTU: $mtu_value"
 }
 
@@ -2017,7 +2017,8 @@ wg_create_tunnel() {
   WG_TRANSPORT_IFACE="${WG_TRANSPORT_IFACE:-}"
   if [ -z "${WG_MTU:-}" ]; then
     case "$WG_ENDPOINT_MODE" in
-      gre|vira7) WG_MTU="1280" ;;
+      gre) WG_MTU="$(wg_mtu_for_gre "$TUNNEL_ID")" ;;
+      wss-client|wss-server) WG_MTU="$WSS_DEFAULT_MTU" ;;
       *) WG_MTU="1420" ;;
     esac
   fi
@@ -2042,8 +2043,8 @@ wg_create_tunnel() {
   echo "[*] WireGuard MTU: ${WG_MTU:-1420}"
   if [ "${WG_ENDPOINT_MODE:-public}" = "gre" ]; then
     echo "[*] WireGuard transport: inside GRE interface ${WG_TRANSPORT_IFACE:-gre$TUNNEL_ID}"
-  elif [ "${WG_ENDPOINT_MODE:-public}" = "vira7" ]; then
-    echo "[*] WireGuard transport: inside Vira7 interface ${WG_TRANSPORT_IFACE:-vira7$TUNNEL_ID}"
+  elif [[ "${WG_ENDPOINT_MODE:-public}" == wss-* ]]; then
+    echo "[*] WireGuard transport: HTTPS/WebSocket service $(wss_service_name "$TUNNEL_ID")"
   fi
   echo
   echo "Your LOCAL WireGuard public key for tunnel $TUNNEL_ID:"
@@ -2120,13 +2121,9 @@ wg_choose_auto_endpoint() {
   local id="$1"
   local role="$2"
   local gre_ifc gre_remote_ip gre_ok
-  local vira_ifc vira_remote_ip vira_ok
-  local choice
 
   gre_ifc="$(wg_transport_iface "$id")"
   gre_remote_ip="$(gre_remote_inner_ip_for_role "$id" "$role")"
-  vira_ifc="$(vira7_iface_name "$id")"
-  vira_remote_ip="$(vira7_remote_inner_ip_for_role "$id" "$role")"
 
   WG_ENDPOINT_MODE="public"
   WG_ENDPOINT_IP="${REMOTE_PUBLIC_IP:-}"
@@ -2137,66 +2134,38 @@ wg_choose_auto_endpoint() {
     gre_ok=1
   fi
 
-  vira_ok=0
-  if ip link show "$vira_ifc" >/dev/null 2>&1; then
-    vira_ok=1
-  fi
-
-  if [ "$gre_ok" -eq 1 ] && [ "$vira_ok" -eq 1 ]; then
-    echo "Same-number GRE and Vira7 tunnels both exist."
-    echo "1) Use GRE as WireGuard transport ($gre_ifc -> $gre_remote_ip)"
-    echo "2) Use Vira7 as WireGuard transport ($vira_ifc -> $vira_remote_ip)"
-    echo "00) Back to main menu"
-    read -rp "Choose WireGuard transport [1-2] (00=menu): " choice
-    if is_main_menu_token "$choice"; then return_main_msg; return 99; fi
-    case "$choice" in
-      1) WG_ENDPOINT_MODE="gre"; WG_ENDPOINT_IP="$gre_remote_ip"; WG_TRANSPORT_IFACE="$gre_ifc"; return 0 ;;
-      2) WG_ENDPOINT_MODE="vira7"; WG_ENDPOINT_IP="$vira_remote_ip"; WG_TRANSPORT_IFACE="$vira_ifc"; return 0 ;;
-      *) warn_msg "Invalid transport choice. Using GRE by default."; WG_ENDPOINT_MODE="gre"; WG_ENDPOINT_IP="$gre_remote_ip"; WG_TRANSPORT_IFACE="$gre_ifc"; return 0 ;;
-    esac
-  fi
-
   if [ "$gre_ok" -eq 1 ]; then
     WG_ENDPOINT_MODE="gre"
     WG_ENDPOINT_IP="$gre_remote_ip"
     WG_TRANSPORT_IFACE="$gre_ifc"
     return 0
   fi
+}
 
-  if [ "$vira_ok" -eq 1 ]; then
-    WG_ENDPOINT_MODE="vira7"
-    WG_ENDPOINT_IP="$vira_remote_ip"
-    WG_TRANSPORT_IFACE="$vira_ifc"
-    return 0
-  fi
-
-  # Keep previous transport choice only if its interface still exists.
-  if [ "${WG_ENDPOINT_MODE:-public}" = "gre" ] && ip link show "$gre_ifc" >/dev/null 2>&1; then
-    WG_ENDPOINT_IP="$gre_remote_ip"
-    WG_TRANSPORT_IFACE="$gre_ifc"
-  elif [ "${WG_ENDPOINT_MODE:-public}" = "vira7" ] && ip link show "$vira_ifc" >/dev/null 2>&1; then
-    WG_ENDPOINT_IP="$vira_remote_ip"
-    WG_TRANSPORT_IFACE="$vira_ifc"
-  fi
+wg_mtu_for_gre() {
+  local id="$1" parent_mtu="" calculated
+  parent_mtu="$(ip -o link show dev "$(gre_iface "$id")" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="mtu") {print $(i+1); exit}}')"
+  [[ "$parent_mtu" =~ ^[0-9]+$ ]] || parent_mtu=1390
+  calculated=$((parent_mtu - 60))
+  [ "$calculated" -lt 1280 ] && calculated=1280
+  [ "$calculated" -gt 1420 ] && calculated=1420
+  echo "$calculated"
 }
 
 wg_menu_config_tunnel() {
   show_header "Configure WireGuard Tunnel"
   prompt_role || return
-  local selected_role existing_local_ip existing_remote_ip existing_peer_key remote_ip_input
+  local selected_role existing_local_ip existing_remote_ip existing_peer_key force_transport
   selected_role="$ROLE"
+  force_transport="${FORCE_WG_TRANSPORT:-auto}"
   echo
   prompt_tunnel_id "Enter WireGuard tunnel number before IP [1-254]: " || return
 
   existing_local_ip=""
   existing_remote_ip=""
   existing_peer_key=""
-  local previous_endpoint_mode previous_endpoint_ip previous_transport_iface gre_saved_remote vira_saved_remote
-  previous_endpoint_mode=""
-  previous_endpoint_ip=""
-  previous_transport_iface=""
+  local gre_saved_remote
   gre_saved_remote=""
-  vira_saved_remote=""
   local existing_wg_port
   existing_wg_port=""
   if wg_load_meta "$TUNNEL_ID"; then
@@ -2204,22 +2173,15 @@ wg_menu_config_tunnel() {
     existing_remote_ip="${REMOTE_PUBLIC_IP:-}"
     existing_peer_key="${REMOTE_WG_PUBLIC_KEY:-}"
     existing_wg_port="${LOCAL_WG_PORT:-}"
-    previous_endpoint_mode="${WG_ENDPOINT_MODE:-}"
-    previous_endpoint_ip="${WG_ENDPOINT_IP:-}"
-    previous_transport_iface="${WG_TRANSPORT_IFACE:-}"
   fi
   ROLE="$selected_role"
   REMOTE_WG_PUBLIC_KEY="$existing_peer_key"
 
-  # Try to reuse the remote public IP saved by same-number GRE or Vira7 tunnel.
+  # Reuse the remote public IP saved by a same-number GRE tunnel when available.
   # Run these in subshells so tunnel variables do not overwrite the selected WireGuard role.
   gre_saved_remote="$(bash -c 'set -e; f="'"$GRE_CONFIG_DIR""'/tunnel-'"$TUNNEL_ID""'.conf"; [ -f "$f" ] && . "$f" && printf "%s" "${REMOTE_PUBLIC_IP:-}"' 2>/dev/null || true)"
-  vira_saved_remote="$(bash -c 'set -e; f="'"$VIRA7_CONFIG_DIR""'/tunnel-'"$TUNNEL_ID""'.conf"; [ -f "$f" ] && . "$f" && printf "%s" "${REMOTE_PUBLIC_IP:-${remote_ip:-}}"' 2>/dev/null || true)"
   if [ -z "$existing_remote_ip" ] && [ -n "$gre_saved_remote" ]; then
     existing_remote_ip="$gre_saved_remote"
-  fi
-  if [ -z "$existing_remote_ip" ] && [ -n "$vira_saved_remote" ]; then
-    existing_remote_ip="$vira_saved_remote"
   fi
 
   echo
@@ -2243,26 +2205,33 @@ wg_menu_config_tunnel() {
   EXTRA_ALLOWED_IPS=""
 
   REMOTE_PUBLIC_IP="$existing_remote_ip"
-  WG_ENDPOINT_MODE="$previous_endpoint_mode"
-  WG_ENDPOINT_IP="$previous_endpoint_ip"
-  WG_TRANSPORT_IFACE="$previous_transport_iface"
-  wg_choose_auto_endpoint "$TUNNEL_ID" "$ROLE" || return
+  WG_ENDPOINT_MODE="public"
+  WG_ENDPOINT_IP=""
+  WG_TRANSPORT_IFACE=""
 
-  if [ "${WG_ENDPOINT_MODE:-public}" = "public" ]; then
+  if [ "$force_transport" = "wss" ]; then
     prompt_remote_public_ip "$existing_remote_ip" || return
-    WG_ENDPOINT_MODE="public"
-    WG_ENDPOINT_IP="$REMOTE_PUBLIC_IP"
-    WG_TRANSPORT_IFACE=""
+    wss_setup_for_wireguard "$TUNNEL_ID" "$ROLE" || return $?
   else
-    echo "Same-number ${WG_ENDPOINT_MODE} tunnel exists."
-    echo "WireGuard will automatically use ${WG_ENDPOINT_MODE} as transport to avoid public UDP/WireGuard blocking."
-    echo "No remote public IP is needed for the WireGuard endpoint in this mode."
-    # Keep the public IP in metadata if it was previously known, but do not require it for the endpoint.
-    REMOTE_PUBLIC_IP="${REMOTE_PUBLIC_IP:-$existing_remote_ip}"
+    # Do not leave an old WSS service running after changing this tunnel back
+    # to direct/GRE mode.
+    [ -f "$(wss_config_file "$TUNNEL_ID")" ] && wss_remove_one "$TUNNEL_ID" || true
+    wg_choose_auto_endpoint "$TUNNEL_ID" "$ROLE" || return
+    if [ "${WG_ENDPOINT_MODE:-public}" = "public" ]; then
+      prompt_remote_public_ip "$existing_remote_ip" || return
+      WG_ENDPOINT_MODE="public"
+      WG_ENDPOINT_IP="$REMOTE_PUBLIC_IP"
+      WG_TRANSPORT_IFACE=""
+    else
+      echo "Same-number GRE tunnel exists."
+      echo "WireGuard will use GRE as its transport for the fast path."
+      REMOTE_PUBLIC_IP="${REMOTE_PUBLIC_IP:-$existing_remote_ip}"
+    fi
   fi
 
   case "${WG_ENDPOINT_MODE:-public}" in
-    gre|vira7) WG_MTU="1280" ;;
+    gre) WG_MTU="$(wg_mtu_for_gre "$TUNNEL_ID")" ;;
+    wss-client|wss-server) WG_MTU="$WSS_DEFAULT_MTU" ;;
     *) WG_MTU="1420" ;;
   esac
 
@@ -2276,8 +2245,8 @@ wg_menu_config_tunnel() {
   echo "  MTU                    : $WG_MTU"
   if [ "${WG_ENDPOINT_MODE:-public}" = "gre" ]; then
     echo "  Transport interface    : ${WG_TRANSPORT_IFACE:-gre$TUNNEL_ID}"
-  elif [ "${WG_ENDPOINT_MODE:-public}" = "vira7" ]; then
-    echo "  Transport interface    : ${WG_TRANSPORT_IFACE:-vira7$TUNNEL_ID}"
+  elif [[ "${WG_ENDPOINT_MODE:-public}" == wss-* ]]; then
+    echo "  WSS service            : $(wss_service_name "$TUNNEL_ID")"
   fi
   echo "  AllowedIPs             : peer /32 only"
   if [ -n "$REMOTE_WG_PUBLIC_KEY" ]; then
@@ -2317,7 +2286,8 @@ wg_check_one_tunnel() {
     echo "Endpoint mode       : ${WG_ENDPOINT_MODE:-public}"
     echo "Remote endpoint     : ${WG_ENDPOINT_IP:-${REMOTE_PUBLIC_IP:-unknown}}:${REMOTE_WG_PORT:-$(wg_default_port "$id")}" 
     case "${WG_ENDPOINT_MODE:-public}" in
-      gre|vira7) echo "Transport interface : ${WG_TRANSPORT_IFACE:-}" ;;
+      gre) echo "Transport interface : ${WG_TRANSPORT_IFACE:-}" ;;
+      wss-client|wss-server) echo "WSS transport      : $(wss_service_name "$id")" ;;
     esac
     echo "Local UDP port      : ${LOCAL_WG_PORT:-$(wg_default_port "$id")}" 
     echo "WireGuard MTU       : ${WG_MTU:-unknown}" 
@@ -2368,8 +2338,10 @@ wg_check_one_tunnel() {
         echo "[WARN] WireGuard inner ping failed"
         last="$(wg show "$ifc" latest-handshakes 2>/dev/null | awk 'NR==1{print $2}' || true)"
         if [ -z "$last" ] || [ "$last" = "0" ]; then
-          if [ "${WG_ENDPOINT_MODE:-public}" = "gre" ] || [ "${WG_ENDPOINT_MODE:-public}" = "vira7" ]; then
+          if [ "${WG_ENDPOINT_MODE:-public}" = "gre" ]; then
             echo "Diagnosis: no WireGuard handshake yet. WireGuard is using ${WG_ENDPOINT_MODE} transport. Check that transport tunnel $id still pings, the peer public key is correct, and UDP $(wg_default_port "$id") is allowed over ${WG_TRANSPORT_IFACE:-transport interface} on both servers."
+          elif [[ "${WG_ENDPOINT_MODE:-public}" == wss-* ]]; then
+            echo "Diagnosis: no WireGuard handshake yet. Check $(wss_service_name "$id"), the WSS path secret/TCP port on both servers, and the remote public IP."
           else
             echo "Diagnosis: no WireGuard handshake yet. Check the peer public key, remote public IP, UDP port $(wg_default_port "$id"), and firewall/NAT on both servers. If public UDP/WireGuard is blocked but GRE works, re-run create/update after GRE is up; v6 will auto-use GRE as WireGuard transport."
           fi
@@ -2502,7 +2474,7 @@ wg_install_service() {
   if wg_load_meta "$id"; then
     case "${WG_ENDPOINT_MODE:-public}" in
       gre) transport_after="gre-tunnel@$id.service" ;;
-      vira7) transport_after="vira7-tunnel@$id.service" ;;
+      wss-client|wss-server) transport_after="$(wss_service_name "$id")" ;;
     esac
   fi
   if [ -n "$transport_after" ]; then
@@ -2638,7 +2610,9 @@ wg_apply_firewall_rules() {
     transport_ifc="${WG_TRANSPORT_IFACE:-}"
   fi
 
-  firewall_allow_udp_port_and_ip "WireGuard tunnel $id" "$port" "$endpoint_ip" "${remote_port:-$port}" "$ifc"
+  if [[ "$endpoint_mode" != wss-* ]]; then
+    firewall_allow_udp_port_and_ip "WireGuard tunnel $id" "$port" "$endpoint_ip" "${remote_port:-$port}" "$ifc"
+  fi
   if wg_load_meta "$id"; then
     firewall_allow_ip_peer "WireGuard tunnel $id remote inner" "${REMOTE_WG_IP:-}" "$ifc"
     firewall_allow_ip_peer "WireGuard tunnel $id remote public" "${REMOTE_PUBLIC_IP:-}" "$ifc"
@@ -2651,13 +2625,15 @@ wg_apply_firewall_rules() {
   done
 
   if command -v iptables >/dev/null 2>&1; then
-    iptables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || iptables -A INPUT -p udp --dport "$port" -j ACCEPT || true
+    if [[ "$endpoint_mode" != wss-* ]]; then
+      iptables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || iptables -A INPUT -p udp --dport "$port" -j ACCEPT || true
+    fi
     iptables -C INPUT -i "$ifc" -j ACCEPT 2>/dev/null || iptables -A INPUT -i "$ifc" -j ACCEPT || true
     iptables -C OUTPUT -o "$ifc" -j ACCEPT 2>/dev/null || iptables -A OUTPUT -o "$ifc" -j ACCEPT || true
     if [ -n "$endpoint_ip" ] && [ -n "$remote_port" ]; then
       iptables -C OUTPUT -p udp -d "$endpoint_ip" --dport "$remote_port" -j ACCEPT 2>/dev/null || iptables -A OUTPUT -p udp -d "$endpoint_ip" --dport "$remote_port" -j ACCEPT || true
     fi
-    if { [ "$endpoint_mode" = "gre" ] || [ "$endpoint_mode" = "vira7" ]; } && [ -n "$transport_ifc" ]; then
+    if [ "$endpoint_mode" = "gre" ] && [ -n "$transport_ifc" ]; then
       iptables -C INPUT -i "$transport_ifc" -p udp --dport "$port" -j ACCEPT 2>/dev/null || iptables -A INPUT -i "$transport_ifc" -p udp --dport "$port" -j ACCEPT || true
       if [ -n "$endpoint_ip" ]; then
         iptables -C OUTPUT -o "$transport_ifc" -p udp -d "$endpoint_ip" --dport "$remote_port" -j ACCEPT 2>/dev/null || iptables -A OUTPUT -o "$transport_ifc" -p udp -d "$endpoint_ip" --dport "$remote_port" -j ACCEPT || true
@@ -2666,17 +2642,21 @@ wg_apply_firewall_rules() {
   fi
 
   if command -v ufw >/dev/null 2>&1; then
-    ufw allow "$port/udp" comment "wgtun$id" >/dev/null 2>&1 || true
+    if [[ "$endpoint_mode" != wss-* ]]; then
+      ufw allow "$port/udp" comment "wgtun$id" >/dev/null 2>&1 || true
+    fi
     ufw allow in on "$ifc" >/dev/null 2>&1 || true
-    if { [ "$endpoint_mode" = "gre" ] || [ "$endpoint_mode" = "vira7" ]; } && [ -n "$transport_ifc" ]; then
+    if [ "$endpoint_mode" = "gre" ] && [ -n "$transport_ifc" ]; then
       ufw allow in on "$transport_ifc" to any port "$port" proto udp >/dev/null 2>&1 || true
     fi
   fi
 
   if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-    firewall-cmd --permanent --add-port="$port/udp" >/dev/null 2>&1 || true
+    if [[ "$endpoint_mode" != wss-* ]]; then
+      firewall-cmd --permanent --add-port="$port/udp" >/dev/null 2>&1 || true
+    fi
     firewall-cmd --permanent --add-interface="$ifc" >/dev/null 2>&1 || true
-    if { [ "$endpoint_mode" = "gre" ] || [ "$endpoint_mode" = "vira7" ]; } && [ -n "$transport_ifc" ]; then
+    if [ "$endpoint_mode" = "gre" ] && [ -n "$transport_ifc" ]; then
       firewall-cmd --permanent --add-interface="$transport_ifc" >/dev/null 2>&1 || true
     fi
     firewall-cmd --reload >/dev/null 2>&1 || true
@@ -2737,12 +2717,13 @@ wg_remove_firewall_rules() {
 
 wg_remove_one_tunnel() {
   local id="$1"
-  local ifc conf meta private public
+  local ifc conf meta private public endpoint_mode=""
   ifc="$(wg_iface_name "$id")"
   conf="$(wg_config_file "$id")"
   meta="$(wg_meta_file "$id")"
   private="$(wg_private_key_file "$id")"
   public="$(wg_public_key_file "$id")"
+  if wg_load_meta "$id"; then endpoint_mode="${WG_ENDPOINT_MODE:-}"; fi
 
   echo "Removing WireGuard tunnel $id ($ifc)..."
 
@@ -2753,6 +2734,9 @@ wg_remove_one_tunnel() {
   # Safe cleanup only for this WireGuard tunnel. Do not touch the main route table.
   wg_safe_cleanup_runtime "$id" >/dev/null 2>&1 || true
   wg_remove_firewall_rules "$id"
+  if [[ "$endpoint_mode" == wss-* ]] || [ -f "$(wss_config_file "$id")" ]; then
+    wss_remove_one "$id"
+  fi
 
   rm -rf "/etc/systemd/system/wg-quick@$ifc.service.d"
   rm -f "$conf" "$meta" "$private" "$public"
@@ -2794,1506 +2778,333 @@ wg_remove_menu() {
 }
 
 # -----------------------------
-# Vira7 UDP-TUN helpers (type only, no Vira7 menu/status/log UI)
+# WSTunnel HTTPS/WebSocket transport for WireGuard
 # -----------------------------
-vira7_iface_name() {
-  echo "${VIRA7_IFACE_PREFIX}$1"
+wss_config_file() { echo "$WSS_CONFIG_DIR/tunnel-$1.conf"; }
+wss_service_name() { echo "gretun-wss@$1.service"; }
+wss_default_local_udp_port() { echo $((WSS_LOCAL_UDP_BASE + $1)); }
+
+wss_collect_ids() {
+  local f id
+  [ -d "$WSS_CONFIG_DIR" ] || return 0
+  for f in "$WSS_CONFIG_DIR"/tunnel-*.conf; do
+    [ -e "$f" ] || continue
+    id="${f##*/tunnel-}"; id="${id%.conf}"
+    validate_tunnel_id "$id" && echo "$id"
+  done | sort -n -u
 }
 
-vira7_config_file() {
-  echo "$VIRA7_CONFIG_DIR/tunnel-$1.conf"
-}
-
-vira7_service_name() {
-  echo "vira7-tunnel@$1.service"
-}
-
-vira7_default_port() {
-  local id="$1"
-  echo $((VIRA7_DEFAULT_PORT_BASE + id))
-}
-
-vira7_inner_ip_for_role() {
-  local id="$1"
-  local role="$2"
-  if [ "$role" = "1" ]; then
-    echo "10.71.$id.1"
-  else
-    echo "10.71.$id.2"
-  fi
-}
-
-vira7_remote_inner_ip_for_role() {
-  local id="$1"
-  local role="$2"
-  if [ "$role" = "1" ]; then
-    echo "10.71.$id.2"
-  else
-    echo "10.71.$id.1"
-  fi
-}
-
-vira7_ensure_deps() {
-  if command -v gcc >/dev/null 2>&1 && command -v ip >/dev/null 2>&1; then
-    return 0
-  fi
-  echo "Installing Vira7 build/runtime dependencies..."
-  if command -v apt-get >/dev/null 2>&1; then
-    apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential gcc iproute2 iptables kmod
-  elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y gcc make iproute iptables kmod
-  elif command -v yum >/dev/null 2>&1; then
-    yum install -y gcc make iproute iptables kmod
-  else
-    echo "No supported package manager found. Install gcc, iproute2, iptables and kmod manually." >&2
-    return 1
-  fi
-}
-
-vira7_compile_engine() {
-  vira7_ensure_deps || return 1
-  mkdir -p "$VIRA7_CONFIG_DIR"
-  cat > "$VIRA7_SOURCE" <<'ENGINEEOF'
-#include <arpa/inet.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <linux/if_tun.h>
-#include <net/if.h>
-#include <netinet/in.h>
-#include <signal.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/ioctl.h>
-#include <sys/select.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <time.h>
-#include <unistd.h>
-
-#define TUN_DEVICE "/dev/net/tun"
-#define MAX_PKT_SIZE 2000
-#define VIRA7_MAGIC 0x5637
-#define PKT_DATA 1
-#define PKT_KEEPALIVE 2
-#define PKT_ACK 3
-
-typedef struct __attribute__((packed)) {
-    uint16_t magic;
-    uint16_t type;
-    uint32_t seq;
-    uint16_t length;
-    uint16_t checksum;
-} v7_hdr_t;
-
-typedef struct {
-    char iface[IFNAMSIZ];
-    char mode[16];
-    char bind_ip[64];
-    char remote_ip[64];
-    char local_priv[64];
-    char remote_priv[64];
-    int port;
-    int mtu;
-    int keepalive;
-    int buffer_size;
-    int queue_len;
-    int checksum;
-    int verify_checksum;
-    int batch;
-} v7_config_t;
-
-static volatile sig_atomic_t running = 1;
-static uint32_t seqno = 1;
-static int g_send_checksum = 1;
-static int g_verify_checksum = 0;
-
-static void on_signal(int sig) { (void)sig; running = 0; }
-
-static void trim(char *s) {
-    char *p = s;
-    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
-    if (p != s) memmove(s, p, strlen(p) + 1);
-    size_t n = strlen(s);
-    while (n && (s[n-1] == ' ' || s[n-1] == '\t' || s[n-1] == '\r' || s[n-1] == '\n')) s[--n] = 0;
-}
-
-static uint16_t csum16(const uint8_t *buf, size_t len) {
-    uint32_t sum = 0;
-    for (size_t i = 0; i < len; i++) {
-        sum += buf[i];
-        sum = (sum & 0xffffU) + (sum >> 16);
-    }
-    return (uint16_t)(~sum & 0xffffU);
-}
-
-static int load_config(const char *path, v7_config_t *c) {
-    memset(c, 0, sizeof(*c));
-    snprintf(c->iface, sizeof(c->iface), "vira7");
-    snprintf(c->mode, sizeof(c->mode), "client");
-    c->port = 5571;
-    c->mtu = 1400;
-    c->keepalive = 5;
-    c->buffer_size = 2097152;
-    c->queue_len = 1000;
-    c->checksum = 1;
-    c->verify_checksum = 0;
-    c->batch = 128;
-
-    FILE *f = fopen(path, "r");
-    if (!f) return -1;
-    char line[512];
-    while (fgets(line, sizeof(line), f)) {
-        trim(line);
-        if (!line[0] || line[0] == '#') continue;
-        char *eq = strchr(line, '=');
-        if (!eq) continue;
-        *eq = 0;
-        char *key = line;
-        char *val = eq + 1;
-        trim(key);
-        trim(val);
-        if (!strcmp(key, "iface")) snprintf(c->iface, sizeof(c->iface), "%s", val);
-        else if (!strcmp(key, "mode")) snprintf(c->mode, sizeof(c->mode), "%s", val);
-        else if (!strcmp(key, "bind_ip")) snprintf(c->bind_ip, sizeof(c->bind_ip), "%s", val);
-        else if (!strcmp(key, "remote_ip")) snprintf(c->remote_ip, sizeof(c->remote_ip), "%s", val);
-        else if (!strcmp(key, "local_priv")) snprintf(c->local_priv, sizeof(c->local_priv), "%s", val);
-        else if (!strcmp(key, "remote_priv")) snprintf(c->remote_priv, sizeof(c->remote_priv), "%s", val);
-        else if (!strcmp(key, "port")) c->port = atoi(val);
-        else if (!strcmp(key, "mtu")) c->mtu = atoi(val);
-        else if (!strcmp(key, "keepalive")) c->keepalive = atoi(val);
-        else if (!strcmp(key, "buffer_size")) c->buffer_size = atoi(val);
-        else if (!strcmp(key, "queue_len")) c->queue_len = atoi(val);
-        else if (!strcmp(key, "checksum")) c->checksum = atoi(val);
-        else if (!strcmp(key, "verify_checksum")) c->verify_checksum = atoi(val);
-        else if (!strcmp(key, "batch")) c->batch = atoi(val);
-    }
-    fclose(f);
-    if (!c->local_priv[0] || !c->remote_priv[0] || c->port <= 0 || c->port > 65535) return -1;
-    if (!strcmp(c->mode, "client") && !c->remote_ip[0]) return -1;
-    if (c->mtu < 576 || c->mtu > 1600) c->mtu = 1400;
-    if (c->keepalive < 1 || c->keepalive > 60) c->keepalive = 5;
-    if (c->queue_len < 100) c->queue_len = 1000;
-    if (c->buffer_size < 65536) c->buffer_size = 2097152;
-    c->checksum = c->checksum ? 1 : 0;
-    c->verify_checksum = c->verify_checksum ? 1 : 0;
-    if (c->batch < 1) c->batch = 1;
-    if (c->batch > 512) c->batch = 512;
-    return 0;
-}
-
-static int tun_alloc_named(const char *dev) {
-    struct ifreq ifr;
-    int fd = open(TUN_DEVICE, O_RDWR);
-    if (fd < 0) return -1;
-    memset(&ifr, 0, sizeof(ifr));
-    ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
-    snprintf(ifr.ifr_name, IFNAMSIZ, "%s", dev);
-    if (ioctl(fd, TUNSETIFF, &ifr) < 0) { close(fd); return -1; }
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-    return fd;
-}
-
-static void cleanup_iface(const char *iface) {
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "ip link del %s 2>/dev/null", iface);
-    system(cmd);
-}
-
-static int configure_tun(const v7_config_t *c) {
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "ip link set dev %s up mtu %d txqueuelen %d", c->iface, c->mtu, c->queue_len);
-    if (system(cmd) != 0) return -1;
-    snprintf(cmd, sizeof(cmd), "ip addr add %s/32 peer %s dev %s 2>/dev/null || true", c->local_priv, c->remote_priv, c->iface);
-    return system(cmd) == 0 ? 0 : -1;
-}
-
-static int udp_socket_create(const v7_config_t *c) {
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) return -1;
-    int yes = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &c->buffer_size, sizeof(c->buffer_size));
-    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &c->buffer_size, sizeof(c->buffer_size));
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons((uint16_t)c->port);
-    if (c->bind_ip[0]) {
-        if (inet_pton(AF_INET, c->bind_ip, &addr.sin_addr) != 1) { close(fd); return -1; }
-    } else {
-        addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    }
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) { close(fd); return -1; }
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-    return fd;
-}
-
-static int send_v7(int fd, const struct sockaddr_in *dst, uint16_t type, const uint8_t *payload, uint16_t len) {
-    uint8_t buf[sizeof(v7_hdr_t) + MAX_PKT_SIZE];
-    if (len > MAX_PKT_SIZE) return -1;
-    v7_hdr_t *h = (v7_hdr_t *)buf;
-    h->magic = htons(VIRA7_MAGIC);
-    h->type = htons(type);
-    h->seq = htonl(seqno++);
-    h->length = htons(len);
-    h->checksum = 0;
-    if (payload && len) memcpy(buf + sizeof(v7_hdr_t), payload, len);
-    if (g_send_checksum) {
-        h->checksum = htons(csum16(buf, sizeof(v7_hdr_t) + len));
-    } else {
-        h->checksum = 0;
-    }
-    ssize_t n = sendto(fd, buf, sizeof(v7_hdr_t) + len, 0, (const struct sockaddr *)dst, sizeof(*dst));
-    return n == (ssize_t)(sizeof(v7_hdr_t) + len) ? 0 : -1;
-}
-
-static int verify_packet(uint8_t *buf, ssize_t n, uint16_t *type, uint8_t **payload, uint16_t *len) {
-    if (n < (ssize_t)sizeof(v7_hdr_t)) return -1;
-    v7_hdr_t *h = (v7_hdr_t *)buf;
-    if (ntohs(h->magic) != VIRA7_MAGIC) return -1;
-    *len = ntohs(h->length);
-    if ((ssize_t)(sizeof(v7_hdr_t) + *len) != n || *len > MAX_PKT_SIZE) return -1;
-    uint16_t got = ntohs(h->checksum);
-    if (got != 0 && g_verify_checksum) {
-        h->checksum = 0;
-        uint16_t calc = csum16(buf, (size_t)n);
-        if (got != calc) return -1;
-    }
-    *type = ntohs(h->type);
-    *payload = buf + sizeof(v7_hdr_t);
-    return 0;
-}
-
-int main(int argc, char **argv) {
-    if (argc < 2 || getuid() != 0) return 1;
-    v7_config_t cfg;
-    if (load_config(argv[1], &cfg) != 0) return 1;
-    g_send_checksum = cfg.checksum ? 1 : 0;
-    g_verify_checksum = cfg.verify_checksum ? 1 : 0;
-    signal(SIGINT, on_signal);
-    signal(SIGTERM, on_signal);
-    signal(SIGPIPE, SIG_IGN);
-    mkdir("/dev/net", 0755);
-    if (access(TUN_DEVICE, F_OK) != 0) system("mknod /dev/net/tun c 10 200 2>/dev/null || true");
-    system("modprobe tun 2>/dev/null || true");
-    cleanup_iface(cfg.iface);
-    int tun_fd = tun_alloc_named(cfg.iface);
-    if (tun_fd < 0) return 1;
-    if (configure_tun(&cfg) != 0) { cleanup_iface(cfg.iface); close(tun_fd); return 1; }
-    int udp_fd = udp_socket_create(&cfg);
-    if (udp_fd < 0) { cleanup_iface(cfg.iface); close(tun_fd); return 1; }
-
-    struct sockaddr_in remote;
-    memset(&remote, 0, sizeof(remote));
-    remote.sin_family = AF_INET;
-    remote.sin_port = htons((uint16_t)cfg.port);
-    int remote_known = 0;
-    if (!strcmp(cfg.mode, "client")) {
-        if (inet_pton(AF_INET, cfg.remote_ip, &remote.sin_addr) != 1) {
-            close(udp_fd); close(tun_fd); cleanup_iface(cfg.iface); return 1;
-        }
-        remote_known = 1;
-    }
-
-    char pidfile[128];
-    snprintf(pidfile, sizeof(pidfile), "/var/run/%s.pid", cfg.iface);
-    FILE *pf = fopen(pidfile, "w");
-    if (pf) { fprintf(pf, "%d\n", getpid()); fclose(pf); }
-
-    uint8_t tun_buf[MAX_PKT_SIZE];
-    uint8_t udp_buf[sizeof(v7_hdr_t) + MAX_PKT_SIZE];
-    time_t last_keepalive = 0;
-
-    while (running) {
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(tun_fd, &rfds);
-        FD_SET(udp_fd, &rfds);
-        int maxfd = tun_fd > udp_fd ? tun_fd : udp_fd;
-        struct timeval tv = {1, 0};
-        int rc = select(maxfd + 1, &rfds, NULL, NULL, &tv);
-        if (rc < 0) { if (errno == EINTR) continue; break; }
-        time_t now = time(NULL);
-        if (remote_known && now - last_keepalive >= cfg.keepalive) {
-            send_v7(udp_fd, &remote, PKT_KEEPALIVE, NULL, 0);
-            last_keepalive = now;
-        }
-        if (FD_ISSET(tun_fd, &rfds)) {
-            for (int i = 0; i < cfg.batch; i++) {
-                ssize_t n = read(tun_fd, tun_buf, sizeof(tun_buf));
-                if (n > 0) {
-                    if (remote_known) send_v7(udp_fd, &remote, PKT_DATA, tun_buf, (uint16_t)n);
-                    continue;
-                }
-                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
-                break;
-            }
-        }
-        if (FD_ISSET(udp_fd, &rfds)) {
-            for (int i = 0; i < cfg.batch; i++) {
-                struct sockaddr_in sender;
-                socklen_t slen = sizeof(sender);
-                ssize_t n = recvfrom(udp_fd, udp_buf, sizeof(udp_buf), 0, (struct sockaddr *)&sender, &slen);
-                if (n < 0) {
-                    if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-                    break;
-                }
-                if (n == 0) break;
-                uint16_t type, len;
-                uint8_t *payload;
-                if (verify_packet(udp_buf, n, &type, &payload, &len) != 0) continue;
-                if (strcmp(cfg.mode, "server") == 0) {
-                    memcpy(&remote, &sender, sizeof(remote));
-                    remote_known = 1;
-                }
-                if (type == PKT_DATA && len > 0) write(tun_fd, payload, len);
-                else if (type == PKT_KEEPALIVE && remote_known) send_v7(udp_fd, &remote, PKT_ACK, NULL, 0);
-            }
-        }
-    }
-    close(udp_fd);
-    close(tun_fd);
-    unlink(pidfile);
-    cleanup_iface(cfg.iface);
-    return 0;
-}
-ENGINEEOF
-  gcc -O3 -flto -Wall -Wextra -o "$VIRA7_BINARY" "$VIRA7_SOURCE" 2>/dev/null || \
-    gcc -O3 -Wall -Wextra -o "$VIRA7_BINARY" "$VIRA7_SOURCE"
-  chmod 755 "$VIRA7_BINARY"
-}
-
-vira7_write_service_template() {
-  cat > "$VIRA7_SERVICE_TEMPLATE" <<EOF_SERVICE
-[Unit]
-Description=Vira7 UDP-TUN Tunnel %i Service
-After=network-online.target
-Wants=network-online.target
-StartLimitIntervalSec=0
-
-[Service]
-Type=simple
-ExecStartPre=/bin/bash $INSTALL_BIN --service firewall-vira7 %i
-ExecStart=/bin/bash $INSTALL_BIN --service run-vira7-logged %i
-Restart=always
-RestartSec=3
-LimitNOFILE=65535
-StandardOutput=append:$DIAG_SERVICE_LOG
-StandardError=append:$DIAG_SERVICE_LOG
-
-[Install]
-WantedBy=multi-user.target
-EOF_SERVICE
-  systemctl daemon-reload
-}
-
-vira7_save_config() {
-  mkdir -p "$VIRA7_CONFIG_DIR"
-  local file
-  file="$(vira7_config_file "$TUNNEL_ID")"
-  {
-    # Shell metadata used by this manager.
-    write_var TUNNEL_TYPE "vira7"
-    write_var TUNNEL_ID "$TUNNEL_ID"
-    write_var VIRA7_IFACE "$VIRA7_IFACE"
-    write_var ROLE "$ROLE"
-    write_var SERVER_ROLE "$SERVER_ROLE"
-    write_var LOCAL_PUBLIC_IP "$LOCAL_PUBLIC_IP"
-    write_var REMOTE_PUBLIC_IP "$REMOTE_PUBLIC_IP"
-    write_var LOCAL_VIRA7_IP "$LOCAL_VIRA7_IP"
-    write_var REMOTE_VIRA7_IP "$REMOTE_VIRA7_IP"
-    write_var VIRA7_PORT "$VIRA7_PORT"
-    write_var VIRA7_MTU "$VIRA7_MTU"
-    write_var VIRA7_CHECKSUM "${VIRA7_CHECKSUM:-$VIRA7_DEFAULT_CHECKSUM}"
-    write_var VIRA7_VERIFY_CHECKSUM "${VIRA7_VERIFY_CHECKSUM:-$VIRA7_DEFAULT_VERIFY_CHECKSUM}"
-    write_var VIRA7_BATCH "${VIRA7_BATCH:-$VIRA7_DEFAULT_BATCH}"
-    echo
-    # Engine config used directly by vira7-engine systemd service.
-    printf 'iface=%s
-' "$VIRA7_IFACE"
-    printf 'mode=%s
-' "$VIRA7_MODE"
-    printf 'bind_ip=%s
-' "$LOCAL_PUBLIC_IP"
-    printf 'remote_ip=%s
-' "$REMOTE_PUBLIC_IP"
-    printf 'local_priv=%s
-' "$LOCAL_VIRA7_IP"
-    printf 'remote_priv=%s
-' "$REMOTE_VIRA7_IP"
-    printf 'port=%s
-' "$VIRA7_PORT"
-    printf 'mtu=%s
-' "$VIRA7_MTU"
-    printf 'keepalive=%s
-' "$VIRA7_DEFAULT_KEEPALIVE"
-    printf 'buffer_size=%s
-' "$VIRA7_DEFAULT_BUFFER_SIZE"
-    printf 'queue_len=%s
-' "$VIRA7_DEFAULT_QUEUE_LEN"
-    printf 'checksum=%s
-' "${VIRA7_CHECKSUM:-$VIRA7_DEFAULT_CHECKSUM}"
-    printf 'verify_checksum=%s
-' "${VIRA7_VERIFY_CHECKSUM:-$VIRA7_DEFAULT_VERIFY_CHECKSUM}"
-    printf 'batch=%s
-' "${VIRA7_BATCH:-$VIRA7_DEFAULT_BATCH}"
-  } > "$file"
-  chmod 600 "$file"
-  echo "Saved Vira7 tunnel $TUNNEL_ID configuration to $file"
-}
-
-vira7_load_config() {
-  local id="${1:-${TUNNEL_ID:-}}"
+wss_load_config() {
+  local id="$1" file
   validate_tunnel_id "$id" || return 1
-  local file
-  file="$(vira7_config_file "$id")"
+  file="$(wss_config_file "$id")"
   [ -f "$file" ] || return 1
+  unset WSS_MODE WSS_BIND_PORT WSS_REMOTE_IP WSS_REMOTE_PORT WSS_LOCAL_UDP_PORT WSS_TARGET_UDP_PORT WSS_PATH_SECRET
   # shellcheck disable=SC1090
   source "$file"
-  TUNNEL_ID="$id"
-  VIRA7_IFACE="${VIRA7_IFACE:-${iface:-$(vira7_iface_name "$id")}}"
-  LOCAL_PUBLIC_IP="${LOCAL_PUBLIC_IP:-${bind_ip:-}}"
-  REMOTE_PUBLIC_IP="${REMOTE_PUBLIC_IP:-${remote_ip:-}}"
-  LOCAL_VIRA7_IP="${LOCAL_VIRA7_IP:-${local_priv:-}}"
-  REMOTE_VIRA7_IP="${REMOTE_VIRA7_IP:-${remote_priv:-}}"
-  VIRA7_PORT="${VIRA7_PORT:-${port:-$(vira7_default_port "$id")}}"
-  VIRA7_MTU="${VIRA7_MTU:-${mtu:-$VIRA7_DEFAULT_MTU}}"
-  VIRA7_CHECKSUM="${VIRA7_CHECKSUM:-${checksum:-$VIRA7_DEFAULT_CHECKSUM}}"
-  VIRA7_VERIFY_CHECKSUM="${VIRA7_VERIFY_CHECKSUM:-${verify_checksum:-$VIRA7_DEFAULT_VERIFY_CHECKSUM}}"
-  VIRA7_BATCH="${VIRA7_BATCH:-${batch:-$VIRA7_DEFAULT_BATCH}}"
-  if [ -z "${ROLE:-}" ]; then
-    if [ "${LOCAL_VIRA7_IP:-}" = "10.71.$id.1" ]; then ROLE="1"; else ROLE="2"; fi
+  [ "${WSS_TUNNEL_ID:-}" = "$id" ] || return 1
+  case "${WSS_MODE:-}" in server|client) ;; *) return 1 ;; esac
+  validate_port "${WSS_BIND_PORT:-${WSS_REMOTE_PORT:-}}" || return 1
+  validate_port "${WSS_TARGET_UDP_PORT:-}" || return 1
+  if [ "$WSS_MODE" = "client" ]; then
+    validate_ipv4 "${WSS_REMOTE_IP:-}" || return 1
+    validate_port "${WSS_LOCAL_UDP_PORT:-}" || return 1
   fi
+  wss_validate_secret "${WSS_PATH_SECRET:-}"
 }
 
-vira7_write_engine_config() {
-  local id="$1"
-  local file
-  file="$(vira7_config_file "$id")"
-  mkdir -p "$VIRA7_CONFIG_DIR"
-  cat > "$file" <<EOF_CONF
-iface=$VIRA7_IFACE
-mode=$VIRA7_MODE
-bind_ip=$LOCAL_PUBLIC_IP
-remote_ip=$REMOTE_PUBLIC_IP
-local_priv=$LOCAL_VIRA7_IP
-remote_priv=$REMOTE_VIRA7_IP
-port=$VIRA7_PORT
-mtu=$VIRA7_MTU
-keepalive=$VIRA7_DEFAULT_KEEPALIVE
-buffer_size=$VIRA7_DEFAULT_BUFFER_SIZE
-queue_len=$VIRA7_DEFAULT_QUEUE_LEN
-checksum=${VIRA7_CHECKSUM:-$VIRA7_DEFAULT_CHECKSUM}
-verify_checksum=${VIRA7_VERIFY_CHECKSUM:-$VIRA7_DEFAULT_VERIFY_CHECKSUM}
-batch=${VIRA7_BATCH:-$VIRA7_DEFAULT_BATCH}
-EOF_CONF
-  chmod 600 "$file"
-}
-
-vira7_apply_firewall_rules() {
-  local id="$1"
-  if ! vira7_load_config "$id"; then return 1; fi
-  firewall_allow_udp_port_and_ip "Vira7 tunnel $id" "$VIRA7_PORT" "$REMOTE_PUBLIC_IP" "$VIRA7_PORT" "$VIRA7_IFACE"
-  firewall_allow_ip_peer "Vira7 tunnel $id remote inner" "${REMOTE_VIRA7_IP:-${remote_priv:-}}" "$VIRA7_IFACE"
-  firewall_allow_ip_peer "Vira7 tunnel $id remote public" "$REMOTE_PUBLIC_IP" "$VIRA7_IFACE"
-}
-
-vira7_install_service() {
-  local id="${1:-${TUNNEL_ID:-}}"
-  validate_tunnel_id "$id" || return 1
-  command -v systemctl >/dev/null 2>&1 || return 1
-  [ -x "$VIRA7_BINARY" ] || vira7_compile_engine || return 1
-  mkdir -p "$(dirname "$INSTALL_BIN")"
-  if ! install_manager_binary; then
-    echo "Failed to install the persistent manager copy at $INSTALL_BIN" >&2
-    return 1
-  fi
-  install_health_monitor
-  vira7_write_service_template
-  systemctl enable "$(vira7_service_name "$id")" || return 1
-  if systemctl restart "$(vira7_service_name "$id")"; then
-    echo "Vira7 service enabled and started ($(vira7_service_name "$id"))"
-    return 0
-  fi
-  systemctl status "$(vira7_service_name "$id")" --no-pager -l 2>/dev/null || true
-  journalctl -u "$(vira7_service_name "$id")" -n 30 --no-pager 2>/dev/null || true
-  return 1
-}
-
-vira7_create_tunnel() {
-  local interactive=${1:-0}
-  validate_tunnel_id "${TUNNEL_ID:-}" || { echo "Invalid tunnel number." >&2; return 1; }
-  VIRA7_IFACE="$(vira7_iface_name "$TUNNEL_ID")"
-  LOCAL_PUBLIC_IP="${LOCAL_PUBLIC_IP:-$(detect_local_public_ip)}"
-  [ -n "${LOCAL_PUBLIC_IP:-}" ] || { echo "Failed to detect local public IPv4" >&2; return 1; }
-  if ! local_ipv4_is_assigned "$LOCAL_PUBLIC_IP"; then
-    echo "Selected Vira7 bind IP is not assigned on this server: $LOCAL_PUBLIC_IP" >&2
-    list_local_ipv4s >&2
-    return 1
-  fi
-  if [ "$ROLE" = "1" ]; then
-    SERVER_ROLE="IRAN"
-    VIRA7_MODE="server"
-    LOCAL_VIRA7_IP="10.71.$TUNNEL_ID.1"
-    REMOTE_VIRA7_IP="10.71.$TUNNEL_ID.2"
-  else
-    SERVER_ROLE="KHAREJ"
-    VIRA7_MODE="client"
-    LOCAL_VIRA7_IP="10.71.$TUNNEL_ID.2"
-    REMOTE_VIRA7_IP="10.71.$TUNNEL_ID.1"
-  fi
-  VIRA7_PORT="${VIRA7_PORT:-$(vira7_default_port "$TUNNEL_ID")}" 
-  VIRA7_MTU="${VIRA7_MTU:-$VIRA7_DEFAULT_MTU}"
-  VIRA7_CHECKSUM="${VIRA7_CHECKSUM:-$VIRA7_DEFAULT_CHECKSUM}"
-  VIRA7_VERIFY_CHECKSUM="${VIRA7_VERIFY_CHECKSUM:-$VIRA7_DEFAULT_VERIFY_CHECKSUM}"
-  VIRA7_BATCH="${VIRA7_BATCH:-$VIRA7_DEFAULT_BATCH}"
-
-  echo "[*] Local server public IP: $LOCAL_PUBLIC_IP"
-  echo "[*] Tunnel type: Vira7 UDP-TUN"
-  echo "[*] Tunnel number: $TUNNEL_ID"
-  echo "[*] Interface: $VIRA7_IFACE"
-  echo "[*] Server role: $SERVER_ROLE"
-  echo "[*] Remote server public IP: $REMOTE_PUBLIC_IP"
-  echo "[*] Local Vira7 IP: $LOCAL_VIRA7_IP"
-  echo "[*] Remote Vira7 IP: $REMOTE_VIRA7_IP"
-  echo "[*] UDP Port: $VIRA7_PORT"
-  echo "[*] CPU mode: checksum=$VIRA7_CHECKSUM verify_checksum=$VIRA7_VERIFY_CHECKSUM batch=$VIRA7_BATCH"
-
-  enable_ip_forward
-  modprobe tun || true
-  vira7_compile_engine || return 1
-  vira7_save_config
-  vira7_apply_firewall_rules "$TUNNEL_ID" || true
-  vira7_install_service "$TUNNEL_ID"
-}
-
-vira7_menu_config_tunnel() {
-  show_header "Configure Vira7 UDP-TUN Tunnel"
-  prompt_role || return
-  local selected_role existing_local_ip existing_remote_ip existing_port existing_mtu
-  selected_role="$ROLE"
-  echo
-  prompt_tunnel_id "Enter Vira7 tunnel number before IP [1-254]: " || return
-  existing_local_ip=""
-  existing_remote_ip=""
-  existing_port=""
-  existing_mtu=""
-  if vira7_load_config "$TUNNEL_ID"; then
-    existing_local_ip="${LOCAL_PUBLIC_IP:-}"
-    existing_remote_ip="${REMOTE_PUBLIC_IP:-}"
-    existing_port="${VIRA7_PORT:-}"
-    existing_mtu="${VIRA7_MTU:-}"
-  fi
-  ROLE="$selected_role"
-  echo
-  echo "Vira7 UDP-TUN tunnel $TUNNEL_ID plan:"
-  echo "  Interface       : $(vira7_iface_name "$TUNNEL_ID")"
-  echo "  Config file     : $(vira7_config_file "$TUNNEL_ID")"
-  echo "  Service         : $(vira7_service_name "$TUNNEL_ID")"
-  echo "  Iran role IP    : 10.71.$TUNNEL_ID.1"
-  echo "  Kharej role IP  : 10.71.$TUNNEL_ID.2"
-  echo
-  prompt_local_tunnel_ip "${existing_local_ip:-$(detect_local_public_ip || true)}" "Enter LOCAL server Public IPv4 for Vira7 UDP bind" || return
-  echo
-  prompt_remote_public_ip "$existing_remote_ip" || return
-  echo
-  VIRA7_PORT="$(auto_select_udp_port "$(vira7_default_port "$TUNNEL_ID")" "$existing_port" "vira7" "$TUNNEL_ID")" || return
-  echo "Auto-selected Vira7 UDP port: $VIRA7_PORT"
-  read -rp "Enter Vira7 MTU [${existing_mtu:-$VIRA7_DEFAULT_MTU}] (00=menu): " VIRA7_MTU_INPUT
-  if is_main_menu_token "$VIRA7_MTU_INPUT"; then return_main_msg; return 99; fi
-  VIRA7_MTU="${VIRA7_MTU_INPUT:-${existing_mtu:-$VIRA7_DEFAULT_MTU}}"
-  if ! [[ "$VIRA7_MTU" =~ ^[0-9]+$ ]] || [ "$VIRA7_MTU" -lt 576 ] || [ "$VIRA7_MTU" -gt 1600 ]; then
-    echo "Invalid MTU."
-    return
-  fi
-  # Safe CPU optimization: keep checksum generation for compatibility, skip expensive receive-side verification, use packet batching.
-  VIRA7_CHECKSUM="${VIRA7_CHECKSUM:-$VIRA7_DEFAULT_CHECKSUM}"
-  VIRA7_VERIFY_CHECKSUM="${VIRA7_VERIFY_CHECKSUM:-$VIRA7_DEFAULT_VERIFY_CHECKSUM}"
-  VIRA7_BATCH="${VIRA7_BATCH:-$VIRA7_DEFAULT_BATCH}"
-  vira7_create_tunnel 1 || echo "Vira7 tunnel creation failed"
-}
-
-vira7_collect_ids() {
-  {
-    if [ -d "$VIRA7_CONFIG_DIR" ]; then
-      local f id
-      for f in "$VIRA7_CONFIG_DIR"/tunnel-*.conf; do
-        [ -e "$f" ] || continue
-        id="${f##*/tunnel-}"
-        id="${id%.conf}"
-        validate_tunnel_id "$id" && echo "$id"
-      done
-    fi
-    ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1 | grep -E "^${VIRA7_IFACE_PREFIX}[0-9]+$" | sed "s/^${VIRA7_IFACE_PREFIX}//" | awk '$1 >= 1 && $1 <= 254' || true
-  } | sort -n -u
-}
-
-vira7_list_tunnels() {
-  echo "Vira7 UDP-TUN tunnels:"
-  local ids id ifc state
-  ids="$(vira7_collect_ids || true)"
-  if [ -z "$ids" ]; then echo "  none"; return 0; fi
-  while IFS= read -r id; do
-    [ -n "$id" ] || continue
-    ifc="$(vira7_iface_name "$id")"
-    state="inactive"
-    ip link show "$ifc" >/dev/null 2>&1 && state="active"
-    echo "  - tunnel $id | iface $ifc | $state | config: $(vira7_config_file "$id") | service: $(systemctl is-enabled "$(vira7_service_name "$id")" 2>/dev/null || true)"
-  done <<< "$ids"
-}
-
-vira7_remove_one_tunnel() {
-  local id="$1"
-  local ifc file port
-  ifc="$(vira7_iface_name "$id")"
-  file="$(vira7_config_file "$id")"
-  port=""
-  if vira7_load_config "$id"; then port="${VIRA7_PORT:-}"; fi
-  echo "Removing Vira7 tunnel $id ($ifc)..."
-  systemctl disable --now "$(vira7_service_name "$id")" 2>/dev/null || true
-  ip link delete "$ifc" 2>/dev/null || true
-  if [ -n "$port" ] && command -v iptables >/dev/null 2>&1; then
-    while iptables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null; do iptables -D INPUT -p udp --dport "$port" -j ACCEPT || break; done
-    while iptables -C FORWARD -i "$ifc" -j ACCEPT 2>/dev/null; do iptables -D FORWARD -i "$ifc" -j ACCEPT || break; done
-    while iptables -C FORWARD -o "$ifc" -j ACCEPT 2>/dev/null; do iptables -D FORWARD -o "$ifc" -j ACCEPT || break; done
-  fi
-  rm -f "$file" "/var/run/$ifc.pid"
-  systemctl daemon-reload 2>/dev/null || true
-  echo "[OK] Vira7 tunnel $id removed."
-}
-
-vira7_remove_menu() {
-  show_header "Remove Vira7 UDP-TUN Tunnel"
-  vira7_list_tunnels
-  echo
-  local ids selected_id
-  ids="$(vira7_collect_ids || true)"
-  if [ -z "$ids" ]; then echo "No Vira7 tunnels found."; return; fi
-  read -rp "Enter Vira7 tunnel number to remove, for example 1, or 00=menu: " selected_id
-  if is_main_menu_token "$selected_id"; then return_main_msg; return 99; fi
-  validate_tunnel_id "$selected_id" || { echo "Invalid tunnel number."; return; }
-  if ! echo "$ids" | grep -qx "$selected_id"; then
-    echo "Vira7 tunnel $selected_id was not found in the list."
-    return
-  fi
-  if confirm_yes "Are you sure you want to remove Vira7 tunnel $selected_id completely?"; then
-    vira7_remove_one_tunnel "$selected_id"
-  else
-    echo "Cancelled."
-  fi
-}
-
-vira7_restart_one_tunnel() {
-  local id="$1"
-  validate_tunnel_id "$id" || return 1
-  if ! vira7_load_config "$id"; then
-    echo "No saved Vira7 configuration found for tunnel $id." >&2
-    return 1
-  fi
-  VIRA7_MODE="client"
-  if [ "${ROLE:-}" = "1" ]; then VIRA7_MODE="server"; fi
-  [ -x "$VIRA7_BINARY" ] || vira7_compile_engine || return 1
-  enable_ip_forward
-  vira7_apply_firewall_rules "$id" || true
-  vira7_install_service "$id"
-}
-
-
-set_config_kv() {
-  local file="$1" key="$2" value="$3"
-  [ -f "$file" ] || return 1
-  if grep -q "^${key}=" "$file" 2>/dev/null; then
-    sed -i "s|^${key}=.*|${key}=${value}|" "$file"
-  else
-    printf '%s=%s\n' "$key" "$value" >> "$file"
-  fi
-}
-
-vira7_optimize_cpu_one() {
-  local id="$1" mode="${2:-safe}" file svc
-  validate_tunnel_id "$id" || { echo "Invalid Vira7 tunnel number." >&2; return 1; }
-  file="$(vira7_config_file "$id")"
-  svc="$(vira7_service_name "$id")"
-  [ -f "$file" ] || { echo "No Vira7 config found: $file" >&2; return 1; }
-
-  # Always safe: skip userspace receive checksum verification and batch packets.
-  # Fast mode additionally disables checksum generation; use it only when BOTH sides run this optimized engine.
-  set_config_kv "$file" verify_checksum 0
-  set_config_kv "$file" batch 128
-  if [ "$mode" = "fast" ]; then
-    set_config_kv "$file" checksum 0
-  else
-    set_config_kv "$file" checksum 1
-  fi
-
-  echo "Recompiling optimized Vira7 engine..."
-  vira7_compile_engine || return 1
-  enable_ip_forward
-  vira7_apply_firewall_rules "$id" || true
-  systemctl daemon-reload 2>/dev/null || true
-  systemctl enable "$svc" >/dev/null 2>&1 || true
-  if systemctl restart "$svc"; then
-    echo "[OK] Vira7 tunnel $id optimized and restarted. mode=$mode"
-    echo "Current CPU settings:"
-    grep -E '^(checksum|verify_checksum|batch|mtu|port)=' "$file" || true
-    return 0
-  fi
-  echo "[WARN] Restart failed. Last logs:" >&2
-  systemctl status "$svc" --no-pager -l 2>/dev/null || true
-  journalctl -u "$svc" -n 40 --no-pager 2>/dev/null || true
-  return 1
-}
-
-vira7_optimize_cpu_menu() {
-  show_header "Optimize Vira7 CPU"
-  vira7_list_tunnels
-  echo
-  local id mode_choice mode
-  read -rp "Enter Vira7 tunnel number to optimize, 0=all, 00=menu: " id
-  if is_main_menu_token "$id"; then return_main_msg; return 99; fi
-  echo
-  echo "1) Safe low CPU mode (compatible, recommended first)"
-  echo "2) Fast low CPU mode (must be applied on BOTH servers for this Vira7 tunnel)"
-  echo "00) Back to main menu"
-  read -rp "Choose CPU mode [1-2/00]: " mode_choice
-  if is_main_menu_token "$mode_choice"; then return_main_msg; return 99; fi
-  case "$mode_choice" in
-    1) mode="safe" ;;
-    2) mode="fast" ;;
-    *) echo "Invalid mode."; return 1 ;;
-  esac
-  if [ "$id" = "0" ]; then
-    local ids one
-    ids="$(vira7_collect_ids || true)"
-    [ -n "$ids" ] || { echo "No Vira7 tunnels found."; return 0; }
-    while IFS= read -r one; do
-      [ -n "$one" ] && vira7_optimize_cpu_one "$one" "$mode" || true
-    done <<< "$ids"
-  else
-    vira7_optimize_cpu_one "$id" "$mode"
-  fi
-}
-
-
-# -----------------------------
-# ViraTCP encrypted TCP-TUN helpers (tunnel type 4)
-# -----------------------------
-viratcp_iface_name() {
-  echo "${VIRATCP_IFACE_PREFIX}$1"
-}
-
-viratcp_config_file() {
-  echo "$VIRATCP_CONFIG_DIR/tunnel-$1.conf"
-}
-
-viratcp_service_name() {
-  echo "viratcp-tunnel@$1.service"
-}
-
-viratcp_inner_ip_for_role() {
-  local id="$1" role="$2"
-  if [ "$role" = "1" ]; then echo "10.81.$id.1"; else echo "10.81.$id.2"; fi
-}
-
-viratcp_remote_inner_ip_for_role() {
-  local id="$1" role="$2"
-  if [ "$role" = "1" ]; then echo "10.81.$id.2"; else echo "10.81.$id.1"; fi
-}
-
-viratcp_generate_psk() {
+wss_random_secret() {
   if command -v openssl >/dev/null 2>&1; then
-    openssl rand -hex 32
+    openssl rand -hex 18
   else
-    od -An -N32 -tx1 /dev/urandom | tr -d ' \n'
+    tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 36
+    echo
   fi
 }
 
-viratcp_validate_psk() {
-  [[ "${1:-}" =~ ^[A-Fa-f0-9]{64}$ ]]
+wss_validate_secret() {
+  [[ "${1:-}" =~ ^[A-Za-z0-9_-]{12,80}$ ]]
 }
 
-viratcp_ensure_deps() {
-  if command -v gcc >/dev/null 2>&1 && [ -f /usr/include/openssl/evp.h ]; then return 0; fi
-  echo "Installing ViraTCP build/runtime dependencies..."
-  if command -v apt-get >/dev/null 2>&1; then
-    apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential gcc libssl-dev iproute2 iptables kmod openssl
-  elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y gcc make openssl-devel iproute iptables kmod openssl
-  elif command -v yum >/dev/null 2>&1; then
-    yum install -y gcc make openssl-devel iproute iptables kmod openssl
-  else
-    echo "No supported package manager found. Install gcc, OpenSSL development headers, iproute2 and iptables manually." >&2
+wss_install_binary() {
+  local current="" arch asset checksum url tmpdir archive found
+  if [ -x "$WSS_BINARY" ]; then
+    current="$($WSS_BINARY --version 2>/dev/null | head -n1 || true)"
+    [[ "$current" == *"$WSS_VERSION"* ]] && return 0
+  fi
+
+  ensure_feature_dependencies "wstunnel" curl:curl tar:tar sha256sum:coreutils || return 1
+  case "$(uname -m)" in
+    x86_64|amd64) arch="amd64"; checksum="$WSS_AMD64_SHA256" ;;
+    aarch64|arm64) arch="arm64"; checksum="$WSS_ARM64_SHA256" ;;
+    *) err_msg "WSTunnel is supported only on Linux amd64/arm64 by this installer."; return 1 ;;
+  esac
+
+  asset="wstunnel_${WSS_VERSION}_linux_${arch}.tar.gz"
+  url="https://github.com/erebe/wstunnel/releases/download/v${WSS_VERSION}/${asset}"
+  tmpdir="$(mktemp -d /tmp/gretun-wss.XXXXXX)" || return 1
+  archive="$tmpdir/$asset"
+  info_msg "Downloading verified WSTunnel v$WSS_VERSION for linux/$arch..."
+  if ! curl -fL --retry 3 --connect-timeout 15 "$url" -o "$archive"; then
+    rm -rf "$tmpdir"
+    err_msg "WSTunnel download failed."
     return 1
   fi
-}
-
-viratcp_compile_engine() {
-  viratcp_ensure_deps || return 1
-  mkdir -p "$VIRATCP_CONFIG_DIR"
-  cat > "$VIRATCP_SOURCE" <<'VIRATCP_ENGINE_EOF'
-#define _GNU_SOURCE
-#include <arpa/inet.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <linux/if_tun.h>
-#include <net/if.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <openssl/evp.h>
-#include <openssl/rand.h>
-#include <openssl/sha.h>
-#include <poll.h>
-#include <signal.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/ioctl.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <time.h>
-#include <unistd.h>
-
-#define TUN_DEVICE "/dev/net/tun"
-#define VT_MAGIC 0x56544350U
-#define VT_VERSION 1U
-#define VT_DATA 1U
-#define VT_PING 2U
-#define VT_PONG 3U
-#define MAX_PACKET 65535U
-#define TAG_LEN 16U
-#define HEADER_LEN 20U
-
-typedef struct {
-    char iface[IFNAMSIZ];
-    char mode[16];
-    char bind_ip[64];
-    char remote_ip[64];
-    char local_priv[64];
-    char remote_priv[64];
-    char psk_hex[129];
-    int port;
-    int mtu;
-    int keepalive;
-    int reconnect;
-    int tcp_user_timeout;
-    int queue_len;
-} vt_config_t;
-
-typedef struct {
-    unsigned char tx_key[32];
-    unsigned char rx_key[32];
-    unsigned char tx_nonce_prefix[4];
-    unsigned char rx_nonce_prefix[4];
-    uint64_t tx_seq;
-    uint64_t rx_seq;
-} crypto_state_t;
-
-static volatile sig_atomic_t running = 1;
-static void on_signal(int sig) { (void)sig; running = 0; }
-
-static uint64_t bswap64_u(uint64_t x) {
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
-    return __builtin_bswap64(x);
-#else
-    return x;
-#endif
-}
-
-static void trim(char *s) {
-    char *p = s;
-    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
-    if (p != s) memmove(s, p, strlen(p) + 1);
-    size_t n = strlen(s);
-    while (n && (s[n-1] == ' ' || s[n-1] == '\t' || s[n-1] == '\r' || s[n-1] == '\n')) s[--n] = 0;
-}
-
-static int load_config(const char *path, vt_config_t *c) {
-    memset(c, 0, sizeof(*c));
-    snprintf(c->iface, sizeof(c->iface), "viratcp");
-    snprintf(c->mode, sizeof(c->mode), "client");
-    c->port = 443; c->mtu = 1280; c->keepalive = 10; c->reconnect = 3;
-    c->tcp_user_timeout = 20000; c->queue_len = 2000;
-    FILE *f = fopen(path, "r");
-    if (!f) return -1;
-    char line[512];
-    while (fgets(line, sizeof(line), f)) {
-        trim(line); if (!line[0] || line[0] == '#') continue;
-        char *eq = strchr(line, '='); if (!eq) continue;
-        *eq = 0; char *key = line; char *val = eq + 1; trim(key); trim(val);
-        if (!strcmp(key, "iface")) snprintf(c->iface, sizeof(c->iface), "%s", val);
-        else if (!strcmp(key, "mode")) snprintf(c->mode, sizeof(c->mode), "%s", val);
-        else if (!strcmp(key, "bind_ip")) snprintf(c->bind_ip, sizeof(c->bind_ip), "%s", val);
-        else if (!strcmp(key, "remote_ip")) snprintf(c->remote_ip, sizeof(c->remote_ip), "%s", val);
-        else if (!strcmp(key, "local_priv")) snprintf(c->local_priv, sizeof(c->local_priv), "%s", val);
-        else if (!strcmp(key, "remote_priv")) snprintf(c->remote_priv, sizeof(c->remote_priv), "%s", val);
-        else if (!strcmp(key, "psk")) snprintf(c->psk_hex, sizeof(c->psk_hex), "%s", val);
-        else if (!strcmp(key, "port")) c->port = atoi(val);
-        else if (!strcmp(key, "mtu")) c->mtu = atoi(val);
-        else if (!strcmp(key, "keepalive")) c->keepalive = atoi(val);
-        else if (!strcmp(key, "reconnect")) c->reconnect = atoi(val);
-        else if (!strcmp(key, "tcp_user_timeout")) c->tcp_user_timeout = atoi(val);
-        else if (!strcmp(key, "queue_len")) c->queue_len = atoi(val);
-    }
-    fclose(f);
-    if (!c->iface[0] || !c->local_priv[0] || !c->remote_priv[0] || strlen(c->psk_hex) != 64) return -1;
-    if (strcmp(c->mode, "client") && strcmp(c->mode, "server")) return -1;
-    if (!strcmp(c->mode, "client") && !c->remote_ip[0]) return -1;
-    if (c->port < 1 || c->port > 65535) return -1;
-    if (c->mtu < 576 || c->mtu > 1500) c->mtu = 1280;
-    if (c->keepalive < 3 || c->keepalive > 60) c->keepalive = 10;
-    if (c->reconnect < 1 || c->reconnect > 60) c->reconnect = 3;
-    if (c->tcp_user_timeout < 5000 || c->tcp_user_timeout > 120000) c->tcp_user_timeout = 20000;
-    if (c->queue_len < 100) c->queue_len = 2000;
-    return 0;
-}
-
-static int hex_to_bytes(const char *hex, unsigned char *out, size_t outlen) {
-    if (strlen(hex) != outlen * 2) return -1;
-    for (size_t i = 0; i < outlen; i++) {
-        unsigned int v;
-        if (sscanf(hex + i * 2, "%2x", &v) != 1) return -1;
-        out[i] = (unsigned char)v;
-    }
-    return 0;
-}
-
-static void derive_session_value(const unsigned char psk[32], const unsigned char client_nonce[32],
-                                 const unsigned char server_nonce[32], const char *label, unsigned char out[32]) {
-    SHA256_CTX c;
-    SHA256_Init(&c);
-    SHA256_Update(&c, psk, 32);
-    SHA256_Update(&c, client_nonce, 32);
-    SHA256_Update(&c, server_nonce, 32);
-    SHA256_Update(&c, label, strlen(label));
-    SHA256_Final(out, &c);
-}
-
-static int crypto_init_state(const vt_config_t *cfg, const unsigned char client_nonce[32],
-                             const unsigned char server_nonce[32], crypto_state_t *st) {
-    unsigned char psk[32], c2s[32], s2c[32], nc2s[32], ns2c[32];
-    if (hex_to_bytes(cfg->psk_hex, psk, sizeof(psk)) != 0) return -1;
-    derive_session_value(psk, client_nonce, server_nonce, "viratcp-c2s-key-v1", c2s);
-    derive_session_value(psk, client_nonce, server_nonce, "viratcp-s2c-key-v1", s2c);
-    derive_session_value(psk, client_nonce, server_nonce, "viratcp-c2s-nonce-v1", nc2s);
-    derive_session_value(psk, client_nonce, server_nonce, "viratcp-s2c-nonce-v1", ns2c);
-    memset(st, 0, sizeof(*st)); st->tx_seq = 1; st->rx_seq = 0;
-    if (!strcmp(cfg->mode, "client")) {
-        memcpy(st->tx_key, c2s, 32); memcpy(st->rx_key, s2c, 32);
-        memcpy(st->tx_nonce_prefix, nc2s, 4); memcpy(st->rx_nonce_prefix, ns2c, 4);
-    } else {
-        memcpy(st->tx_key, s2c, 32); memcpy(st->rx_key, c2s, 32);
-        memcpy(st->tx_nonce_prefix, ns2c, 4); memcpy(st->rx_nonce_prefix, nc2s, 4);
-    }
-    OPENSSL_cleanse(psk, sizeof(psk)); OPENSSL_cleanse(c2s, sizeof(c2s)); OPENSSL_cleanse(s2c, sizeof(s2c));
-    OPENSSL_cleanse(nc2s, sizeof(nc2s)); OPENSSL_cleanse(ns2c, sizeof(ns2c));
-    return 0;
-}
-
-static int tun_alloc_named(const char *dev) {
-    int fd = open(TUN_DEVICE, O_RDWR); if (fd < 0) return -1;
-    struct ifreq ifr; memset(&ifr, 0, sizeof(ifr)); ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
-    snprintf(ifr.ifr_name, IFNAMSIZ, "%s", dev);
-    if (ioctl(fd, TUNSETIFF, &ifr) < 0) { close(fd); return -1; }
-    return fd;
-}
-
-static void cleanup_iface(const char *iface) {
-    char cmd[256]; snprintf(cmd, sizeof(cmd), "ip link del %s 2>/dev/null", iface); system(cmd);
-}
-
-static int configure_tun(const vt_config_t *c) {
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "ip link set dev %s up mtu %d txqueuelen %d", c->iface, c->mtu, c->queue_len);
-    if (system(cmd) != 0) return -1;
-    snprintf(cmd, sizeof(cmd), "ip addr replace %s/32 peer %s dev %s", c->local_priv, c->remote_priv, c->iface);
-    return system(cmd) == 0 ? 0 : -1;
-}
-
-static void set_sock_opts(int fd, const vt_config_t *c) {
-    int one = 1, idle = c->keepalive, intvl = c->keepalive / 2; if (intvl < 2) intvl = 2; int cnt = 3;
-    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-#ifdef TCP_KEEPIDLE
-    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
-#endif
-#ifdef TCP_KEEPINTVL
-    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
-#endif
-#ifdef TCP_KEEPCNT
-    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
-#endif
-#ifdef TCP_USER_TIMEOUT
-    setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &c->tcp_user_timeout, sizeof(c->tcp_user_timeout));
-#endif
-    struct timeval tv; tv.tv_sec = c->keepalive * 4; tv.tv_usec = 0;
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)); setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-}
-
-static int create_listener(const vt_config_t *c) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0); if (fd < 0) return -1;
-    int one = 1; setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-    struct sockaddr_in a; memset(&a, 0, sizeof(a)); a.sin_family = AF_INET; a.sin_port = htons((uint16_t)c->port);
-    if (c->bind_ip[0]) { if (inet_pton(AF_INET, c->bind_ip, &a.sin_addr) != 1) { close(fd); return -1; } }
-    else a.sin_addr.s_addr = htonl(INADDR_ANY);
-    if (bind(fd, (struct sockaddr *)&a, sizeof(a)) != 0 || listen(fd, 8) != 0) { close(fd); return -1; }
-    return fd;
-}
-
-static int connect_client(const vt_config_t *c) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0); if (fd < 0) return -1;
-    if (c->bind_ip[0]) {
-        struct sockaddr_in l; memset(&l, 0, sizeof(l)); l.sin_family = AF_INET; l.sin_port = 0;
-        if (inet_pton(AF_INET, c->bind_ip, &l.sin_addr) != 1 || bind(fd, (struct sockaddr *)&l, sizeof(l)) != 0) { close(fd); return -1; }
-    }
-    struct sockaddr_in r; memset(&r, 0, sizeof(r)); r.sin_family = AF_INET; r.sin_port = htons((uint16_t)c->port);
-    if (inet_pton(AF_INET, c->remote_ip, &r.sin_addr) != 1) { close(fd); return -1; }
-    if (connect(fd, (struct sockaddr *)&r, sizeof(r)) != 0) { close(fd); return -1; }
-    set_sock_opts(fd, c); return fd;
-}
-
-static ssize_t read_full(int fd, void *buf, size_t len) {
-    unsigned char *p = buf; size_t got = 0;
-    while (got < len && running) {
-        ssize_t n = recv(fd, p + got, len - got, 0);
-        if (n == 0) return 0;
-        if (n < 0) { if (errno == EINTR) continue; return -1; }
-        got += (size_t)n;
-    }
-    return (ssize_t)got;
-}
-
-static int write_full(int fd, const void *buf, size_t len) {
-    const unsigned char *p = buf; size_t sent = 0;
-    while (sent < len && running) {
-        ssize_t n = send(fd, p + sent, len - sent, MSG_NOSIGNAL);
-        if (n < 0) { if (errno == EINTR) continue; return -1; }
-        if (n == 0) return -1;
-        sent += (size_t)n;
-    }
-    return sent == len ? 0 : -1;
-}
-
-static void make_nonce(const unsigned char prefix[4], uint64_t seq, unsigned char nonce[12]) {
-    uint64_t nseq = bswap64_u(seq); memcpy(nonce, prefix, 4); memcpy(nonce + 4, &nseq, 8);
-}
-
-static int aead_encrypt(const unsigned char key[32], const unsigned char nonce[12], const unsigned char *aad, int aad_len,
-                        const unsigned char *plain, int plain_len, unsigned char *cipher, unsigned char tag[TAG_LEN]) {
-    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new(); if (!ctx) return -1; int len = 0, out = 0, ok = -1;
-    if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1) goto end;
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL) != 1) goto end;
-    if (EVP_EncryptInit_ex(ctx, NULL, NULL, key, nonce) != 1) goto end;
-    if (EVP_EncryptUpdate(ctx, NULL, &len, aad, aad_len) != 1) goto end;
-    if (plain_len && EVP_EncryptUpdate(ctx, cipher, &len, plain, plain_len) != 1) goto end;
-    out = len;
-    if (EVP_EncryptFinal_ex(ctx, cipher + out, &len) != 1) goto end;
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, TAG_LEN, tag) != 1) goto end;
-    ok = 0;
-end: EVP_CIPHER_CTX_free(ctx); return ok;
-}
-
-static int aead_decrypt(const unsigned char key[32], const unsigned char nonce[12], const unsigned char *aad, int aad_len,
-                        const unsigned char *cipher, int cipher_len, const unsigned char tag[TAG_LEN], unsigned char *plain) {
-    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new(); if (!ctx) return -1; int len = 0, out = 0, ok = -1;
-    if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1) goto end;
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL) != 1) goto end;
-    if (EVP_DecryptInit_ex(ctx, NULL, NULL, key, nonce) != 1) goto end;
-    if (EVP_DecryptUpdate(ctx, NULL, &len, aad, aad_len) != 1) goto end;
-    if (cipher_len && EVP_DecryptUpdate(ctx, plain, &len, cipher, cipher_len) != 1) goto end;
-    out = len;
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, TAG_LEN, (void *)tag) != 1) goto end;
-    if (EVP_DecryptFinal_ex(ctx, plain + out, &len) != 1) goto end;
-    ok = 0;
-end: EVP_CIPHER_CTX_free(ctx); return ok;
-}
-
-static void put_u32(unsigned char *p, uint32_t v) { v = htonl(v); memcpy(p, &v, 4); }
-static uint32_t get_u32(const unsigned char *p) { uint32_t v; memcpy(&v, p, 4); return ntohl(v); }
-static void put_u64(unsigned char *p, uint64_t v) { v = bswap64_u(v); memcpy(p, &v, 8); }
-static uint64_t get_u64(const unsigned char *p) { uint64_t v; memcpy(&v, p, 8); return bswap64_u(v); }
-
-static int send_frame(int fd, crypto_state_t *st, uint8_t type, const unsigned char *payload, uint32_t len) {
-    if (len > MAX_PACKET) return -1;
-    unsigned char hdr[HEADER_LEN], nonce[12], tag[TAG_LEN];
-    unsigned char *cipher = malloc(len ? len : 1); if (!cipher) return -1;
-    uint64_t seq = st->tx_seq++;
-    put_u32(hdr, VT_MAGIC); hdr[4] = VT_VERSION; hdr[5] = type; hdr[6] = hdr[7] = 0;
-    put_u64(hdr + 8, seq); put_u32(hdr + 16, len); make_nonce(st->tx_nonce_prefix, seq, nonce);
-    if (aead_encrypt(st->tx_key, nonce, hdr, HEADER_LEN, payload, (int)len, cipher, tag) != 0) { free(cipher); return -1; }
-    int rc = write_full(fd, hdr, HEADER_LEN);
-    if (rc == 0 && len) rc = write_full(fd, cipher, len);
-    if (rc == 0) rc = write_full(fd, tag, TAG_LEN);
-    free(cipher); return rc;
-}
-
-static int recv_frame(int fd, crypto_state_t *st, uint8_t *type, unsigned char **payload, uint32_t *len) {
-    unsigned char hdr[HEADER_LEN], nonce[12], tag[TAG_LEN];
-    ssize_t n = read_full(fd, hdr, HEADER_LEN); if (n <= 0) return -1;
-    if (get_u32(hdr) != VT_MAGIC || hdr[4] != VT_VERSION) return -1;
-    uint64_t seq = get_u64(hdr + 8); uint32_t plen = get_u32(hdr + 16);
-    if (plen > MAX_PACKET || seq <= st->rx_seq) return -1;
-    unsigned char *cipher = malloc(plen ? plen : 1), *plain = malloc(plen ? plen : 1);
-    if (!cipher || !plain) { free(cipher); free(plain); return -1; }
-    if (plen && read_full(fd, cipher, plen) != (ssize_t)plen) { free(cipher); free(plain); return -1; }
-    if (read_full(fd, tag, TAG_LEN) != TAG_LEN) { free(cipher); free(plain); return -1; }
-    make_nonce(st->rx_nonce_prefix, seq, nonce);
-    if (aead_decrypt(st->rx_key, nonce, hdr, HEADER_LEN, cipher, (int)plen, tag, plain) != 0) { free(cipher); free(plain); return -1; }
-    free(cipher); st->rx_seq = seq; *type = hdr[5]; *payload = plain; *len = plen; return 0;
-}
-
-static int session_handshake(int sock, const vt_config_t *cfg, crypto_state_t *st) {
-    unsigned char client_nonce[32], server_nonce[32];
-    if (!strcmp(cfg->mode, "client")) {
-        if (RAND_bytes(client_nonce, sizeof(client_nonce)) != 1) return -1;
-        if (write_full(sock, client_nonce, sizeof(client_nonce)) != 0) return -1;
-        if (read_full(sock, server_nonce, sizeof(server_nonce)) != (ssize_t)sizeof(server_nonce)) return -1;
-    } else {
-        if (read_full(sock, client_nonce, sizeof(client_nonce)) != (ssize_t)sizeof(client_nonce)) return -1;
-        if (RAND_bytes(server_nonce, sizeof(server_nonce)) != 1) return -1;
-        if (write_full(sock, server_nonce, sizeof(server_nonce)) != 0) return -1;
-    }
-    return crypto_init_state(cfg, client_nonce, server_nonce, st);
-}
-
-static int connected_loop(int sock, int tun_fd, const vt_config_t *cfg) {
-    crypto_state_t st;
-    if (session_handshake(sock, cfg, &st) != 0) return -1;
-    time_t last_tx = time(NULL), last_rx = time(NULL);
-    while (running) {
-        struct pollfd fds[2]; fds[0].fd = tun_fd; fds[0].events = POLLIN; fds[1].fd = sock; fds[1].events = POLLIN;
-        int pr = poll(fds, 2, 1000); if (pr < 0) { if (errno == EINTR) continue; return -1; }
-        if (fds[1].revents & (POLLERR | POLLHUP | POLLNVAL)) return -1;
-        if (fds[0].revents & POLLIN) {
-            unsigned char packet[MAX_PACKET]; ssize_t n = read(tun_fd, packet, sizeof(packet));
-            if (n > 0 && send_frame(sock, &st, VT_DATA, packet, (uint32_t)n) != 0) return -1;
-            if (n > 0) last_tx = time(NULL);
-        }
-        if (fds[1].revents & POLLIN) {
-            uint8_t type; unsigned char *payload = NULL; uint32_t len = 0;
-            if (recv_frame(sock, &st, &type, &payload, &len) != 0) { free(payload); return -1; }
-            last_rx = time(NULL);
-            if (type == VT_DATA && len > 0) {
-                ssize_t w = write(tun_fd, payload, len); free(payload); if (w != (ssize_t)len) return -1;
-            } else if (type == VT_PING) {
-                free(payload); if (send_frame(sock, &st, VT_PONG, NULL, 0) != 0) return -1; last_tx = time(NULL);
-            } else free(payload);
-        }
-        time_t now = time(NULL);
-        if (now - last_tx >= cfg->keepalive) {
-            if (send_frame(sock, &st, VT_PING, NULL, 0) != 0) return -1;
-            last_tx = now;
-        }
-        if (now - last_rx > cfg->keepalive * 4 + 5) return -1;
-    }
-    return 0;
-}
-
-int main(int argc, char **argv) {
-    if (argc < 2 || getuid() != 0) return 1;
-    vt_config_t cfg; if (load_config(argv[1], &cfg) != 0) { fprintf(stderr, "invalid ViraTCP config\n"); return 1; }
-    signal(SIGINT, on_signal); signal(SIGTERM, on_signal); signal(SIGPIPE, SIG_IGN);
-    mkdir("/dev/net", 0755); if (access(TUN_DEVICE, F_OK) != 0) system("mknod /dev/net/tun c 10 200 2>/dev/null || true");
-    system("modprobe tun 2>/dev/null || true"); cleanup_iface(cfg.iface);
-    int tun_fd = tun_alloc_named(cfg.iface); if (tun_fd < 0 || configure_tun(&cfg) != 0) { cleanup_iface(cfg.iface); if (tun_fd >= 0) close(tun_fd); return 1; }
-    int listener = -1;
-    if (!strcmp(cfg.mode, "server")) {
-        listener = create_listener(&cfg); if (listener < 0) { perror("ViraTCP listen"); cleanup_iface(cfg.iface); close(tun_fd); return 1; }
-        fprintf(stderr, "ViraTCP server listening on %s:%d\n", cfg.bind_ip[0] ? cfg.bind_ip : "0.0.0.0", cfg.port);
-    }
-    while (running) {
-        int sock = -1;
-        if (!strcmp(cfg.mode, "client")) {
-            sock = connect_client(&cfg);
-            if (sock < 0) { sleep((unsigned int)cfg.reconnect); continue; }
-            fprintf(stderr, "ViraTCP connected to %s:%d\n", cfg.remote_ip, cfg.port);
-        } else {
-            struct sockaddr_in peer; socklen_t sl = sizeof(peer); sock = accept(listener, (struct sockaddr *)&peer, &sl);
-            if (sock < 0) { if (errno == EINTR) continue; sleep(1); continue; }
-            set_sock_opts(sock, &cfg); fprintf(stderr, "ViraTCP accepted client\n");
-        }
-        connected_loop(sock, tun_fd, &cfg); close(sock);
-        if (running) { fprintf(stderr, "ViraTCP connection lost; reconnecting\n"); sleep((unsigned int)cfg.reconnect); }
-    }
-    if (listener >= 0) close(listener);
-    close(tun_fd);
-    cleanup_iface(cfg.iface);
-    return 0;
-}
-VIRATCP_ENGINE_EOF
-  if ! gcc -O2 -Wall -Wextra -Wno-deprecated-declarations -o "$VIRATCP_BINARY" "$VIRATCP_SOURCE" -lcrypto; then
-    echo "Failed to compile ViraTCP engine." >&2
+  if ! printf '%s  %s\n' "$checksum" "$archive" | sha256sum -c - >/dev/null 2>&1; then
+    rm -rf "$tmpdir"
+    err_msg "WSTunnel SHA-256 verification failed; the binary was NOT installed."
     return 1
   fi
-  chmod 755 "$VIRATCP_BINARY"
+  if ! tar -xzf "$archive" -C "$tmpdir"; then
+    rm -rf "$tmpdir"
+    err_msg "Could not extract WSTunnel archive."
+    return 1
+  fi
+  found="$(find "$tmpdir" -type f -name wstunnel -print -quit 2>/dev/null || true)"
+  if [ -z "$found" ]; then
+    rm -rf "$tmpdir"
+    err_msg "WSTunnel executable was not found in the verified archive."
+    return 1
+  fi
+  install -m 0755 "$found" "$WSS_BINARY"
+  rm -rf "$tmpdir"
+  ok_msg "Installed $($WSS_BINARY --version 2>/dev/null | head -n1 || echo WSTunnel)."
 }
 
-viratcp_write_service_template() {
-  cat > "$VIRATCP_SERVICE_TEMPLATE" <<EOF_SERVICE
+wss_write_service_template() {
+  diagnostic_prepare_logs || true
+  cat > "$WSS_SERVICE_TEMPLATE" <<EOF_WSS_SERVICE
 [Unit]
-Description=ViraTCP Encrypted TCP-TUN %i Self-Healing Service
+Description=WireGuard over HTTPS/WebSocket transport %i
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-ExecStart=/bin/bash $INSTALL_BIN --service run-viratcp-logged %i
+ExecStart=/bin/bash $INSTALL_BIN --service start-wss %i
 Restart=always
 RestartSec=2
-TimeoutStopSec=10
 LimitNOFILE=1048576
 StandardOutput=append:$DIAG_SERVICE_LOG
 StandardError=append:$DIAG_SERVICE_LOG
 
 [Install]
 WantedBy=multi-user.target
-EOF_SERVICE
+EOF_WSS_SERVICE
   systemctl daemon-reload >/dev/null 2>&1 || true
 }
 
-viratcp_save_config() {
-  mkdir -p "$VIRATCP_CONFIG_DIR"
-  local file; file="$(viratcp_config_file "$TUNNEL_ID")"
-  cat > "$file" <<EOF_CONF
-TUNNEL_TYPE=viratcp
-TUNNEL_ID=$TUNNEL_ID
-ROLE=$ROLE
-VIRATCP_IFACE=$VIRATCP_IFACE
-VIRATCP_MODE=$VIRATCP_MODE
-LOCAL_PUBLIC_IP=$LOCAL_PUBLIC_IP
-REMOTE_PUBLIC_IP=$REMOTE_PUBLIC_IP
-LOCAL_VIRATCP_IP=$LOCAL_VIRATCP_IP
-REMOTE_VIRATCP_IP=$REMOTE_VIRATCP_IP
-VIRATCP_PORT=$VIRATCP_PORT
-VIRATCP_MTU=$VIRATCP_MTU
-VIRATCP_PSK=$VIRATCP_PSK
-VIRATCP_KEEPALIVE=${VIRATCP_KEEPALIVE:-$VIRATCP_DEFAULT_KEEPALIVE}
-VIRATCP_RECONNECT=${VIRATCP_RECONNECT:-$VIRATCP_DEFAULT_RECONNECT}
-VIRATCP_TCP_USER_TIMEOUT=${VIRATCP_TCP_USER_TIMEOUT:-$VIRATCP_DEFAULT_TCP_USER_TIMEOUT}
+wss_open_server_firewall() {
+  local port="$1"
+  validate_port "$port" || return 1
+  if command -v iptables >/dev/null 2>&1; then
+    iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || iptables -A INPUT -p tcp --dport "$port" -j ACCEPT || true
+  fi
+  command -v ufw >/dev/null 2>&1 && ufw allow "$port/tcp" comment "gretun-wss" >/dev/null 2>&1 || true
+  if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    firewall-cmd --permanent --add-port="$port/tcp" >/dev/null 2>&1 || true
+    firewall-cmd --reload >/dev/null 2>&1 || true
+  fi
+}
 
-iface=$VIRATCP_IFACE
-mode=$VIRATCP_MODE
-bind_ip=$LOCAL_PUBLIC_IP
-remote_ip=$REMOTE_PUBLIC_IP
-local_priv=$LOCAL_VIRATCP_IP
-remote_priv=$REMOTE_VIRATCP_IP
-port=$VIRATCP_PORT
-mtu=$VIRATCP_MTU
-psk=$VIRATCP_PSK
-keepalive=${VIRATCP_KEEPALIVE:-$VIRATCP_DEFAULT_KEEPALIVE}
-reconnect=${VIRATCP_RECONNECT:-$VIRATCP_DEFAULT_RECONNECT}
-tcp_user_timeout=${VIRATCP_TCP_USER_TIMEOUT:-$VIRATCP_DEFAULT_TCP_USER_TIMEOUT}
-queue_len=2000
-EOF_CONF
+wss_run_service() {
+  local id="$1" workers
+  wss_load_config "$id" || { echo "Invalid WSS config for tunnel $id" >&2; return 1; }
+  [ -x "$WSS_BINARY" ] || { echo "Missing WSTunnel binary: $WSS_BINARY" >&2; return 1; }
+  workers="$(nproc 2>/dev/null || echo 1)"
+  [ "$workers" -gt 8 ] && workers=8
+  [ "$workers" -ge 1 ] || workers=1
+
+  if [ "$WSS_MODE" = "server" ]; then
+    exec "$WSS_BINARY" server \
+      --restrict-to "127.0.0.1:$WSS_TARGET_UDP_PORT" \
+      --restrict-http-upgrade-path-prefix "$WSS_PATH_SECRET" \
+      --websocket-ping-frequency 15s \
+      --nb-worker-threads "$workers" \
+      --log-lvl INFO \
+      "wss://0.0.0.0:$WSS_BIND_PORT"
+  fi
+
+  ensure_public_endpoint_route "$WSS_REMOTE_IP" "$(detect_local_public_ip || true)"
+  exec "$WSS_BINARY" client \
+    -L "udp://127.0.0.1:$WSS_LOCAL_UDP_PORT:127.0.0.1:$WSS_TARGET_UDP_PORT?timeout_sec=0" \
+    -P "$WSS_PATH_SECRET" \
+    --websocket-ping-frequency 15s \
+    --connection-retry-max-backoff 10s \
+    --nb-worker-threads "$workers" \
+    --log-lvl INFO \
+    "wss://$WSS_REMOTE_IP:$WSS_REMOTE_PORT"
+}
+
+wss_save_config() {
+  local id="$1" file
+  mkdir -p "$WSS_CONFIG_DIR"
+  chmod 700 "$WSS_CONFIG_DIR" 2>/dev/null || true
+  file="$(wss_config_file "$id")"
+  {
+    write_var WSS_TUNNEL_ID "$id"
+    write_var WSS_MODE "$WSS_MODE"
+    write_var WSS_BIND_PORT "${WSS_BIND_PORT:-}"
+    write_var WSS_REMOTE_IP "${WSS_REMOTE_IP:-}"
+    write_var WSS_REMOTE_PORT "${WSS_REMOTE_PORT:-}"
+    write_var WSS_LOCAL_UDP_PORT "${WSS_LOCAL_UDP_PORT:-}"
+    write_var WSS_TARGET_UDP_PORT "$WSS_TARGET_UDP_PORT"
+    write_var WSS_PATH_SECRET "$WSS_PATH_SECRET"
+  } > "$file"
   chmod 600 "$file"
-  echo "Saved ViraTCP tunnel $TUNNEL_ID configuration to $file"
 }
 
-viratcp_load_config() {
-  local id="${1:-${TUNNEL_ID:-}}" file
-  validate_tunnel_id "$id" || return 1
-  file="$(viratcp_config_file "$id")"; [ -f "$file" ] || return 1
-  VIRATCP_IFACE=""; VIRATCP_MODE=""; ROLE=""; LOCAL_PUBLIC_IP=""; REMOTE_PUBLIC_IP=""
-  LOCAL_VIRATCP_IP=""; REMOTE_VIRATCP_IP=""; VIRATCP_PORT=""; VIRATCP_MTU=""; VIRATCP_PSK=""
-  # shellcheck disable=SC1090
-  source "$file"
-  TUNNEL_ID="$id"
-  VIRATCP_IFACE="${VIRATCP_IFACE:-${iface:-$(viratcp_iface_name "$id")}}"
-  VIRATCP_MODE="${VIRATCP_MODE:-${mode:-client}}"
-  LOCAL_PUBLIC_IP="${LOCAL_PUBLIC_IP:-${bind_ip:-}}"
-  REMOTE_PUBLIC_IP="${REMOTE_PUBLIC_IP:-${remote_ip:-}}"
-  LOCAL_VIRATCP_IP="${LOCAL_VIRATCP_IP:-${local_priv:-}}"
-  REMOTE_VIRATCP_IP="${REMOTE_VIRATCP_IP:-${remote_priv:-}}"
-  VIRATCP_PORT="${VIRATCP_PORT:-${port:-$VIRATCP_DEFAULT_PORT}}"
-  VIRATCP_MTU="${VIRATCP_MTU:-${mtu:-$VIRATCP_DEFAULT_MTU}}"
-  VIRATCP_PSK="${VIRATCP_PSK:-${psk:-}}"
-  VIRATCP_KEEPALIVE="${VIRATCP_KEEPALIVE:-${keepalive:-$VIRATCP_DEFAULT_KEEPALIVE}}"
-  VIRATCP_RECONNECT="${VIRATCP_RECONNECT:-${reconnect:-$VIRATCP_DEFAULT_RECONNECT}}"
-  VIRATCP_TCP_USER_TIMEOUT="${VIRATCP_TCP_USER_TIMEOUT:-${tcp_user_timeout:-$VIRATCP_DEFAULT_TCP_USER_TIMEOUT}}"
-  if [ -z "${ROLE:-}" ]; then if [ "$LOCAL_VIRATCP_IP" = "10.81.$id.1" ]; then ROLE="1"; else ROLE="2"; fi; fi
-}
-
-viratcp_apply_firewall_rules() {
-  local id="$1" listen_mode=0
-  viratcp_load_config "$id" || return 1
-  [ "$VIRATCP_MODE" = "server" ] && listen_mode=1
-  enable_ip_forward
-  ensure_public_endpoint_route "$REMOTE_PUBLIC_IP" "$LOCAL_PUBLIC_IP"
-  firewall_allow_tcp_port_and_ip "ViraTCP tunnel $id" "$VIRATCP_PORT" "$REMOTE_PUBLIC_IP" "$VIRATCP_IFACE" "$listen_mode"
-  firewall_allow_ip_peer "ViraTCP tunnel $id remote inner" "$REMOTE_VIRATCP_IP" "$VIRATCP_IFACE"
-}
-
-viratcp_install_service() {
-  local id="${1:-${TUNNEL_ID:-}}"
-  validate_tunnel_id "$id" || return 1
-  command -v systemctl >/dev/null 2>&1 || return 1
-  viratcp_compile_engine || return 1
-  install_manager_binary || { echo "Failed to install manager binary" >&2; return 1; }
-  viratcp_write_service_template
-  install_health_monitor
-  systemctl enable "$(viratcp_service_name "$id")" >/dev/null || return 1
-  if systemctl restart "$(viratcp_service_name "$id")"; then
-    echo "ViraTCP service enabled and started ($(viratcp_service_name "$id"))"
-    return 0
+wss_setup_for_wireguard() {
+  local id="$1" role="$2" old_secret="" old_port="" input remote_wg_port
+  wss_install_binary || return 1
+  systemctl disable --now "$(wss_service_name "$id")" >/dev/null 2>&1 || true
+  if wss_load_config "$id"; then
+    old_secret="${WSS_PATH_SECRET:-}"
+    old_port="${WSS_BIND_PORT:-${WSS_REMOTE_PORT:-}}"
   fi
-  systemctl status "$(viratcp_service_name "$id")" --no-pager -l 2>/dev/null || true
-  journalctl -u "$(viratcp_service_name "$id")" -n 40 --no-pager 2>/dev/null || true
-  return 1
-}
 
-viratcp_create_tunnel() {
-  validate_tunnel_id "${TUNNEL_ID:-}" || { echo "Invalid tunnel number." >&2; return 1; }
-  VIRATCP_IFACE="$(viratcp_iface_name "$TUNNEL_ID")"
-  LOCAL_PUBLIC_IP="${LOCAL_PUBLIC_IP:-$(detect_local_public_ip)}"
-  local_ipv4_is_assigned "$LOCAL_PUBLIC_IP" || { echo "Selected ViraTCP local IP is not assigned: $LOCAL_PUBLIC_IP" >&2; return 1; }
-  if [ "$ROLE" = "1" ]; then
-    SERVER_ROLE="IRAN"; VIRATCP_MODE="client"; LOCAL_VIRATCP_IP="10.81.$TUNNEL_ID.1"; REMOTE_VIRATCP_IP="10.81.$TUNNEL_ID.2"
+  echo
+  echo "WSS transports WireGuard UDP inside HTTPS/WebSocket."
+  echo "Use the same TCP port and secret on both servers. Port 443 is preferred when free."
+  read -rp "WSS TCP port [${old_port:-$WSS_DEFAULT_TCP_PORT}] (00=menu): " input
+  is_main_menu_token "$input" && return 99
+  input="${input:-${old_port:-$WSS_DEFAULT_TCP_PORT}}"
+  validate_port "$input" || { err_msg "Invalid WSS TCP port."; return 1; }
+
+  if [ -n "$old_secret" ]; then
+    read -rp "WSS secret [Enter=keep, NEW=generate, or paste same secret] (00=menu): " WSS_PATH_SECRET
+    is_main_menu_token "$WSS_PATH_SECRET" && return 99
+    case "${WSS_PATH_SECRET^^}" in NEW) WSS_PATH_SECRET="$(wss_random_secret)" ;; "") WSS_PATH_SECRET="$old_secret" ;; esac
   else
-    SERVER_ROLE="KHAREJ"; VIRATCP_MODE="server"; LOCAL_VIRATCP_IP="10.81.$TUNNEL_ID.2"; REMOTE_VIRATCP_IP="10.81.$TUNNEL_ID.1"
+    if [ "$role" = "2" ]; then
+      WSS_PATH_SECRET="$(wss_random_secret)"
+      echo "Generated WSS secret. Copy it exactly to the Iran server:"
+      echo "$WSS_PATH_SECRET"
+    else
+      read -rp "Paste WSS secret generated on the Kharej server (00=menu): " WSS_PATH_SECRET
+      is_main_menu_token "$WSS_PATH_SECRET" && return 99
+    fi
   fi
-  VIRATCP_PORT="${VIRATCP_PORT:-$VIRATCP_DEFAULT_PORT}"
-  VIRATCP_MTU="${VIRATCP_MTU:-$VIRATCP_DEFAULT_MTU}"
-  VIRATCP_KEEPALIVE="${VIRATCP_KEEPALIVE:-$VIRATCP_DEFAULT_KEEPALIVE}"
-  VIRATCP_RECONNECT="${VIRATCP_RECONNECT:-$VIRATCP_DEFAULT_RECONNECT}"
-  VIRATCP_TCP_USER_TIMEOUT="${VIRATCP_TCP_USER_TIMEOUT:-$VIRATCP_DEFAULT_TCP_USER_TIMEOUT}"
-  viratcp_validate_psk "$VIRATCP_PSK" || { echo "Invalid ViraTCP PSK; it must be exactly 64 hexadecimal characters." >&2; return 1; }
+  wss_validate_secret "$WSS_PATH_SECRET" || { err_msg "WSS secret must be 12-80 characters: letters, numbers, _ or -."; return 1; }
 
-  echo "[*] Local server public IP: $LOCAL_PUBLIC_IP"
-  echo "[*] Tunnel type: ViraTCP encrypted TCP-TUN"
-  echo "[*] Tunnel number: $TUNNEL_ID"
-  echo "[*] Interface: $VIRATCP_IFACE"
-  echo "[*] Server role: $SERVER_ROLE ($VIRATCP_MODE)"
-  echo "[*] Remote server public IP: $REMOTE_PUBLIC_IP"
-  echo "[*] Local ViraTCP IP: $LOCAL_VIRATCP_IP"
-  echo "[*] Remote ViraTCP IP: $REMOTE_VIRATCP_IP"
-  echo "[*] TCP port: $VIRATCP_PORT"
-  echo "[*] MTU: $VIRATCP_MTU"
-  echo "[*] Encryption: AES-256-GCM with pre-shared key"
-
-  modprobe tun || true
-  enable_ip_forward
-  viratcp_compile_engine || return 1
-  viratcp_save_config
-  viratcp_apply_firewall_rules "$TUNNEL_ID" || true
-  viratcp_install_service "$TUNNEL_ID"
-}
-
-viratcp_menu_config_tunnel() {
-  show_header "Configure ViraTCP Encrypted TCP-TUN"
-  echo "Iran role opens an outbound TCP connection; Kharej role listens on the selected TCP port."
-  echo "Use the exact same port and 64-character PSK on both servers."
-  echo
-  prompt_role || return
-  local selected_role existing_local_ip="" existing_remote_ip="" existing_port="" existing_mtu="" existing_psk="" input
-  selected_role="$ROLE"
-  echo
-  prompt_tunnel_id "Enter ViraTCP tunnel number before IP [1-254]: " || return
-  if viratcp_load_config "$TUNNEL_ID"; then
-    existing_local_ip="${LOCAL_PUBLIC_IP:-}"; existing_remote_ip="${REMOTE_PUBLIC_IP:-}"; existing_port="${VIRATCP_PORT:-}"
-    existing_mtu="${VIRATCP_MTU:-}"; existing_psk="${VIRATCP_PSK:-}"
+  WSS_TARGET_UDP_PORT="$LOCAL_WG_PORT"
+  WSS_BIND_PORT=""
+  WSS_REMOTE_IP=""
+  WSS_REMOTE_PORT=""
+  WSS_LOCAL_UDP_PORT=""
+  if [ "$role" = "2" ]; then
+    # Kharej receives WSS/TCP and delivers the inner UDP packets to local WireGuard.
+    WSS_MODE="server"
+    WSS_BIND_PORT="$input"
+    if ss -H -ltn "sport = :$WSS_BIND_PORT" 2>/dev/null | grep -q .; then
+      err_msg "TCP port $WSS_BIND_PORT is already in use on this server. Choose another port (for example 8443 or 2053)."
+      return 1
+    fi
+    wss_open_server_firewall "$WSS_BIND_PORT"
+    WG_ENDPOINT_MODE="wss-server"
+    WG_ENDPOINT_IP=""
+    WG_TRANSPORT_IFACE=""
+  else
+    # Iran originates WSS and points WireGuard to a local UDP relay.
+    WSS_MODE="client"
+    WSS_REMOTE_IP="$REMOTE_PUBLIC_IP"
+    WSS_REMOTE_PORT="$input"
+    WSS_LOCAL_UDP_PORT="$(auto_select_udp_port "$(wss_default_local_udp_port "$id")" "" "wss" "$id")" || return 1
+    read -rp "Remote Kharej WireGuard UDP port [$LOCAL_WG_PORT] (00=menu): " remote_wg_port
+    is_main_menu_token "$remote_wg_port" && return 99
+    remote_wg_port="${remote_wg_port:-$LOCAL_WG_PORT}"
+    validate_port "$remote_wg_port" || { err_msg "Invalid remote WireGuard UDP port."; return 1; }
+    WSS_TARGET_UDP_PORT="$remote_wg_port"
+    WG_ENDPOINT_MODE="wss-client"
+    WG_ENDPOINT_IP="127.0.0.1"
+    WG_TRANSPORT_IFACE=""
+    REMOTE_WG_PORT="$WSS_LOCAL_UDP_PORT"
   fi
-  ROLE="$selected_role"
-  echo
-  echo "ViraTCP tunnel $TUNNEL_ID plan:"
-  echo "  Interface       : $(viratcp_iface_name "$TUNNEL_ID")"
-  echo "  Config file     : $(viratcp_config_file "$TUNNEL_ID")"
-  echo "  Service         : $(viratcp_service_name "$TUNNEL_ID")"
-  echo "  Iran role       : client / 10.81.$TUNNEL_ID.1"
-  echo "  Kharej role     : server / 10.81.$TUNNEL_ID.2"
-  echo
-  prompt_local_tunnel_ip "${existing_local_ip:-$(detect_local_public_ip || true)}" "Enter LOCAL server Public IPv4 for ViraTCP" || return
-  echo
-  prompt_remote_public_ip "$existing_remote_ip" || return
-  echo
-  read -rp "Enter ViraTCP TCP port [${existing_port:-$VIRATCP_DEFAULT_PORT}] (00=menu): " input
-  if is_main_menu_token "$input"; then return_main_msg; return 99; fi
-  VIRATCP_PORT="${input:-${existing_port:-$VIRATCP_DEFAULT_PORT}}"
-  validate_port "$VIRATCP_PORT" || { echo "Invalid TCP port."; return; }
-  if [ "$ROLE" = "2" ] && [ "$VIRATCP_PORT" != "${existing_port:-}" ] && command -v ss >/dev/null 2>&1 && ss -H -ltn "sport = :$VIRATCP_PORT" 2>/dev/null | grep -q .; then
-    warn_msg "TCP port $VIRATCP_PORT is already listening on this Kharej server. Choose another unused port, or stop the current service first."
+
+  wss_save_config "$id"
+  wss_write_service_template
+  install_manager_binary >/dev/null 2>&1 || return 1
+  systemctl enable "$(wss_service_name "$id")" >/dev/null 2>&1 || true
+  if ! systemctl restart "$(wss_service_name "$id")"; then
+    err_msg "WSS transport failed to start. Check: journalctl -u $(wss_service_name "$id") -n 80 --no-pager"
     return 1
   fi
-  read -rp "Enter ViraTCP MTU [${existing_mtu:-$VIRATCP_DEFAULT_MTU}] (00=menu): " input
-  if is_main_menu_token "$input"; then return_main_msg; return 99; fi
-  VIRATCP_MTU="${input:-${existing_mtu:-$VIRATCP_DEFAULT_MTU}}"
-  [[ "$VIRATCP_MTU" =~ ^[0-9]+$ ]] && [ "$VIRATCP_MTU" -ge 576 ] && [ "$VIRATCP_MTU" -le 1500 ] || { echo "Invalid MTU."; return 1; }
-  echo
-  if [ -n "$existing_psk" ]; then
-    read -rp "ViraTCP PSK [press Enter to keep existing, or paste a new 64-hex key] (00=menu): " input
-    if is_main_menu_token "$input"; then return_main_msg; return 99; fi
-    VIRATCP_PSK="${input:-$existing_psk}"
-  else
-    read -rp "Paste the SAME 64-hex PSK used on the other server, or press Enter to generate one (00=menu): " input
-    if is_main_menu_token "$input"; then return_main_msg; return 99; fi
-    VIRATCP_PSK="${input:-$(viratcp_generate_psk)}"
-  fi
-  viratcp_validate_psk "$VIRATCP_PSK" || { echo "Invalid PSK. Use exactly 64 hexadecimal characters."; return 1; }
-  echo
-  echo -e "${C_YELLOW}${C_BOLD}ViraTCP PSK (copy this exact value to the other server):${C_RESET}"
-  echo "$VIRATCP_PSK"
-  echo
-  viratcp_create_tunnel || echo "ViraTCP tunnel creation failed"
+  ok_msg "WSS transport $id started in $WSS_MODE mode."
+  echo "WSS secret: $WSS_PATH_SECRET"
 }
 
-viratcp_collect_ids() {
-  {
-    if [ -d "$VIRATCP_CONFIG_DIR" ]; then
-      local f id
-      for f in "$VIRATCP_CONFIG_DIR"/tunnel-*.conf; do
-        [ -e "$f" ] || continue; id="${f##*/tunnel-}"; id="${id%.conf}"; validate_tunnel_id "$id" && echo "$id"
-      done
-    fi
-    ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1 | grep -E "^${VIRATCP_IFACE_PREFIX}[0-9]+$" | sed "s/^${VIRATCP_IFACE_PREFIX}//" | awk '$1 >= 1 && $1 <= 254' || true
-  } | sort -n -u
-}
-
-viratcp_list_tunnels() {
-  echo "ViraTCP encrypted TCP-TUN tunnels:"
-  local ids id ifc state mode port
-  ids="$(viratcp_collect_ids || true)"; [ -n "$ids" ] || { echo "  none"; return 0; }
-  while IFS= read -r id; do
-    [ -n "$id" ] || continue; ifc="$(viratcp_iface_name "$id")"; state="inactive"; mode="unknown"; port="unknown"
-    tunnel_iface_is_up "$ifc" && state="active"
-    if viratcp_load_config "$id"; then mode="${VIRATCP_MODE:-unknown}"; port="${VIRATCP_PORT:-unknown}"; fi
-    echo "  - tunnel $id | iface $ifc | $state | mode: $mode | TCP: $port | config: $(viratcp_config_file "$id") | service: $(systemctl is-enabled "$(viratcp_service_name "$id")" 2>/dev/null || true)"
-  done <<< "$ids"
-}
-
-viratcp_remove_one_tunnel() {
-  local id="$1" ifc file port mode
-  ifc="$(viratcp_iface_name "$id")"; file="$(viratcp_config_file "$id")"; port=""; mode=""
-  if viratcp_load_config "$id"; then port="${VIRATCP_PORT:-}"; mode="${VIRATCP_MODE:-}"; fi
-  echo "Removing ViraTCP tunnel $id ($ifc)..."
-  systemctl disable --now "$(viratcp_service_name "$id")" 2>/dev/null || true
-  ip link delete "$ifc" 2>/dev/null || true
-  if [ "$mode" = "server" ] && [ -n "$port" ] && command -v iptables >/dev/null 2>&1; then
+wss_remove_one() {
+  local id="$1" port=""
+  if wss_load_config "$id"; then port="${WSS_BIND_PORT:-}"; fi
+  systemctl disable --now "$(wss_service_name "$id")" >/dev/null 2>&1 || true
+  rm -f "$(wss_config_file "$id")"
+  if [ -n "$port" ] && command -v iptables >/dev/null 2>&1; then
     while iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null; do iptables -D INPUT -p tcp --dport "$port" -j ACCEPT || break; done
   fi
-  rm -f "$file"
+  if [ -n "$port" ] && command -v ufw >/dev/null 2>&1; then
+    ufw delete allow "$port/tcp" >/dev/null 2>&1 || true
+  fi
+  if [ -n "$port" ] && command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    firewall-cmd --permanent --remove-port="$port/tcp" >/dev/null 2>&1 || true
+    firewall-cmd --reload >/dev/null 2>&1 || true
+  fi
   systemctl daemon-reload >/dev/null 2>&1 || true
-  echo "[OK] ViraTCP tunnel $id removed."
-}
-
-viratcp_restart_one_tunnel() {
-  local id="$1"
-  viratcp_load_config "$id" || return 1
-  viratcp_compile_engine || return 1
-  viratcp_write_service_template
-  viratcp_apply_firewall_rules "$id" >/dev/null 2>&1 || true
-  systemctl enable "$(viratcp_service_name "$id")" >/dev/null 2>&1 || true
-  systemctl restart "$(viratcp_service_name "$id")"
 }
 
 # -----------------------------
+# Legacy v10 Vira cleanup helpers. v11 cannot create or start Vira tunnels.
+vira7_iface_name() { echo "vira7$1"; }
+vira7_config_file() { echo "$VIRA7_CONFIG_DIR/tunnel-$1.conf"; }
+vira7_service_name() { echo "vira7-tunnel@$1.service"; }
+vira7_collect_ids() {
+  local f id
+  [ -d "$VIRA7_CONFIG_DIR" ] || return 0
+  for f in "$VIRA7_CONFIG_DIR"/tunnel-*.conf; do
+    [ -e "$f" ] || continue
+    id="${f##*/tunnel-}"; id="${id%.conf}"
+    validate_tunnel_id "$id" && echo "$id"
+  done | sort -n -u
+}
+vira7_remove_one_tunnel() {
+  local id="$1" ifc file port=""
+  ifc="$(vira7_iface_name "$id")"; file="$(vira7_config_file "$id")"
+  [ -f "$file" ] && port="$(awk -F= '$1=="VIRA7_PORT" || $1=="port" {gsub(/[\047\042[:space:]]/, "", $2); print $2; exit}' "$file" 2>/dev/null || true)"
+  systemctl disable --now "$(vira7_service_name "$id")" >/dev/null 2>&1 || true
+  ip link delete "$ifc" >/dev/null 2>&1 || true
+  if validate_port "$port" && command -v iptables >/dev/null 2>&1; then
+    while iptables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null; do iptables -D INPUT -p udp --dport "$port" -j ACCEPT || break; done
+  fi
+  rm -f "$file"
+  echo "[OK] Legacy Vira7 tunnel $id removed."
+}
+
+# Legacy v10 ViraTCP cleanup helpers. v11 cannot create or start Vira tunnels.
+viratcp_iface_name() { echo "viratcp$1"; }
+viratcp_config_file() { echo "$VIRATCP_CONFIG_DIR/tunnel-$1.conf"; }
+viratcp_service_name() { echo "viratcp-tunnel@$1.service"; }
+viratcp_collect_ids() {
+  local f id
+  [ -d "$VIRATCP_CONFIG_DIR" ] || return 0
+  for f in "$VIRATCP_CONFIG_DIR"/tunnel-*.conf; do
+    [ -e "$f" ] || continue
+    id="${f##*/tunnel-}"; id="${id%.conf}"
+    validate_tunnel_id "$id" && echo "$id"
+  done | sort -n -u
+}
+viratcp_remove_one_tunnel() {
+  local id="$1" ifc file port=""
+  ifc="$(viratcp_iface_name "$id")"; file="$(viratcp_config_file "$id")"
+  [ -f "$file" ] && port="$(awk -F= '$1=="VIRATCP_PORT" || $1=="port" {gsub(/[\047\042[:space:]]/, "", $2); print $2; exit}' "$file" 2>/dev/null || true)"
+  systemctl disable --now "$(viratcp_service_name "$id")" >/dev/null 2>&1 || true
+  ip link delete "$ifc" >/dev/null 2>&1 || true
+  if validate_port "$port" && command -v iptables >/dev/null 2>&1; then
+    while iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null; do iptables -D INPUT -p tcp --dport "$port" -j ACCEPT || break; done
+  fi
+  rm -f "$file"
+  echo "[OK] Legacy ViraTCP tunnel $id removed."
+}
+
 # Shared helpers/menus
 # -----------------------------
 enable_ip_forward() {
@@ -4315,9 +3126,6 @@ enable_ip_forward() {
 declare -a INV_TYPE INV_ID INV_IFACE INV_LOCAL INV_TARGET INV_LOCAL_PUBLIC INV_REMOTE_PUBLIC INV_STATE INV_DESC
 
 build_tunnel_inventory() {
-  # Aggregation was removed from the user-facing manager in v10.1.0.
-  # Keep the optional argument only for backward-compatible internal cleanup.
-  local include_aggregates="${1:-0}"
   INV_TYPE=(); INV_ID=(); INV_IFACE=(); INV_LOCAL=(); INV_TARGET=(); INV_LOCAL_PUBLIC=(); INV_REMOTE_PUBLIC=(); INV_STATE=(); INV_DESC=()
   local ids id ifc local_ip target local_pub remote_pub state desc
 
@@ -4355,57 +3163,6 @@ build_tunnel_inventory() {
     INV_TYPE+=("wireguard"); INV_ID+=("$id"); INV_IFACE+=("$ifc"); INV_LOCAL+=("$local_ip"); INV_TARGET+=("$target"); INV_LOCAL_PUBLIC+=("$local_pub"); INV_REMOTE_PUBLIC+=("$remote_pub"); INV_STATE+=("$state"); INV_DESC+=("$desc")
   done <<< "$ids"
 
-  ids="$(vira7_collect_ids || true)"
-  while IFS= read -r id; do
-    [ -n "$id" ] || continue
-    ifc="$(vira7_iface_name "$id")"
-    local_ip=""; target=""; local_pub=""; remote_pub=""; desc="Vira7 UDP-TUN"
-    if vira7_load_config "$id"; then
-      local_ip="${LOCAL_VIRA7_IP:-${local_priv:-}}"
-      target="${REMOTE_VIRA7_IP:-${remote_priv:-}}"
-      local_pub="${LOCAL_PUBLIC_IP:-${bind_ip:-}}"
-      remote_pub="${REMOTE_PUBLIC_IP:-${remote_ip:-}}"
-    fi
-    if tunnel_iface_is_up "$ifc"; then state="active"; else state="inactive"; fi
-    INV_TYPE+=("vira7"); INV_ID+=("$id"); INV_IFACE+=("$ifc"); INV_LOCAL+=("$local_ip"); INV_TARGET+=("$target"); INV_LOCAL_PUBLIC+=("$local_pub"); INV_REMOTE_PUBLIC+=("$remote_pub"); INV_STATE+=("$state"); INV_DESC+=("$desc")
-  done <<< "$ids"
-
-  ids="$(viratcp_collect_ids || true)"
-  while IFS= read -r id; do
-    [ -n "$id" ] || continue
-    ifc="$(viratcp_iface_name "$id")"
-    local_ip=""; target=""; local_pub=""; remote_pub=""; desc="ViraTCP encrypted TCP-TUN"
-    if viratcp_load_config "$id"; then
-      local_ip="${LOCAL_VIRATCP_IP:-${local_priv:-}}"
-      target="${REMOTE_VIRATCP_IP:-${remote_priv:-}}"
-      local_pub="${LOCAL_PUBLIC_IP:-${bind_ip:-}}"
-      remote_pub="${REMOTE_PUBLIC_IP:-${remote_ip:-}}"
-    fi
-    if tunnel_iface_is_up "$ifc"; then state="active"; else state="inactive"; fi
-    INV_TYPE+=("viratcp"); INV_ID+=("$id"); INV_IFACE+=("$ifc"); INV_LOCAL+=("$local_ip"); INV_TARGET+=("$target"); INV_LOCAL_PUBLIC+=("$local_pub"); INV_REMOTE_PUBLIC+=("$remote_pub"); INV_STATE+=("$state"); INV_DESC+=("$desc")
-  done <<< "$ids"
-
-  # Aggregate profiles participate in the same user-facing inventory as real
-  # tunnels.  Internal member lookups call this function with 0 to avoid
-  # recursively expanding aggregates while an aggregate is being rebuilt.
-  if [ "$include_aggregates" = "1" ]; then
-    ids="$(aggregate_collect_ids || true)"
-    while IFS= read -r id; do
-      [ -n "$id" ] || continue
-      ifc="$(aggregate_iface_name "$id")"
-      local_ip=""; target=""; local_pub=""; remote_pub=""; desc="Aggregate ECMP"
-      if aggregate_load_config "$id"; then
-        local_ip="${LOCAL_AGG_IP:-}"
-        target="${REMOTE_AGG_IP:-}"
-      fi
-      if tunnel_iface_is_up "$ifc" && [ -n "$target" ] && ip route show "$target/32" 2>/dev/null | grep -q .; then
-        state="active"
-      else
-        state="inactive"
-      fi
-      INV_TYPE+=("aggregate"); INV_ID+=("$id"); INV_IFACE+=("$ifc"); INV_LOCAL+=("$local_ip"); INV_TARGET+=("$target"); INV_LOCAL_PUBLIC+=("$local_pub"); INV_REMOTE_PUBLIC+=("$remote_pub"); INV_STATE+=("$state"); INV_DESC+=("$desc")
-    done <<< "$ids"
-  fi
 }
 
 
@@ -4441,9 +3198,6 @@ remove_inventory_item() {
   case "$type" in
     gre) gre_remove_one_tunnel "$id" ;;
     wireguard) wg_remove_one_tunnel "$id" ;;
-    vira7) vira7_remove_one_tunnel "$id" ;;
-    viratcp) viratcp_remove_one_tunnel "$id" ;;
-    aggregate) aggregate_remove_profile "$id" ;;
   esac
 }
 
@@ -4455,9 +3209,6 @@ ping_inventory_item() {
   case "$type" in
     gre) test_gre_tunnel_ping "$id" ;;
     wireguard) test_wg_tunnel_ping "$id" ;;
-    vira7) test_vira7_tunnel_ping "$id" ;;
-    viratcp) test_viratcp_tunnel_ping "$id" ;;
-    aggregate) test_aggregate_profile_ping "$id" ;;
   esac
 }
 
@@ -4489,10 +3240,6 @@ wg_uses_transport_tunnel() {
       expected_ifc="$(gre_iface "$transport_id")"
       [ "${WG_ENDPOINT_MODE:-}" = "gre" ] || return 1
       ;;
-    vira7)
-      expected_ifc="$(vira7_iface_name "$transport_id")"
-      [ "${WG_ENDPOINT_MODE:-}" = "vira7" ] || return 1
-      ;;
     *)
       return 1
       ;;
@@ -4507,7 +3254,7 @@ wg_uses_transport_tunnel() {
   [ "$wg_id" = "$transport_id" ]
 }
 
-# Prevent accidental removal of a GRE/Vira7 transport that still has a WireGuard tunnel on top.
+# Prevent accidental removal of a GRE transport that still has WireGuard on top.
 # This avoids the common "I removed one tunnel and the others stopped" case.
 remove_selection_dependency_guard() {
   local -a selected=("$@")
@@ -4519,7 +3266,7 @@ remove_selection_dependency_guard() {
     id="${INV_ID[$i]:-}"
 
     case "$type" in
-      gre|vira7)
+      gre)
         wg_ids="$(wg_collect_ids || true)"
         while IFS= read -r wg_id; do
           [ -n "$wg_id" ] || continue
@@ -4570,34 +3317,6 @@ heal_remaining_tunnels_after_remove() {
     fi
   done <<< "$ids"
 
-  ids="$(vira7_collect_ids || true)"
-  while IFS= read -r id; do
-    [ -n "$id" ] || continue
-    if vira7_load_config "$id"; then
-      ifc="$(vira7_iface_name "$id")"
-      vira7_apply_firewall_rules "$id" >/dev/null 2>&1 || true
-      svc="$(vira7_service_name "$id")"
-      if command -v systemctl >/dev/null 2>&1 && systemctl is-enabled --quiet "$svc" 2>/dev/null && ! ip link show "$ifc" >/dev/null 2>&1; then
-        warn_msg "Remaining Vira7 tunnel $id is enabled but inactive; restarting only this tunnel."
-        systemctl restart "$svc" 2>/dev/null || true
-      fi
-    fi
-  done <<< "$ids"
-
-  ids="$(viratcp_collect_ids || true)"
-  while IFS= read -r id; do
-    [ -n "$id" ] || continue
-    if viratcp_load_config "$id"; then
-      ifc="$(viratcp_iface_name "$id")"
-      viratcp_apply_firewall_rules "$id" >/dev/null 2>&1 || true
-      svc="$(viratcp_service_name "$id")"
-      if command -v systemctl >/dev/null 2>&1 && systemctl is-enabled --quiet "$svc" 2>/dev/null && ! tunnel_iface_is_up "$ifc"; then
-        warn_msg "Remaining ViraTCP tunnel $id is enabled but inactive; restarting only this tunnel."
-        systemctl restart "$svc" 2>/dev/null || true
-      fi
-    fi
-  done <<< "$ids"
-
   ids="$(wg_collect_ids || true)"
   while IFS= read -r id; do
     [ -n "$id" ] || continue
@@ -4620,9 +3339,16 @@ menu_config_tunnel() {
   ask_tunnel_type || return
   case "$SELECTED_TUNNEL_TYPE" in
     gre) gre_menu_config_tunnel ;;
-    wireguard) wg_menu_config_tunnel ;;
-    vira7) vira7_menu_config_tunnel ;;
-    viratcp) viratcp_menu_config_tunnel ;;
+    wireguard)
+      FORCE_WG_TRANSPORT="auto"
+      wg_menu_config_tunnel
+      unset FORCE_WG_TRANSPORT
+      ;;
+    wsswireguard)
+      FORCE_WG_TRANSPORT="wss"
+      wg_menu_config_tunnel
+      unset FORCE_WG_TRANSPORT
+      ;;
   esac
 }
 
@@ -4651,23 +3377,16 @@ remove_tun() {
 
   if [ "$selected" = "88" ]; then
     echo
-    echo -e "${C_RED}${C_BOLD}WARNING:${C_RESET} this will remove ALL aggregate profiles, GRE, WireGuard, Vira7, and ViraTCP tunnels."
+    echo -e "${C_RED}${C_BOLD}WARNING:${C_RESET} this will remove ALL managed GRE, WireGuard, and WSS transport tunnels."
     if ! confirm_yes "Are you sure?"; then
       echo "Cancelled."
       return
     fi
 
     local ids id
-    # Remove aggregate profiles before the member tunnels they reference.
-    ids="$(aggregate_collect_ids || true)"
-    while IFS= read -r id; do [ -n "$id" ] && aggregate_remove_profile "$id"; done <<< "$ids"
-    # Remove UDP/overlay tunnels first, then GRE transport last.
+    # Removing WireGuard also removes its matching WSS transport. GRE stays last.
     ids="$(wg_collect_ids || true)"
     while IFS= read -r id; do [ -n "$id" ] && wg_remove_one_tunnel "$id"; done <<< "$ids"
-    ids="$(vira7_collect_ids || true)"
-    while IFS= read -r id; do [ -n "$id" ] && vira7_remove_one_tunnel "$id"; done <<< "$ids"
-    ids="$(viratcp_collect_ids || true)"
-    while IFS= read -r id; do [ -n "$id" ] && viratcp_remove_one_tunnel "$id"; done <<< "$ids"
     ids="$(gre_collect_ids || true)"
     while IFS= read -r id; do [ -n "$id" ] && gre_remove_one_tunnel "$id"; done <<< "$ids"
     ok_msg "All tunnels removed."
@@ -4722,9 +3441,8 @@ remove_tun() {
     return
   fi
 
-  # Remove in dependency-safe order. Profiles go before their members;
-  # WireGuard may depend on GRE/Vira transport, so GRE remains last.
-  for phase in aggregate wireguard vira7 viratcp gre; do
+  # Remove in dependency-safe order: WireGuard before its GRE transport.
+  for phase in wireguard gre; do
     for idx in "${SELECTED_INDEXES[@]}"; do
       i=$((idx - 1))
       if [ "${INV_TYPE[$i]}" = "$phase" ]; then
@@ -4748,10 +3466,6 @@ list_saved_tunnels() {
   gre_list_tunnels
   echo
   wg_list_tunnels
-  echo
-  vira7_list_tunnels
-  echo
-  viratcp_list_tunnels
 }
 
 ping4_target() {
@@ -4825,47 +3539,6 @@ test_wg_tunnel_ping() {
   ping4_target "WireGuard tunnel $id ($(wg_iface_name "$id")) remote inner IP" "${REMOTE_WG_IP:-}" "$(wg_iface_name "$id")"
 }
 
-test_vira7_tunnel_ping() {
-  local id="$1"
-  if ! vira7_load_config "$id"; then
-    echo "[SKIP] Vira7 tunnel $id: no saved config"
-    return 1
-  fi
-  ping4_target "Vira7 tunnel $id ($(vira7_iface_name "$id")) remote inner IP" "${REMOTE_VIRA7_IP:-${remote_priv:-}}" "$(vira7_iface_name "$id")"
-}
-
-test_viratcp_tunnel_ping() {
-  local id="$1" ifc svc
-  if ! viratcp_load_config "$id"; then
-    echo "[SKIP] ViraTCP tunnel $id: no saved config"
-    return 1
-  fi
-  ifc="$(viratcp_iface_name "$id")"; svc="$(viratcp_service_name "$id")"
-  if ! tunnel_iface_is_up "$ifc"; then
-    echo "[REPAIR] $ifc is inactive; restarting ViraTCP service..."
-    systemctl restart "$svc" >/dev/null 2>&1 || true
-    sleep 2
-  fi
-  ping4_target "ViraTCP tunnel $id ($ifc) remote inner IP" "${REMOTE_VIRATCP_IP:-${remote_priv:-}}" "$ifc"
-}
-
-test_aggregate_profile_ping() {
-  local id="$1" ifc target source_ip
-  if ! aggregate_load_config "$id"; then
-    echo "[SKIP] Aggregate profile $id: no valid saved configuration"
-    return 1
-  fi
-  ifc="$(aggregate_iface_name "$id")"
-  target="$REMOTE_AGG_IP"
-  source_ip="$LOCAL_AGG_IP"
-  # Rebuild the ECMP route first so a recovered member is included before the
-  # user tests the virtual peer address.
-  aggregate_apply_profile "$id" >/dev/null 2>&1 || true
-  # Bind the virtual source address, not the dummy device: the actual egress
-  # device must remain free for the kernel to choose an ECMP member.
-  ping4_target "Aggregate profile $id ($ifc) peer virtual IP" "$target" "$source_ip"
-}
-
 test_one_tunnel_ping_menu() {
   show_header "Test One Tunnel"
   ask_tunnel_type || return
@@ -4873,9 +3546,7 @@ test_one_tunnel_ping_menu() {
   prompt_tunnel_id "Enter tunnel number to test [1-254]: " || return
   case "$SELECTED_TUNNEL_TYPE" in
     gre) test_gre_tunnel_ping "$TUNNEL_ID" ;;
-    wireguard) test_wg_tunnel_ping "$TUNNEL_ID" ;;
-    vira7) test_vira7_tunnel_ping "$TUNNEL_ID" ;;
-    viratcp) test_viratcp_tunnel_ping "$TUNNEL_ID" ;;
+    wireguard|wsswireguard) test_wg_tunnel_ping "$TUNNEL_ID" ;;
   esac
 }
 
@@ -4898,24 +3569,6 @@ test_all_tunnels_ping() {
     [ -n "$id" ] || continue
     total=$((total + 1))
     if test_wg_tunnel_ping "$id"; then ok=$((ok + 1)); else fail=$((fail + 1)); fi
-  done <<< "$ids"
-
-  echo
-  echo "Testing all saved Vira7 tunnels..."
-  ids="$(vira7_collect_ids || true)"
-  while IFS= read -r id; do
-    [ -n "$id" ] || continue
-    total=$((total + 1))
-    if test_vira7_tunnel_ping "$id"; then ok=$((ok + 1)); else fail=$((fail + 1)); fi
-  done <<< "$ids"
-
-  echo
-  echo "Testing all saved ViraTCP tunnels..."
-  ids="$(viratcp_collect_ids || true)"
-  while IFS= read -r id; do
-    [ -n "$id" ] || continue
-    total=$((total + 1))
-    if test_viratcp_tunnel_ping "$id"; then ok=$((ok + 1)); else fail=$((fail + 1)); fi
   done <<< "$ids"
 
   echo
@@ -4968,7 +3621,6 @@ tunnel_speed_test_menu() {
     fi
   elif [ "$role" = "1" ]; then
     echo "Make sure iperf3 -s is running on the Kharej server, then testing through the selected tunnel..."
-    [ "$type" = "aggregate" ] && echo "Aggregate test uses 4 parallel flows so ECMP can exercise multiple healthy members."
     if [ -n "$local_ip" ]; then
       echo "Command: iperf3 -c $target -B $local_ip -t $duration -P 4"
       if iperf3 -c "$target" -B "$local_ip" -t "$duration" -P 4; then :; else rc=$?; fi
@@ -4988,10 +3640,10 @@ tunnel_speed_test_menu() {
   return 0
 }
 
+# Legacy aggregate cleanup helpers. v11 cannot create or apply ECMP profiles.
 aggregate_config_file() { echo "$AGG_CONFIG_DIR/profile-$1.conf"; }
 aggregate_iface_name() { echo "${AGG_IFACE_PREFIX}$1"; }
 aggregate_service_name() { echo "gretun-aggregate@$1.service"; }
-
 aggregate_collect_ids() {
   local f id
   [ -d "$AGG_CONFIG_DIR" ] || return 0
@@ -5001,528 +3653,12 @@ aggregate_collect_ids() {
     validate_tunnel_id "$id" && echo "$id"
   done | sort -n -u
 }
-
-aggregate_load_config() {
-  local id="$1" f
-  f="$(aggregate_config_file "$id")"
-  [ -f "$f" ] || return 1
-  unset AGG_PROFILE_ID AGG_ROLE LOCAL_AGG_IP REMOTE_AGG_IP AGG_MEMBERS AGG_MODE
-  # shellcheck disable=SC1090
-  source "$f"
-  validate_tunnel_id "${AGG_PROFILE_ID:-}" || return 1
-  validate_ipv4 "${LOCAL_AGG_IP:-}" || return 1
-  validate_ipv4 "${REMOTE_AGG_IP:-}" || return 1
-  AGG_MODE="${AGG_MODE:-isolated-gre-v2}"
-  [ -n "${AGG_MEMBERS:-}" ]
-}
-
-aggregate_member_details() {
-  local want_type="$1" want_id="$2" ifc="" src="" peer="" state="inactive"
-  case "$want_type" in
-    gre)
-      gre_load_config "$want_id" || return 1
-      ifc="$(gre_iface "$want_id")"; src="${LOCAL_GRE_IP:-}"; src="${src%%/*}"; peer="${REMOTE_GRE_IP:-}"; peer="${peer%%/*}"
-      ;;
-    wireguard)
-      wg_load_meta "$want_id" || return 1
-      ifc="$(wg_iface_name "$want_id")"; src="${LOCAL_WG_IP:-}"; src="${src%%/*}"; peer="${REMOTE_WG_IP:-}"; peer="${peer%%/*}"
-      ;;
-    vira7)
-      vira7_load_config "$want_id" || return 1
-      ifc="$(vira7_iface_name "$want_id")"
-      src="${LOCAL_VIRA7_IP:-${local_priv:-}}"; src="${src%%/*}"
-      peer="${REMOTE_VIRA7_IP:-${remote_priv:-}}"; peer="${peer%%/*}"
-      ;;
-    viratcp)
-      viratcp_load_config "$want_id" || return 1
-      ifc="$(viratcp_iface_name "$want_id")"
-      src="${LOCAL_VIRATCP_IP:-${local_priv:-}}"; src="${src%%/*}"
-      peer="${REMOTE_VIRATCP_IP:-${remote_priv:-}}"; peer="${peer%%/*}"
-      ;;
-    *) return 1 ;;
-  esac
-  tunnel_iface_is_up "$ifc" && state="active"
-  printf '%s\t%s\t%s\t%s\n' "$ifc" "$src" "$peer" "$state"
-}
-
-# Restore the WireGuard peer to its own real addresses only.  v9 injected each
-# aggregate /32 into every member's AllowedIPs, which let wg-quick create
-# competing single-path routes after a restart.  v10 carries aggregate packets
-# inside a keyed GRE path whose outer destination is the normal WG peer /32, so
-# no aggregate address ever needs to enter WireGuard cryptokey routing.
-aggregate_refresh_wireguard_member() {
-  local id="$1" allowed conf ifc key desired_compact current_compact config_compact
-  wg_load_meta "$id" || return 0
-  [ -n "${REMOTE_WG_PUBLIC_KEY:-}" ] || return 0
-  allowed="${REMOTE_WG_IP%%/*}/32"
-  if [ -n "${EXTRA_ALLOWED_IPS:-}" ]; then
-    allowed="$allowed, $EXTRA_ALLOWED_IPS"
-  fi
-  conf="$(wg_config_file "$id")"; ifc="$(wg_iface_name "$id")"; key="$REMOTE_WG_PUBLIC_KEY"
-  desired_compact="$(printf '%s' "$allowed" | tr -d '[:space:]')"
-  if [ -f "$conf" ]; then
-    config_compact="$(awk -F= '/^[[:space:]]*AllowedIPs[[:space:]]*=/{v=$0; sub(/^[^=]*=/,"",v); gsub(/[[:space:]]/,"",v); print v; exit}' "$conf")"
-    if [ "$config_compact" != "$desired_compact" ]; then
-      sed -i -E "s|^[[:space:]]*AllowedIPs[[:space:]]*=.*$|AllowedIPs = $allowed|" "$conf" || true
-    fi
-  fi
-  if command -v wg >/dev/null 2>&1 && ip link show "$ifc" >/dev/null 2>&1; then
-    current_compact="$(wg show "$ifc" allowed-ips 2>/dev/null | awk -v k="$key" '$1==k {$1=""; sub(/^[[:space:]]+/,""); gsub(/[[:space:]]/,""); print; exit}')"
-    if [ "$current_compact" != "$desired_compact" ]; then
-      wg set "$ifc" peer "$key" allowed-ips "$allowed" >/dev/null 2>&1 || true
-    fi
-  fi
-}
-
-aggregate_remove_member_firewall() {
-  local ifc="$1" local_ip="$2" remote_ip="$3"
-  command -v iptables >/dev/null 2>&1 || return 0
-  while iptables -w 5 -C INPUT -i "$ifc" -d "$local_ip" -j ACCEPT 2>/dev/null; do
-    iptables -w 5 -D INPUT -i "$ifc" -d "$local_ip" -j ACCEPT 2>/dev/null || break
-  done
-  while iptables -w 5 -C FORWARD -o "$ifc" -d "$remote_ip" -j ACCEPT 2>/dev/null; do
-    iptables -w 5 -D FORWARD -o "$ifc" -d "$remote_ip" -j ACCEPT 2>/dev/null || break
-  done
-  while iptables -w 5 -C FORWARD -i "$ifc" -s "$remote_ip" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null; do
-    iptables -w 5 -D FORWARD -i "$ifc" -s "$remote_ip" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || break
-  done
-}
-
-aggregate_write_service_template() {
-  command -v systemctl >/dev/null 2>&1 || return 0
-  mkdir -p "$(dirname "$AGG_SERVICE_TEMPLATE")"
-  cat > "$AGG_SERVICE_TEMPLATE" <<EOF_AGG_SERVICE
-[Unit]
-Description=GRE-TUN aggregate profile %i
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/bin/bash $INSTALL_BIN --service apply-aggregate %i
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF_AGG_SERVICE
-}
-
-aggregate_member_type_code() {
-  case "$1" in
-    gre) echo 1 ;;
-    wireguard) echo 2 ;;
-    vira7) echo 3 ;;
-    viratcp) echo 4 ;;
-    *) return 1 ;;
-  esac
-}
-
-aggregate_path_iface() {
-  local profile="$1" type="$2" tid="$3" code
-  code="$(aggregate_member_type_code "$type")" || return 1
-  # Maximum length is 9 characters (ga + 3 + 1 + 3), below IFNAMSIZ=16.
-  printf '%s%s%s%s\n' "$AGG_PATH_IFACE_PREFIX" "$profile" "$code" "$tid"
-}
-
-aggregate_path_key() {
-  local profile="$1" type="$2" tid="$3" code
-  code="$(aggregate_member_type_code "$type")" || return 1
-  echo $((profile * 1000000 + code * 1000 + tid))
-}
-
-aggregate_member_fail_file() {
-  local profile="$1" type="$2" tid="$3"
-  echo "$HEALTH_STATE_DIR/aggregate-${profile}-${type}-${tid}.fail"
-}
-
-aggregate_member_health_reset() {
-  rm -f "$(aggregate_member_fail_file "$1" "$2" "$3")" 2>/dev/null || true
-}
-
-aggregate_member_health_fail() {
-  local file count
-  file="$(aggregate_member_fail_file "$1" "$2" "$3")"
-  mkdir -p "$HEALTH_STATE_DIR" 2>/dev/null || true
-  count="$(cat "$file" 2>/dev/null || echo 0)"
-  [[ "$count" =~ ^[0-9]+$ ]] || count=0
-  count=$((count + 1))
-  printf '%s\n' "$count" > "$file"
-  printf '%s\n' "$count"
-}
-
-aggregate_route_has_path() {
-  local remote="$1" path_if="$2"
-  ip -o route show "$remote/32" 2>/dev/null | grep -Eq "(^|[[:space:]])dev[[:space:]]+$path_if([[:space:]]|$)"
-}
-
-aggregate_member_is_healthy() {
-  local profile="$1" type="$2" tid="$3" ifc="$4" peer="$5" path_if="$6" remote="$7" failures
-  tunnel_iface_is_up "$ifc" || return 1
-
-  if { [ "$type" = "wireguard" ] && wg_iface_has_recent_handshake "$ifc"; } || \
-     { [ "$type" = "gre" ] && transport_has_recent_wg_handshake gre "$tid"; } || \
-     quick_tunnel_ping "$ifc" "$peer"; then
-    aggregate_member_health_reset "$profile" "$type" "$tid"
-    return 0
-  fi
-
-  failures="$(aggregate_member_health_fail "$profile" "$type" "$tid")"
-  # Do not move established flows after a single probe lost under load.  Keep
-  # an already-installed member until several consecutive checks fail.
-  if [ "$failures" -lt "$AGG_FAIL_LIMIT" ] && aggregate_route_has_path "$remote" "$path_if"; then
-    return 0
-  fi
-  return 1
-}
-
-aggregate_ensure_path() {
-  local path_if="$1" src="$2" peer="$3" key="$4" mtu="$5" underlay="$6" shown
-  shown="$(ip tunnel show "$path_if" 2>/dev/null || true)"
-  # Pin every isolated GRE path to its selected member transport. Without this,
-  # nested GRE can recurse through the wrong route (or the physical uplink).
-  if [ -n "$shown" ] && { [[ "$shown" != *"remote $peer"* ]] || [[ "$shown" != *"local $src"* ]] || [[ "$shown" != *"dev $underlay"* ]]; }; then
-    ip link del "$path_if" 2>/dev/null || true
-    shown=""
-  fi
-  if [ -z "$shown" ]; then
-    ip tunnel add "$path_if" mode gre local "$src" remote "$peer" key "$key" dev "$underlay" nopmtudisc || \
-      ip tunnel add "$path_if" mode gre local "$src" remote "$peer" key "$key" dev "$underlay" || return 1
-  fi
-  ip link set dev "$path_if" mtu "$mtu" up || return 1
-  [ -e "/proc/sys/net/ipv4/conf/$path_if/rp_filter" ] && echo 0 > "/proc/sys/net/ipv4/conf/$path_if/rp_filter" 2>/dev/null || true
-}
-
-aggregate_cleanup_stale_paths() {
-  local profile="$1" keep=" ${2:-} " local_ip="${3:-}" remote_ip="${4:-}" ifc
-  ip -o link show 2>/dev/null | awk -F': ' -v p="^${AGG_PATH_IFACE_PREFIX}${profile}[1-4][0-9]+$" '{n=$2; sub(/@.*/,"",n); if(n ~ p) print n}' | while IFS= read -r ifc; do
-    [ -n "$ifc" ] || continue
-    if [[ "$keep" != *" $ifc "* ]]; then
-      [ -n "$local_ip" ] && [ -n "$remote_ip" ] && aggregate_remove_member_firewall "$ifc" "$local_ip" "$remote_ip"
-      ip link del "$ifc" 2>/dev/null || true
-    fi
-  done
-}
-
-aggregate_route_matches() {
-  local remote="$1" expected="$2" expected_mtu="${3:-}" route path actual=0 wanted=0
-  route="$(ip -o route show "$remote/32" 2>/dev/null || true)"
-  [ -n "$route" ] || return 1
-  [ -z "$expected_mtu" ] || [[ "$route" == *"mtu $expected_mtu"* ]] || return 1
-  for path in $expected; do
-    wanted=$((wanted + 1))
-    [[ "$route" == *"dev $path"* ]] || return 1
-  done
-  actual="$(grep -oE "dev[[:space:]]+${AGG_PATH_IFACE_PREFIX}[0-9]+" <<< "$route" | wc -l | tr -d ' ' || true)"
-  [ "$actual" -eq "$wanted" ]
-}
-
-aggregate_apply_profile_unlocked() {
-  local id="$1" iface local_ip remote_ip members ref type tid details ifc src peer state path_if key
-  local healthy=0 min_mtu=65535 member_mtu candidate_mtu keep_paths="" expected_paths=""
-  local -a route_args=() healthy_types=() healthy_ids=() healthy_ifcs=() healthy_srcs=() healthy_peers=() healthy_paths=() healthy_keys=()
-  aggregate_load_config "$id" || return 1
-  local_ip="$LOCAL_AGG_IP"; remote_ip="$REMOTE_AGG_IP"; members="$AGG_MEMBERS"
-  iface="$(aggregate_iface_name "$id")"
-
-  apply_tunnel_sysctls
-  ip link show "$iface" >/dev/null 2>&1 || ip link add "$iface" type dummy
-  ip -4 addr show dev "$iface" 2>/dev/null | grep -qE "[[:space:]]inet[[:space:]]+$local_ip/32([[:space:]]|$)" || ip addr replace "$local_ip/32" dev "$iface"
-  ip link set "$iface" up
-
-  # First select stable members with hysteresis and calculate one conservative
-  # MTU for every path. Equal MTU prevents per-flow PMTU surprises.
-  IFS=',' read -ra _agg_members <<< "$members"
-  for ref in "${_agg_members[@]}"; do
-    type="${ref%%:*}"; tid="${ref#*:}"
-    details="$(aggregate_member_details "$type" "$tid" 2>/dev/null || true)"
-    [ -n "$details" ] || continue
-    IFS=$'\t' read -r ifc src peer state <<< "$details"
-    [ "$state" = "active" ] || continue
-    validate_ipv4 "$peer" || continue
-    validate_ipv4 "$src" || continue
-    path_if="$(aggregate_path_iface "$id" "$type" "$tid")" || continue
-    key="$(aggregate_path_key "$id" "$type" "$tid")" || continue
-    aggregate_member_is_healthy "$id" "$type" "$tid" "$ifc" "$peer" "$path_if" "$remote_ip" || continue
-
-    member_mtu="$(ip -o link show dev "$ifc" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="mtu") {print $(i+1); exit}}')"
-    [[ "$member_mtu" =~ ^[0-9]+$ ]] || member_mtu=1280
-    candidate_mtu=$((member_mtu - 24))
-    [ "$candidate_mtu" -ge 1200 ] || candidate_mtu=1200
-    [ "$candidate_mtu" -lt "$min_mtu" ] && min_mtu="$candidate_mtu"
-    healthy_types+=("$type"); healthy_ids+=("$tid"); healthy_ifcs+=("$ifc")
-    healthy_srcs+=("$src"); healthy_peers+=("$peer"); healthy_paths+=("$path_if"); healthy_keys+=("$key")
-    healthy=$((healthy + 1))
-  done
-
-  if [ "$healthy" -eq 0 ]; then
-    # Transient failures were already absorbed by per-member hysteresis. At
-    # this point every member reached the fail limit, so withdraw the route
-    # instead of blackholing traffic into dead path interfaces forever.
-    ip route del "$remote_ip/32" 2>/dev/null || true
-    aggregate_cleanup_stale_paths "$id" "" "$local_ip" "$remote_ip"
-    return 1
-  fi
-
-  local i
-  for i in "${!healthy_types[@]}"; do
-    type="${healthy_types[$i]}"; tid="${healthy_ids[$i]}"; ifc="${healthy_ifcs[$i]}"
-    src="${healthy_srcs[$i]}"; peer="${healthy_peers[$i]}"; path_if="${healthy_paths[$i]}"; key="${healthy_keys[$i]}"
-    aggregate_ensure_path "$path_if" "$src" "$peer" "$key" "$min_mtu" "$ifc" || continue
-    route_args+=(nexthop dev "$path_if" weight 1)
-    keep_paths+="${keep_paths:+ }$path_if"
-    expected_paths+="${expected_paths:+ }$path_if"
-    if command -v iptables >/dev/null 2>&1; then
-      iptables -w 5 -C INPUT -i "$path_if" -d "$local_ip" -j ACCEPT 2>/dev/null || iptables -w 5 -I INPUT 1 -i "$path_if" -d "$local_ip" -j ACCEPT || true
-      iptables -w 5 -C FORWARD -o "$path_if" -d "$remote_ip" -j ACCEPT 2>/dev/null || iptables -w 5 -I FORWARD 1 -o "$path_if" -d "$remote_ip" -j ACCEPT || true
-      iptables -w 5 -C FORWARD -i "$path_if" -s "$remote_ip" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || iptables -w 5 -I FORWARD 1 -i "$path_if" -s "$remote_ip" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT || true
-    fi
-  done
-
-  [ "${#route_args[@]}" -gt 0 ] || return 1
-  aggregate_cleanup_stale_paths "$id" "$keep_paths" "$local_ip" "$remote_ip"
-  if ! aggregate_route_matches "$remote_ip" "$expected_paths" "$min_mtu"; then
-    ip route replace "$remote_ip/32" proto static mtu "$min_mtu" "${route_args[@]}"
-  fi
-  # Migration from v9: the isolated route is live before aggregate prefixes
-  # are removed from WireGuard, so established traffic never sees a gap.
-  for i in "${!healthy_types[@]}"; do
-    [ "${healthy_types[$i]}" = "wireguard" ] && aggregate_refresh_wireguard_member "${healthy_ids[$i]}"
-  done
-  return 0
-}
-
-aggregate_apply_profile() {
-  local id="$1" lockdir="/run/gretun-aggregate-$1.lock" rc owner=""
-  if ! mkdir "$lockdir" 2>/dev/null; then
-    owner="$(cat "$lockdir/pid" 2>/dev/null || true)"
-    if [[ "$owner" =~ ^[0-9]+$ ]] && kill -0 "$owner" 2>/dev/null; then
-      # Another service/menu health pass is already applying this profile.
-      return 0
-    fi
-    rm -f "$lockdir/pid" 2>/dev/null || true
-    rmdir "$lockdir" 2>/dev/null || return 1
-    mkdir "$lockdir" 2>/dev/null || return 1
-  fi
-  printf '%s\n' "$$" > "$lockdir/pid"
-  if aggregate_apply_profile_unlocked "$id"; then rc=0; else rc=$?; fi
-  rm -f "$lockdir/pid" 2>/dev/null || true
-  rmdir "$lockdir" 2>/dev/null || true
-  if [ "$rc" -ne 0 ]; then
-    return 1
-  fi
-  return 0
-}
-
-aggregate_apply_all() {
-  local ids id
-  ids="$(aggregate_collect_ids || true)"
-  while IFS= read -r id; do
-    [ -n "$id" ] || continue
-    aggregate_apply_profile "$id" >/dev/null 2>&1 || true
-  done <<< "$ids"
-}
-
-aggregate_profile_for_remote_ip() {
-  local target="$1" id ids
-  ids="$(aggregate_collect_ids || true)"
-  while IFS= read -r id; do
-    [ -n "$id" ] || continue
-    if aggregate_load_config "$id" && [ "$REMOTE_AGG_IP" = "$target" ]; then
-      printf '%s\n' "$id"
-      return 0
-    fi
-  done <<< "$ids"
-  return 1
-}
-
-aggregate_uses_member() {
-  local type="$1" id="$2" f members ref found=1
-  for f in "$AGG_CONFIG_DIR"/profile-*.conf; do
-    [ -e "$f" ] || continue
-    members="$(bash -c 'source "$1" 2>/dev/null; printf "%s" "${AGG_MEMBERS:-}"' _ "$f" 2>/dev/null || true)"
-    IFS=',' read -ra _agg_refs <<< "$members"
-    for ref in "${_agg_refs[@]}"; do
-      if [ "$ref" = "$type:$id" ]; then
-        echo "${f##*/profile-}" | sed 's/\.conf$//'
-        found=0
-        break
-      fi
-    done
-  done
-  return "$found"
-}
-
-aggregate_save_profile() {
-  local id="$1" role="$2" local_ip="$3" remote_ip="$4" members="$5" f
-  mkdir -p "$AGG_CONFIG_DIR"
-  f="$(aggregate_config_file "$id")"
-  {
-    write_var AGG_PROFILE_ID "$id"
-    write_var AGG_ROLE "$role"
-    write_var LOCAL_AGG_IP "$local_ip"
-    write_var REMOTE_AGG_IP "$remote_ip"
-    write_var AGG_MEMBERS "$members"
-    write_var AGG_MODE "isolated-gre-v2"
-  } > "$f"
-  chmod 600 "$f"
-}
-
-aggregate_create_menu() {
-  show_header "Create / Update Aggregate Tunnel"
-  ensure_feature_dependencies "aggregation" "ip:iproute2" "ping:iputils-ping" "iptables:iptables" || return 1
-  local role
-  echo "Select this server's location:"
-  echo "1) Iran side"
-  echo "2) Kharej/outside side"
-  read -rp "Choose [1-2] (00=menu): " role
-  is_main_menu_token "$role" && return 99
-  [[ "$role" = "1" || "$role" = "2" ]] || { err_msg "Invalid role."; return 1; }
-  echo
-
-  build_tunnel_inventory
-  print_tunnel_inventory || return 1
-  echo "Select at least two ACTIVE non-aggregate tunnel rows."
-  echo "Examples: 1 2 5  OR  1,2,5"
-  read -rp "Tunnel rows (00=menu): " raw
-  is_main_menu_token "$raw" && return 99
-  raw="$(printf '%s' "$raw" | tr ',' ' ')"
-  read -ra picks <<< "$raw"
-  [ "${#picks[@]}" -ge 2 ] || { err_msg "Select at least two tunnels."; return 1; }
-
-  local p idx seen=" " members="" profile_id local_ip remote_ip
-  local previous_members="" previous_local="" previous_remote="" ref type tid details ifc _src _peer _state
-  for p in "${picks[@]}"; do
-    [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le "${#INV_TYPE[@]}" ] || { err_msg "Invalid tunnel row: $p"; return 1; }
-    [[ "$seen" != *" $p "* ]] || { err_msg "Tunnel row $p was selected twice."; return 1; }
-    seen+="$p "; idx=$((p - 1))
-    [ "${INV_TYPE[$idx]}" != "aggregate" ] || { err_msg "An aggregate profile cannot be a member of another aggregate profile."; return 1; }
-    [ "${INV_STATE[$idx]}" = "active" ] || { err_msg "${INV_IFACE[$idx]} is not active."; return 1; }
-    members+="${members:+,}${INV_TYPE[$idx]}:${INV_ID[$idx]}"
-  done
-
-  read -rp "Aggregate profile number [1-254] (same number on both servers, 00=menu): " profile_id
-  is_main_menu_token "$profile_id" && return 99
-  validate_tunnel_id "$profile_id" || { err_msg "Invalid aggregate profile number."; return 1; }
-  if [ "$role" = "1" ]; then local_ip="10.99.$profile_id.1"; remote_ip="10.99.$profile_id.2"
-  else local_ip="10.99.$profile_id.2"; remote_ip="10.99.$profile_id.1"; fi
-
-  if aggregate_load_config "$profile_id"; then
-    previous_members="$AGG_MEMBERS"; previous_local="$LOCAL_AGG_IP"; previous_remote="$REMOTE_AGG_IP"
-    ip route del "$previous_remote/32" 2>/dev/null || true
-    if [ "$previous_local" != "$local_ip" ]; then
-      ip addr del "$previous_local/32" dev "$(aggregate_iface_name "$profile_id")" 2>/dev/null || true
-    fi
-  fi
-  aggregate_save_profile "$profile_id" "$role" "$local_ip" "$remote_ip" "$members"
-  if [ -n "$previous_members" ]; then
-    IFS=',' read -ra _old_agg_members <<< "$previous_members"
-    for ref in "${_old_agg_members[@]}"; do
-      type="${ref%%:*}"; tid="${ref#*:}"
-      details="$(aggregate_member_details "$type" "$tid" 2>/dev/null || true)"
-      if [ -n "$details" ]; then
-        IFS=$'\t' read -r ifc _src _peer _state <<< "$details"
-        aggregate_remove_member_firewall "$ifc" "$previous_local" "$previous_remote"
-      fi
-      [ "$type" = "wireguard" ] && aggregate_refresh_wireguard_member "$tid"
-    done
-  fi
-  install_manager_binary || { err_msg "Could not install the persistent manager."; return 1; }
-  aggregate_write_service_template
-  systemctl daemon-reload >/dev/null 2>&1 || true
-  systemctl enable "$(aggregate_service_name "$profile_id")" >/dev/null 2>&1 || true
-  if ! aggregate_apply_profile "$profile_id"; then
-    err_msg "Profile was saved, but no selected path passed its health check. Run Repair after the peer tunnels are up."
-    return 1
-  fi
-  systemctl restart "$(aggregate_service_name "$profile_id")" >/dev/null 2>&1 || true
-  echo
-  ok_msg "Aggregate profile $profile_id is active."
-  echo "Local virtual IPv4 : $local_ip ($(aggregate_iface_name "$profile_id"))"
-  echo "Peer aggregate IPv4: $remote_ip"
-  echo "HAProxy/forward target on this server should be the peer aggregate IPv4: $remote_ip"
-  echo "Concurrent connections are ECMP-hashed across all healthy selected tunnels."
-}
-
-aggregate_list_profiles() {
-  show_header "Aggregate Tunnel Status"
-  local ids id iface route active total ref type tid details path_list path_count
-  ids="$(aggregate_collect_ids || true)"
-  [ -n "$ids" ] || { warn_msg "No aggregate profile exists."; return 0; }
-  while IFS= read -r id; do
-    aggregate_load_config "$id" || continue
-    iface="$(aggregate_iface_name "$id")"; active=0; total=0
-    IFS=',' read -ra _agg_members <<< "$AGG_MEMBERS"
-    for ref in "${_agg_members[@]}"; do
-      total=$((total + 1)); type="${ref%%:*}"; tid="${ref#*:}"
-      details="$(aggregate_member_details "$type" "$tid" 2>/dev/null || true)"
-      [[ "$details" == *$'\tactive' ]] && active=$((active + 1))
-    done
-    route="$(ip -o route show "$REMOTE_AGG_IP/32" 2>/dev/null | head -n1 || true)"
-    path_list="$(grep -oE "dev[[:space:]]+${AGG_PATH_IFACE_PREFIX}[0-9]+" <<< "$route" | awk '{print $2}' | paste -sd, - 2>/dev/null || true)"
-    path_count="$(grep -oE "dev[[:space:]]+${AGG_PATH_IFACE_PREFIX}[0-9]+" <<< "$route" | wc -l | tr -d ' ' || true)"
-    printf 'Profile %-3s  local=%-15s peer=%-15s iface=%-9s members=%s/%s ecmp=%s mode=%s\n' "$id" "$LOCAL_AGG_IP" "$REMOTE_AGG_IP" "$iface" "$active" "$total" "${path_count:-0}" "${AGG_MODE:-isolated-gre-v2}"
-    echo "  members: $AGG_MEMBERS"
-    echo "  isolated paths: ${path_list:-none} | route: ${route:+installed}"
-  done <<< "$ids"
-}
-
-aggregate_repair_all_menu() {
-  show_header "Repair Aggregate Tunnels"
-  ensure_feature_dependencies "aggregation" "ip:iproute2" "ping:iputils-ping" "iptables:iptables" || return 1
-  aggregate_apply_all
-  aggregate_list_profiles
-  ok_msg "Aggregate profiles were rebuilt from currently healthy tunnel paths."
-}
-
 aggregate_remove_profile() {
-  local id="$1" iface local_ip remote members ref type tid details ifc _src _peer _state
-  validate_tunnel_id "$id" || { err_msg "Invalid profile number."; return 1; }
-  aggregate_load_config "$id" || { err_msg "Profile $id was not found."; return 1; }
-  local_ip="$LOCAL_AGG_IP"; remote="$REMOTE_AGG_IP"; members="$AGG_MEMBERS"; iface="$(aggregate_iface_name "$id")"
+  local id="$1"
   systemctl disable --now "$(aggregate_service_name "$id")" >/dev/null 2>&1 || true
-  ip route del "$remote/32" 2>/dev/null || true
-  aggregate_cleanup_stale_paths "$id" "" "$local_ip" "$remote"
-  ip link del "$iface" 2>/dev/null || true
+  ip link delete "$(aggregate_iface_name "$id")" >/dev/null 2>&1 || true
   rm -f "$(aggregate_config_file "$id")"
-  IFS=',' read -ra _agg_members <<< "$members"
-  for ref in "${_agg_members[@]}"; do
-    type="${ref%%:*}"; tid="${ref#*:}"
-    details="$(aggregate_member_details "$type" "$tid" 2>/dev/null || true)"
-    if [ -n "$details" ]; then
-      IFS=$'\t' read -r ifc _src _peer _state <<< "$details"
-      aggregate_remove_member_firewall "$ifc" "$local_ip" "$remote"
-    fi
-    [ "$type" = "wireguard" ] && aggregate_refresh_wireguard_member "$tid"
-  done
-  ok_msg "Aggregate profile $id removed."
-}
-
-aggregate_remove_menu() {
-  aggregate_list_profiles
-  local id
-  read -rp "Aggregate profile to remove [1-254] (00=menu): " id
-  is_main_menu_token "$id" && return 99
-  aggregate_remove_profile "$id"
-}
-
-tunnel_aggregation_menu() {
-  while true; do
-    show_header "Persistent Multi-Tunnel Aggregation"
-    echo "  1) create/update aggregate profile"
-    echo "  2) list/status profiles"
-    echo "  3) repair/rebuild all profiles"
-    echo "  4) remove profile"
-    echo "  00) back to main menu"
-    read -rp "Choose [1-4/00]: " AGG_CHOICE
-    case "$AGG_CHOICE" in
-      1) aggregate_create_menu; pause ;;
-      2) aggregate_list_profiles; pause ;;
-      3) aggregate_repair_all_menu; pause ;;
-      4) aggregate_remove_menu; pause ;;
-      00) return 0 ;;
-      *) err_msg "Invalid option"; sleep 1 ;;
-    esac
-  done
+  echo "[OK] Legacy aggregate profile $id removed."
 }
 
 iperf3_prepare_firewall() {
@@ -5571,7 +3707,7 @@ test_tunnels_menu() {
 
 reset_all_tunnels() {
   show_header "Reset All Tunnels"
-  echo "This will restart/recreate all saved GRE, WireGuard, Vira7, and ViraTCP tunnels from their saved configs."
+  echo "This will restart/recreate all saved GRE, WSS transport, and WireGuard tunnels from their saved configs."
   echo "It will also re-enable their systemd services for boot."
   echo
   if ! confirm_yes "Continue with reset all tunnels?"; then
@@ -5582,7 +3718,7 @@ reset_all_tunnels() {
   diagnostic_event "MANUAL" "manager" "manual reset-all started by operator"
 
   echo
-  echo "Stopping WireGuard, Vira7, and ViraTCP first..."
+  echo "Stopping WireGuard and WSS transport first..."
   local ids id
 
   ids="$(wg_collect_ids || true)"
@@ -5593,18 +3729,10 @@ reset_all_tunnels() {
     ip link delete "$(wg_iface_name "$id")" 2>/dev/null || true
   done <<< "$ids"
 
-  ids="$(vira7_collect_ids || true)"
+  ids="$(wss_collect_ids || true)"
   while IFS= read -r id; do
     [ -n "$id" ] || continue
-    systemctl stop "$(vira7_service_name "$id")" 2>/dev/null || true
-    ip link delete "$(vira7_iface_name "$id")" 2>/dev/null || true
-  done <<< "$ids"
-
-  ids="$(viratcp_collect_ids || true)"
-  while IFS= read -r id; do
-    [ -n "$id" ] || continue
-    systemctl stop "$(viratcp_service_name "$id")" 2>/dev/null || true
-    ip link delete "$(viratcp_iface_name "$id")" 2>/dev/null || true
+    systemctl stop "$(wss_service_name "$id")" 2>/dev/null || true
   done <<< "$ids"
 
   echo "Stopping GRE tunnels..."
@@ -5631,26 +3759,14 @@ reset_all_tunnels() {
   done <<< "$ids"
 
   echo
-  echo "Starting Vira7 tunnels..."
-  ids="$(vira7_collect_ids || true)"
+  echo "Starting WSS transports..."
+  ids="$(wss_collect_ids || true)"
   while IFS= read -r id; do
     [ -n "$id" ] || continue
-    if vira7_restart_one_tunnel "$id"; then
-      echo "[OK] Vira7 tunnel $id reset"
+    if systemctl enable --now "$(wss_service_name "$id")" >/dev/null 2>&1; then
+      echo "[OK] WSS transport $id reset"
     else
-      echo "[WARN] Vira7 tunnel $id reset failed"
-    fi
-  done <<< "$ids"
-
-  echo
-  echo "Starting ViraTCP tunnels..."
-  ids="$(viratcp_collect_ids || true)"
-  while IFS= read -r id; do
-    [ -n "$id" ] || continue
-    if viratcp_restart_one_tunnel "$id"; then
-      echo "[OK] ViraTCP tunnel $id reset"
-    else
-      echo "[WARN] ViraTCP tunnel $id reset failed"
+      echo "[WARN] WSS transport $id reset failed"
     fi
   done <<< "$ids"
 
@@ -5692,8 +3808,6 @@ diagnostics_collect_current() {
     case "$kind" in
       gre) svc="$(gre_service_name "$id")" ;;
       wireguard) svc="$(wg_service_name "$id")" ;;
-      vira7) svc="$(vira7_service_name "$id")" ;;
-      viratcp) svc="$(viratcp_service_name "$id")" ;;
       *) svc="" ;;
     esac
     diagnostic_capture "$kind" "$id" "$ifc" "$svc" "$target" "manual diagnostic snapshot"
@@ -6877,8 +4991,132 @@ haproxy_menu() {
   done
 }
 
+# -----------------------------
+# Performance, capacity, and v11 migration tools
+# -----------------------------
+performance_status() {
+  local mem_kb cpu_count nofile conntrack_now="N/A" conntrack_max="N/A" congestion="N/A" qdisc="N/A"
+  mem_kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+  cpu_count="$(nproc 2>/dev/null || echo 1)"
+  nofile="$(ulimit -n 2>/dev/null || echo unknown)"
+  [ -r /proc/sys/net/netfilter/nf_conntrack_count ] && conntrack_now="$(cat /proc/sys/net/netfilter/nf_conntrack_count)"
+  [ -r /proc/sys/net/netfilter/nf_conntrack_max ] && conntrack_max="$(cat /proc/sys/net/netfilter/nf_conntrack_max)"
+  [ -r /proc/sys/net/ipv4/tcp_congestion_control ] && congestion="$(cat /proc/sys/net/ipv4/tcp_congestion_control)"
+  [ -r /proc/sys/net/core/default_qdisc ] && qdisc="$(cat /proc/sys/net/core/default_qdisc)"
+  show_header "Performance / Capacity Status"
+  printf "CPU cores                 : %s\n" "$cpu_count"
+  printf "RAM                       : %s MiB\n" "$((mem_kb / 1024))"
+  printf "Current shell open files  : %s\n" "$nofile"
+  printf "HAProxy configured maxconn: %s\n" "$HAPROXY_MAXCONN"
+  printf "Conntrack usage           : %s / %s\n" "$conntrack_now" "$conntrack_max"
+  printf "TCP congestion / qdisc    : %s / %s\n" "$congestion" "$qdisc"
+  echo
+  echo "Note: HAProxy maxconn is a ceiling, not guaranteed capacity; RAM, CPU, file descriptors,"
+  echo "conntrack, backend capacity, RTT, and packet loss determine the real limit."
+}
+
+apply_capacity_profile() {
+  mkdir -p /etc/sysctl.d /etc/systemd/system/haproxy.service.d 2>/dev/null || true
+  cat > "$PERFORMANCE_SYSCTL_FILE" <<'EOF_PERFORMANCE'
+# GRETUN v11 balanced high-capacity profile. Buffer values are maxima, not pre-allocation.
+fs.file-max = 4194304
+net.core.somaxconn = 65535
+net.core.netdev_max_backlog = 65536
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 131072 16777216
+net.ipv4.tcp_wmem = 4096 131072 16777216
+net.ipv4.tcp_max_syn_backlog = 65535
+net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.tcp_fin_timeout = 20
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_keepalive_intvl = 30
+net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.tcp_tw_reuse = 1
+EOF_PERFORMANCE
+  if [ -e /proc/sys/net/netfilter/nf_conntrack_max ]; then
+    echo 'net.netfilter.nf_conntrack_max = 1048576' >> "$PERFORMANCE_SYSCTL_FILE"
+  fi
+  sysctl -p "$PERFORMANCE_SYSCTL_FILE" >/dev/null 2>&1 || true
+  apply_tunnel_sysctls
+  haproxy_apply_high_limits
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  if systemctl is-active --quiet haproxy 2>/dev/null; then
+    systemctl reload haproxy >/dev/null 2>&1 || systemctl restart haproxy >/dev/null 2>&1 || true
+  fi
+  ok_msg "Balanced capacity profile applied. Existing tunnel addresses/routes were not changed."
+}
+
+enable_bbr_profile() {
+  if ! modprobe tcp_bbr >/dev/null 2>&1 || [ ! -d /sys/module/tcp_bbr ]; then
+    err_msg "This kernel does not provide tcp_bbr. No congestion-control setting was changed."
+    return 1
+  fi
+  cat > /etc/sysctl.d/99-gretun-bbr.conf <<'EOF_BBR'
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+EOF_BBR
+  if ! sysctl -p /etc/sysctl.d/99-gretun-bbr.conf >/dev/null 2>&1; then
+    err_msg "Kernel rejected BBR settings; inspect /etc/sysctl.d/99-gretun-bbr.conf."
+    return 1
+  fi
+  ok_msg "BBR + fq enabled for TCP traffic (HAProxy/WSS). GRE/WireGuard UDP itself does not use TCP congestion control."
+}
+
+cleanup_removed_v11_features() {
+  echo "This removes legacy Vira7, ViraTCP, and aggregate services/configs from this server."
+  echo "GRE, WireGuard, WSS, HAProxy, and their logs are not removed."
+  if ! confirm_yes "Continue with legacy cleanup?"; then
+    echo "Cancelled."
+    return 0
+  fi
+
+  local ids id unit ifc
+  ids="$(vira7_collect_ids || true)"
+  while IFS= read -r id; do [ -n "$id" ] && vira7_remove_one_tunnel "$id"; done <<< "$ids"
+  ids="$(viratcp_collect_ids || true)"
+  while IFS= read -r id; do [ -n "$id" ] && viratcp_remove_one_tunnel "$id"; done <<< "$ids"
+  ids="$(aggregate_collect_ids || true)"
+  while IFS= read -r id; do [ -n "$id" ] && aggregate_remove_profile "$id"; done <<< "$ids"
+
+  while read -r unit _; do
+    [[ "$unit" == vira7-tunnel@*.service || "$unit" == viratcp-tunnel@*.service || "$unit" == gretun-aggregate@*.service ]] || continue
+    systemctl disable --now "$unit" >/dev/null 2>&1 || true
+  done < <(systemctl list-units --all --plain --no-legend 'vira7-tunnel@*.service' 'viratcp-tunnel@*.service' 'gretun-aggregate@*.service' 2>/dev/null || true)
+
+  for ifc in $(ip -o link show 2>/dev/null | awk -F': ' '$2 ~ /^(vira7|viratcp|ga|gtagg)[0-9]+(@|$)/ {sub(/@.*/, "", $2); print $2}'); do
+    ip link delete "$ifc" >/dev/null 2>&1 || true
+  done
+  rm -f "$VIRA7_SERVICE_TEMPLATE" "$VIRATCP_SERVICE_TEMPLATE" "$AGG_SERVICE_TEMPLATE" "$VIRA7_BINARY" "$VIRATCP_BINARY"
+  rm -rf "$VIRA7_CONFIG_DIR" "$VIRATCP_CONFIG_DIR" "$AGG_CONFIG_DIR"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  ok_msg "Legacy Vira and aggregate installation files were removed."
+}
+
+performance_menu() {
+  while true; do
+    show_header "Performance / Capacity / Migration"
+    echo "1) show current capacity status"
+    echo "2) apply balanced high-capacity profile"
+    echo "3) enable BBR + fq for TCP (when kernel supports it)"
+    echo "4) remove legacy Vira / aggregate installation"
+    echo "00) back to main menu"
+    echo
+    local choice
+    read -rp "Choose [1-4/00]: " choice
+    case "$choice" in
+      1) performance_status; pause ;;
+      2) if confirm_yes "Apply the balanced capacity profile?"; then apply_capacity_profile; fi; pause ;;
+      3) if confirm_yes "Enable BBR + fq?"; then enable_bbr_profile || true; fi; pause ;;
+      4) run_maintenance_action cleanup_removed_v11_features; pause ;;
+      00) return_main_msg; return 0 ;;
+      *) err_msg "Invalid option"; sleep 1 ;;
+    esac
+  done
+}
+
 show_menu() {
-  show_header "GRE + WireGuard + ViraTCP Management v${APP_VERSION}"
+  show_header "GRE + WireGuard + WSS Management v${APP_VERSION}"
   echo -e "${C_BOLD}${C_WHITE}Main Menu${C_RESET}"
   echo -e "  ${C_GREEN}1)${C_RESET} create/update tunnel"
   echo -e "  ${C_RED}2)${C_RESET} remove tunnel"
@@ -6887,18 +5125,20 @@ show_menu() {
   echo -e "  ${C_MAGENTA}5)${C_RESET} throughput speed test ${C_DIM}(iperf3)${C_RESET}"
   echo -e "  ${C_MAGENTA}6)${C_RESET} haproxy port manager"
   echo -e "  ${C_YELLOW}7)${C_RESET} disconnect / error / restart logs"
+  echo -e "  ${C_CYAN}8)${C_RESET} performance / capacity / migration tools"
   echo -e "  ${C_DIM}00) Main menu / back${C_RESET}"
   echo -e "  ${C_DIM}0) Exit${C_RESET}"
   echo
-  read -rp "Choose an option [0-7]: " CHOICE
+  read -rp "Choose an option [0-8]: " CHOICE
   case "$CHOICE" in
-    1) if menu_config_tunnel; then pause; fi ;;
-    2) if remove_tun; then pause; fi ;;
-    3) if reset_all_tunnels; then pause; fi ;;
+    1) if run_maintenance_action menu_config_tunnel; then pause; fi ;;
+    2) if run_maintenance_action remove_tun; then pause; fi ;;
+    3) if run_maintenance_action reset_all_tunnels; then pause; fi ;;
     4) if test_tunnels_menu; then pause; fi ;;
     5) if tunnel_speed_test_menu; then pause; fi ;;
     6) haproxy_menu || true ;;
     7) diagnostics_menu || true ;;
+    8) performance_menu || true ;;
     00) return_main_msg ;;
     0) echo "Bye"; exit 0 ;;
     *) err_msg "Invalid option"; sleep 1 ;;
@@ -6934,31 +5174,9 @@ if [[ "${1:-}" == "--service" ]]; then
       wg_apply_firewall_rules "${3:-}"
       exit $?
       ;;
-    firewall-vira7)
+    start-wss)
       ensure_root
-      vira7_apply_firewall_rules "${3:-}"
-      exit $?
-      ;;
-    start-vira7)
-      ensure_root
-      vira7_restart_one_tunnel "${3:-}"
-      exit $?
-      ;;
-    run-vira7-logged)
-      ensure_root
-      validate_tunnel_id "${3:-}" || exit 1
-      run_logged_tunnel_engine "vira7" "${3:-}" "$VIRA7_BINARY" "$VIRA7_CONFIG_DIR/tunnel-${3:-}.conf"
-      exit $?
-      ;;
-    start-viratcp)
-      ensure_root
-      viratcp_restart_one_tunnel "${3:-}"
-      exit $?
-      ;;
-    run-viratcp-logged)
-      ensure_root
-      validate_tunnel_id "${3:-}" || exit 1
-      run_logged_tunnel_engine "viratcp" "${3:-}" "$VIRATCP_BINARY" "$VIRATCP_CONFIG_DIR/tunnel-${3:-}.conf"
+      wss_run_service "${3:-}"
       exit $?
       ;;
     haproxy-udp-sync)
@@ -6972,7 +5190,7 @@ if [[ "${1:-}" == "--service" ]]; then
       exit $?
       ;;
     *)
-      echo "Unknown service command. Use --service supervise-gre <id>, health-check-all, run-vira7-logged <id>, run-viratcp-logged <id>, haproxy-udp-sync, or haproxy-udp-repair." >&2
+      echo "Unknown service command. Use --service supervise-gre <id>, start-wss <id>, health-check-all, haproxy-udp-sync, or haproxy-udp-repair." >&2
       exit 1
       ;;
   esac
