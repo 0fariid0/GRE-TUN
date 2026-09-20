@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + WireGuard + ViraTCP + HAProxy multi-tunnel manager v10.0.1
+# GRE + WireGuard + ViraTCP + HAProxy multi-tunnel manager v10.1.0
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
@@ -33,8 +33,11 @@ set -euo pipefail
 #   injected into WireGuard AllowedIPs, so wg-quick restarts cannot replace ECMP routes or disturb handshakes.
 #   Route updates are idempotent and health-aware with failure hysteresis. Fresh WireGuard handshakes also
 #   suppress destructive GRE/WireGuard restarts when ICMP probes are lost under load.
+# - v10.1.0 removes aggregation from the main menu and adds persistent disconnect/error diagnostics.
+#   Health failures, automatic/manual restarts, service state, interface state, routes, and recent journal
+#   messages are retained under /var/log/gretun-manager for troubleshooting short interruptions.
 
-APP_VERSION="10.0.1"
+APP_VERSION="10.1.0"
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -47,6 +50,12 @@ HEALTH_SERVICE_UNIT="/etc/systemd/system/gretun-health.service"
 HEALTH_TIMER_UNIT="/etc/systemd/system/gretun-health.timer"
 HEALTH_STATE_DIR="/run/gretun-health"
 HEALTH_FAIL_LIMIT=3
+DIAG_LOG_DIR="/var/log/gretun-manager"
+DIAG_EVENT_LOG="$DIAG_LOG_DIR/events.log"
+DIAG_DETAIL_LOG="$DIAG_LOG_DIR/diagnostics.log"
+DIAG_SERVICE_LOG="$DIAG_LOG_DIR/services.log"
+DIAG_EVENT_MAX_BYTES=5242880
+DIAG_DETAIL_MAX_BYTES=20971520
 SELF_RAW_URL="https://raw.githubusercontent.com/0fariid0/GRE-TUN/refs/heads/main/GRETUN.sh"
 
 WG_META_DIR="/etc/wgtun-tunnels"
@@ -124,6 +133,149 @@ ok_msg() { echo -e "${C_GREEN}[OK]${C_RESET} $*"; }
 warn_msg() { echo -e "${C_YELLOW}[WARN]${C_RESET} $*"; }
 err_msg() { echo -e "${C_RED}[ERR]${C_RESET} $*"; }
 info_msg() { echo -e "${C_CYAN}[INFO]${C_RESET} $*"; }
+
+diagnostic_prepare_logs() {
+  mkdir -p "$DIAG_LOG_DIR" 2>/dev/null || return 1
+  touch "$DIAG_EVENT_LOG" "$DIAG_DETAIL_LOG" "$DIAG_SERVICE_LOG" 2>/dev/null || return 1
+  chmod 700 "$DIAG_LOG_DIR" 2>/dev/null || true
+  chmod 600 "$DIAG_EVENT_LOG" "$DIAG_DETAIL_LOG" "$DIAG_SERVICE_LOG" 2>/dev/null || true
+}
+
+diagnostic_install_logrotate() {
+  diagnostic_prepare_logs || return 0
+  [ -d /etc/logrotate.d ] || return 0
+  cat > /etc/logrotate.d/gretun-manager <<'EOF_LOGROTATE'
+/var/log/gretun-manager/*.log {
+    daily
+    size 10M
+    rotate 7
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su root root
+}
+EOF_LOGROTATE
+}
+
+diagnostic_rotate_file() {
+  local file="$1" max_bytes="$2" size=0
+  [ -f "$file" ] || return 0
+  size="$(stat -c '%s' "$file" 2>/dev/null || echo 0)"
+  [[ "$size" =~ ^[0-9]+$ ]] || size=0
+  if [ "$size" -ge "$max_bytes" ]; then
+    mv -f "$file" "${file}.1" 2>/dev/null || true
+    : > "$file" 2>/dev/null || true
+    chmod 600 "$file" 2>/dev/null || true
+  fi
+}
+
+diagnostic_event() {
+  local level="${1:-INFO}" component="${2:-manager}" message="${3:-}"
+  message="${message//$'\n'/ }"
+  diagnostic_prepare_logs || return 0
+  diagnostic_rotate_file "$DIAG_EVENT_LOG" "$DIAG_EVENT_MAX_BYTES"
+  if command -v flock >/dev/null 2>&1; then
+    (
+      flock -x 9
+      printf '%s [%s] [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S %z')" "$level" "$component" "$message" >&9
+    ) 9>>"$DIAG_EVENT_LOG" || true
+  else
+    printf '%s [%s] [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S %z')" "$level" "$component" "$message" >> "$DIAG_EVENT_LOG" 2>/dev/null || true
+  fi
+}
+
+# Save evidence immediately before a repair/restart. This is intentionally
+# independent from journald so the reason survives journal rotation/reboots.
+diagnostic_capture() {
+  local kind="${1:-unknown}" id="${2:-?}" ifc="${3:-}" svc="${4:-}" target="${5:-}" reason="${6:-unspecified}"
+  diagnostic_prepare_logs || return 0
+  diagnostic_rotate_file "$DIAG_DETAIL_LOG" "$DIAG_DETAIL_MAX_BYTES"
+  {
+    echo
+    echo "======================================================================"
+    printf 'Captured : %s\n' "$(date '+%Y-%m-%d %H:%M:%S %z')"
+    printf 'Tunnel   : %s %s\n' "$kind" "$id"
+    printf 'Reason   : %s\n' "$reason"
+    printf 'Service  : %s\n' "${svc:-N/A}"
+    printf 'Interface: %s\n' "${ifc:-N/A}"
+    printf 'Target   : %s\n' "${target:-N/A}"
+    echo "----------------------------------------------------------------------"
+    if [ -n "$svc" ] && command -v systemctl >/dev/null 2>&1; then
+      echo "[systemd state]"
+      systemctl show "$svc" --no-pager \
+        -p ActiveState -p SubState -p Result -p NRestarts -p ExecMainStatus \
+        -p ExecMainCode -p ActiveEnterTimestamp -p InactiveEnterTimestamp 2>&1 || true
+    fi
+    if [ -n "$ifc" ]; then
+      echo "[interface]"
+      ip -details link show dev "$ifc" 2>&1 || true
+      ip -4 addr show dev "$ifc" 2>&1 || true
+      ip -s link show dev "$ifc" 2>&1 || true
+    fi
+    if [ -n "$target" ]; then
+      target="${target%%/*}"
+      echo "[route to target]"
+      ip -4 route get "$target" 2>&1 || true
+    fi
+    echo "[default route]"
+    ip -4 route show default 2>&1 || true
+    if [ -n "$svc" ] && command -v journalctl >/dev/null 2>&1; then
+      echo "[recent service journal: last 5 minutes / 80 lines]"
+      journalctl -u "$svc" --since '-5 minutes' -n 80 --no-pager -o short-iso 2>&1 || true
+    fi
+    echo "[recent kernel network messages]"
+    journalctl -k --since '-5 minutes' -n 40 --no-pager -o short-iso 2>&1 || true
+    echo "======================================================================"
+  } >> "$DIAG_DETAIL_LOG" 2>&1 || true
+}
+
+restart_service_with_diagnostics() {
+  local kind="$1" id="$2" ifc="$3" svc="$4" target="${5:-}" reason="${6:-health failure}"
+  diagnostic_event "ERROR" "$kind-$id" "$reason; automatic restart requested (service=$svc interface=$ifc target=${target:-N/A})"
+  diagnostic_capture "$kind" "$id" "$ifc" "$svc" "$target" "$reason"
+  if systemctl restart "$svc" >/dev/null 2>&1; then
+    diagnostic_event "RESTART" "$kind-$id" "service restart succeeded: $svc"
+    return 0
+  fi
+  diagnostic_event "ERROR" "$kind-$id" "service restart FAILED: $svc"
+  return 1
+}
+
+diagnostic_service_line() {
+  local component="${1:-service}" line="${2:-}"
+  diagnostic_prepare_logs || return 0
+  if command -v flock >/dev/null 2>&1; then
+    (
+      flock -x 9
+      printf '%s [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S %z')" "$component" "$line" >&9
+    ) 9>>"$DIAG_SERVICE_LOG" || true
+  else
+    printf '%s [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S %z')" "$component" "$line" >> "$DIAG_SERVICE_LOG" 2>/dev/null || true
+  fi
+}
+
+# Run reconnecting tunnel engines through a timestamping wrapper so even a
+# two-second disconnect emitted by the engine is retained with an exact time.
+run_logged_tunnel_engine() {
+  local kind="$1" id="$2" binary="$3" config="$4" line rc
+  [ -x "$binary" ] || { diagnostic_event "ERROR" "$kind-$id" "engine is missing or not executable: $binary"; return 1; }
+  [ -f "$config" ] || { diagnostic_event "ERROR" "$kind-$id" "engine config is missing: $config"; return 1; }
+  diagnostic_event "START" "$kind-$id" "engine process started"
+  set +e
+  "$binary" "$config" 2>&1 | while IFS= read -r line || [ -n "$line" ]; do
+    diagnostic_service_line "$kind-$id" "$line"
+  done
+  rc="${PIPESTATUS[0]}"
+  set -e
+  if [ "$rc" -eq 0 ]; then
+    diagnostic_event "STOP" "$kind-$id" "engine process exited normally"
+  else
+    diagnostic_event "ERROR" "$kind-$id" "engine process exited with code $rc; systemd will restart it"
+  fi
+  return "$rc"
+}
 
 is_main_menu_token() { [ "${1:-}" = "00" ]; }
 return_main_msg() { echo -e "${C_CYAN}Returning to main menu...${C_RESET}"; }
@@ -693,8 +845,13 @@ transport_has_recent_wg_handshake() {
 }
 
 health_counter_reset() {
-  local kind="$1" id="$2"
-  rm -f "$HEALTH_STATE_DIR/${kind}-${id}.fail" 2>/dev/null || true
+  local kind="$1" id="$2" file previous=""
+  file="$HEALTH_STATE_DIR/${kind}-${id}.fail"
+  if [ -f "$file" ]; then
+    previous="$(cat "$file" 2>/dev/null || true)"
+    diagnostic_event "RECOVERED" "$kind-$id" "health check recovered after ${previous:-unknown} consecutive failure(s)"
+  fi
+  rm -f "$file" 2>/dev/null || true
 }
 
 health_counter_fail() {
@@ -721,7 +878,12 @@ restart_wg_dependents_for_transport() {
       svc="$(wg_service_name "$wg_id")"
       if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
         wg_apply_firewall_rules "$wg_id" >/dev/null 2>&1 || true
-        systemctl restart "$svc" >/dev/null 2>&1 || true
+        diagnostic_event "RESTART" "wireguard-$wg_id" "restart triggered because transport $transport_type-$transport_id was repaired"
+        if systemctl restart "$svc" >/dev/null 2>&1; then
+          diagnostic_event "RESTART" "wireguard-$wg_id" "dependent service restart succeeded: $svc"
+        else
+          diagnostic_event "ERROR" "wireguard-$wg_id" "dependent service restart FAILED: $svc"
+        fi
       fi
     fi
   done <<< "$ids"
@@ -730,6 +892,7 @@ restart_wg_dependents_for_transport() {
 install_health_monitor() {
   command -v systemctl >/dev/null 2>&1 || return 0
   mkdir -p "$(dirname "$INSTALL_BIN")" "$HEALTH_STATE_DIR" 2>/dev/null || true
+  diagnostic_install_logrotate || true
   if [ ! -s "$INSTALL_BIN" ]; then
     install_manager_binary >/dev/null 2>&1 || return 1
   fi
@@ -743,6 +906,8 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart=/bin/bash $INSTALL_BIN --service health-check-all
+StandardOutput=append:$DIAG_SERVICE_LOG
+StandardError=append:$DIAG_SERVICE_LOG
 EOF_HEALTH_SERVICE
 
   cat > "$HEALTH_TIMER_UNIT" <<'EOF_HEALTH_TIMER'
@@ -777,6 +942,7 @@ gre_supervisor() {
   while true; do
     if ! gre_load_config "$id"; then
       echo "GRE supervisor: missing config for tunnel $id" >&2
+      diagnostic_event "ERROR" "gre-$id" "supervisor stopped: saved configuration is missing or invalid"
       return 1
     fi
     ifc="$(gre_iface "$id")"
@@ -786,10 +952,14 @@ gre_supervisor() {
 
     if ! tunnel_iface_is_up "$ifc"; then
       echo "GRE supervisor: $ifc is missing/down; recreating tunnel $id" >&2
+      diagnostic_event "ERROR" "gre-$id" "interface $ifc is missing/down; recreating tunnel"
+      diagnostic_capture "gre" "$id" "$ifc" "$(gre_service_name "$id")" "$target" "interface missing or down"
       if gre_create_tunnel 0; then
+        diagnostic_event "RESTART" "gre-$id" "tunnel recreation succeeded after interface disappeared"
         failures=0
         restart_wg_dependents_for_transport gre "$id"
       else
+        diagnostic_event "ERROR" "gre-$id" "tunnel recreation FAILED after interface disappeared"
         sleep "$GRE_SUPERVISOR_INTERVAL"
         continue
       fi
@@ -797,10 +967,15 @@ gre_supervisor() {
       failures=0
     else
       failures=$((failures + 1))
+      diagnostic_event "WARN" "gre-$id" "inner reachability check failed ($failures/$GRE_SUPERVISOR_FAIL_LIMIT), interface=$ifc target=$target"
       if [ "$failures" -ge "$GRE_SUPERVISOR_FAIL_LIMIT" ]; then
         echo "GRE supervisor: tunnel $id failed $failures health checks; recreating" >&2
+        diagnostic_capture "gre" "$id" "$ifc" "$(gre_service_name "$id")" "$target" "$failures consecutive inner reachability failures"
         if gre_create_tunnel 0; then
+          diagnostic_event "RESTART" "gre-$id" "tunnel recreation succeeded after $failures failed checks"
           restart_wg_dependents_for_transport gre "$id"
+        else
+          diagnostic_event "ERROR" "gre-$id" "tunnel recreation FAILED after $failures failed checks"
         fi
         failures=0
       fi
@@ -825,6 +1000,8 @@ ExecStart=/bin/bash $INSTALL_BIN --service supervise-gre %i
 Restart=always
 RestartSec=2
 TimeoutStopSec=10
+StandardOutput=append:$DIAG_SERVICE_LOG
+StandardError=append:$DIAG_SERVICE_LOG
 
 [Install]
 WantedBy=multi-user.target
@@ -848,7 +1025,7 @@ tunnel_health_check_all() {
     if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
       ifc="$(gre_iface "$id")"
       if ! systemctl is-active --quiet "$svc" 2>/dev/null || ! tunnel_iface_is_up "$ifc"; then
-        systemctl restart "$svc" >/dev/null 2>&1 || true
+        restart_service_with_diagnostics "gre" "$id" "$ifc" "$svc" "" "service inactive or interface missing during periodic health check" || true
       fi
     fi
   done <<< "$ids"
@@ -867,7 +1044,7 @@ tunnel_health_check_all() {
     vira7_apply_firewall_rules "$id" >/dev/null 2>&1 || true
 
     if ! systemctl is-active --quiet "$svc" 2>/dev/null || ! tunnel_iface_is_up "$ifc"; then
-      systemctl restart "$svc" >/dev/null 2>&1 || true
+      restart_service_with_diagnostics "vira7" "$id" "$ifc" "$svc" "$target" "service inactive or interface missing" || true
       health_counter_reset vira7 "$id"
       sleep 1
       restart_wg_dependents_for_transport vira7 "$id"
@@ -875,8 +1052,9 @@ tunnel_health_check_all() {
       health_counter_reset vira7 "$id"
     else
       count="$(health_counter_fail vira7 "$id")"
+      diagnostic_event "WARN" "vira7-$id" "inner ping failed ($count/$HEALTH_FAIL_LIMIT), interface=$ifc target=$target"
       if [ "$count" -ge "$HEALTH_FAIL_LIMIT" ]; then
-        systemctl restart "$svc" >/dev/null 2>&1 || true
+        restart_service_with_diagnostics "vira7" "$id" "$ifc" "$svc" "$target" "$count consecutive inner ping failures" || true
         health_counter_reset vira7 "$id"
         sleep 1
         restart_wg_dependents_for_transport vira7 "$id"
@@ -897,14 +1075,15 @@ tunnel_health_check_all() {
     ensure_public_endpoint_route "${REMOTE_PUBLIC_IP:-${remote_ip:-}}" "${LOCAL_PUBLIC_IP:-${bind_ip:-}}"
     viratcp_apply_firewall_rules "$id" >/dev/null 2>&1 || true
     if ! systemctl is-active --quiet "$svc" 2>/dev/null || ! tunnel_iface_is_up "$ifc"; then
-      systemctl restart "$svc" >/dev/null 2>&1 || true
+      restart_service_with_diagnostics "viratcp" "$id" "$ifc" "$svc" "$target" "service inactive or interface missing" || true
       health_counter_reset viratcp "$id"
     elif quick_tunnel_ping "$ifc" "$target"; then
       health_counter_reset viratcp "$id"
     else
       count="$(health_counter_fail viratcp "$id")"
+      diagnostic_event "WARN" "viratcp-$id" "inner ping failed ($count/$HEALTH_FAIL_LIMIT), interface=$ifc target=$target"
       if [ "$count" -ge "$HEALTH_FAIL_LIMIT" ]; then
-        systemctl restart "$svc" >/dev/null 2>&1 || true
+        restart_service_with_diagnostics "viratcp" "$id" "$ifc" "$svc" "$target" "$count consecutive inner ping failures" || true
         health_counter_reset viratcp "$id"
       fi
     fi
@@ -927,18 +1106,23 @@ tunnel_health_check_all() {
         if ! tunnel_iface_is_up "${WG_TRANSPORT_IFACE:-}"; then transport_ok=0; fi
         ;;
     esac
-    [ "$transport_ok" -eq 1 ] || { health_counter_reset wireguard "$id"; continue; }
+    if [ "$transport_ok" -ne 1 ]; then
+      diagnostic_event "WARN" "wireguard-$id" "health check skipped because transport interface ${WG_TRANSPORT_IFACE:-unknown} is down"
+      health_counter_reset wireguard "$id"
+      continue
+    fi
     wg_apply_firewall_rules "$id" >/dev/null 2>&1 || true
 
     if ! systemctl is-active --quiet "$svc" 2>/dev/null || ! tunnel_iface_is_up "$ifc"; then
-      systemctl restart "$svc" >/dev/null 2>&1 || true
+      restart_service_with_diagnostics "wireguard" "$id" "$ifc" "$svc" "$target" "service inactive or interface missing" || true
       health_counter_reset wireguard "$id"
     elif wg_iface_has_recent_handshake "$ifc" || quick_tunnel_ping "$ifc" "$target"; then
       health_counter_reset wireguard "$id"
     else
       count="$(health_counter_fail wireguard "$id")"
+      diagnostic_event "WARN" "wireguard-$id" "handshake is stale and inner ping failed ($count/$HEALTH_FAIL_LIMIT), interface=$ifc target=$target"
       if [ "$count" -ge "$HEALTH_FAIL_LIMIT" ]; then
-        systemctl restart "$svc" >/dev/null 2>&1 || true
+        restart_service_with_diagnostics "wireguard" "$id" "$ifc" "$svc" "$target" "$count stale-handshake/inner-ping failures" || true
         health_counter_reset wireguard "$id"
       fi
     fi
@@ -947,7 +1131,6 @@ tunnel_health_check_all() {
   # HAProxy UDP companions are checked last. This is intentionally lightweight:
   # when all four managed rules exist for every TCP row, nothing is changed.
   # If firewall/NAT rules disappear, run the same rebuild+verify logic as menu option 8.
-  aggregate_apply_all || true
   haproxy_udp_self_heal_check || true
 }
 
@@ -960,12 +1143,10 @@ bootstrap_runtime_repairs() {
     migrate=1
   fi
   gre_write_service_template
+  [ -d "$VIRA7_CONFIG_DIR" ] && vira7_write_service_template >/dev/null 2>&1 || true
+  [ -d "$VIRATCP_CONFIG_DIR" ] && viratcp_write_service_template >/dev/null 2>&1 || true
   install_health_monitor
   apply_tunnel_sysctls
-  if [ -d "$AGG_CONFIG_DIR" ]; then
-    aggregate_write_service_template
-    aggregate_apply_all || true
-  fi
   systemctl daemon-reload >/dev/null 2>&1 || true
 
   ids="$(gre_collect_ids || true)"
@@ -975,7 +1156,7 @@ bootstrap_runtime_repairs() {
     ifc="$(gre_iface "$id")"
     if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
       if [ "$migrate" -eq 1 ] || ! systemctl is-active --quiet "$svc" 2>/dev/null || ! tunnel_iface_is_up "$ifc"; then
-        systemctl restart "$svc" >/dev/null 2>&1 || true
+        restart_service_with_diagnostics "gre" "$id" "$ifc" "$svc" "" "startup repair: service migration, inactive service, or missing interface" || true
       fi
     fi
   done <<< "$ids"
@@ -2332,6 +2513,8 @@ Wants=$transport_after
 
 [Service]
 ExecStartPre=/bin/bash $INSTALL_BIN --service firewall-wg $id
+StandardOutput=append:$DIAG_SERVICE_LOG
+StandardError=append:$DIAG_SERVICE_LOG
 EOF_WG_FW
   else
     cat > "/etc/systemd/system/wg-quick@$ifc.service.d/10-gretun-firewall.conf" <<EOF_WG_FW
@@ -2340,6 +2523,8 @@ After=network-online.target
 
 [Service]
 ExecStartPre=/bin/bash $INSTALL_BIN --service firewall-wg $id
+StandardOutput=append:$DIAG_SERVICE_LOG
+StandardError=append:$DIAG_SERVICE_LOG
 EOF_WG_FW
   fi
 
@@ -2995,10 +3180,12 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 ExecStartPre=/bin/bash $INSTALL_BIN --service firewall-vira7 %i
-ExecStart=$VIRA7_BINARY $VIRA7_CONFIG_DIR/tunnel-%i.conf
+ExecStart=/bin/bash $INSTALL_BIN --service run-vira7-logged %i
 Restart=always
 RestartSec=3
 LimitNOFILE=65535
+StandardOutput=append:$DIAG_SERVICE_LOG
+StandardError=append:$DIAG_SERVICE_LOG
 
 [Install]
 WantedBy=multi-user.target
@@ -3859,11 +4046,13 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-ExecStart=$VIRATCP_BINARY $VIRATCP_CONFIG_DIR/tunnel-%i.conf
+ExecStart=/bin/bash $INSTALL_BIN --service run-viratcp-logged %i
 Restart=always
 RestartSec=2
 TimeoutStopSec=10
 LimitNOFILE=1048576
+StandardOutput=append:$DIAG_SERVICE_LOG
+StandardError=append:$DIAG_SERVICE_LOG
 
 [Install]
 WantedBy=multi-user.target
@@ -4126,7 +4315,9 @@ enable_ip_forward() {
 declare -a INV_TYPE INV_ID INV_IFACE INV_LOCAL INV_TARGET INV_LOCAL_PUBLIC INV_REMOTE_PUBLIC INV_STATE INV_DESC
 
 build_tunnel_inventory() {
-  local include_aggregates="${1:-1}"
+  # Aggregation was removed from the user-facing manager in v10.1.0.
+  # Keep the optional argument only for backward-compatible internal cleanup.
+  local include_aggregates="${1:-0}"
   INV_TYPE=(); INV_ID=(); INV_IFACE=(); INV_LOCAL=(); INV_TARGET=(); INV_LOCAL_PUBLIC=(); INV_REMOTE_PUBLIC=(); INV_STATE=(); INV_DESC=()
   local ids id ifc local_ip target local_pub remote_pub state desc
 
@@ -4320,22 +4511,12 @@ wg_uses_transport_tunnel() {
 # This avoids the common "I removed one tunnel and the others stopped" case.
 remove_selection_dependency_guard() {
   local -a selected=("$@")
-  local idx i type id wg_ids wg_id agg_profile agg_profiles blocked=0
+  local idx i type id wg_ids wg_id blocked=0
 
   for idx in "${selected[@]}"; do
     i=$((idx - 1))
     type="${INV_TYPE[$i]:-}"
     id="${INV_ID[$i]:-}"
-
-    agg_profiles="$(aggregate_uses_member "$type" "$id" 2>/dev/null || true)"
-    while IFS= read -r agg_profile; do
-      [ -n "$agg_profile" ] || continue
-      if ! selection_has_type_id "aggregate" "$agg_profile" "${selected[@]}"; then
-        warn_msg "Cannot remove $type tunnel $id: aggregate profile $agg_profile is using it."
-        echo "  Select aggregate profile $agg_profile too, or remove/update it first."
-        blocked=1
-      fi
-    done <<< "$agg_profiles"
 
     case "$type" in
       gre|vira7)
@@ -5398,6 +5579,8 @@ reset_all_tunnels() {
     return
   fi
 
+  diagnostic_event "MANUAL" "manager" "manual reset-all started by operator"
+
   echo
   echo "Stopping WireGuard, Vira7, and ViraTCP first..."
   local ids id
@@ -5488,11 +5671,144 @@ reset_all_tunnels() {
   done <<< "$ids"
 
   echo
-  echo "Rebuilding aggregate profiles..."
-  aggregate_apply_all || true
-
-  echo
   echo "[OK] Reset all finished."
+  diagnostic_event "MANUAL" "manager" "manual reset-all finished"
+}
+
+# -----------------------------
+# Persistent disconnect / restart diagnostics
+# -----------------------------
+diagnostics_collect_current() {
+  local i kind id ifc svc target
+  build_tunnel_inventory 0
+  if [ "${#INV_TYPE[@]}" -eq 0 ]; then
+    warn_msg "No managed tunnel was found."
+    return 1
+  fi
+
+  info_msg "Saving a current diagnostic snapshot for every tunnel..."
+  for i in "${!INV_TYPE[@]}"; do
+    kind="${INV_TYPE[$i]}"; id="${INV_ID[$i]}"; ifc="${INV_IFACE[$i]}"; target="${INV_TARGET[$i]:-}"
+    case "$kind" in
+      gre) svc="$(gre_service_name "$id")" ;;
+      wireguard) svc="$(wg_service_name "$id")" ;;
+      vira7) svc="$(vira7_service_name "$id")" ;;
+      viratcp) svc="$(viratcp_service_name "$id")" ;;
+      *) svc="" ;;
+    esac
+    diagnostic_capture "$kind" "$id" "$ifc" "$svc" "$target" "manual diagnostic snapshot"
+  done
+  diagnostic_event "MANUAL" "manager" "current snapshot saved for ${#INV_TYPE[@]} tunnel(s)"
+  ok_msg "Snapshot saved to $DIAG_DETAIL_LOG"
+}
+
+diagnostics_show_events() {
+  diagnostic_prepare_logs || { err_msg "Cannot create/read $DIAG_LOG_DIR"; return 1; }
+  show_header "Recent Tunnel Errors / Restarts"
+  if [ ! -s "$DIAG_EVENT_LOG" ]; then
+    warn_msg "No health error or restart has been recorded yet."
+    return 0
+  fi
+  echo "Log file: $DIAG_EVENT_LOG"
+  echo "Showing the latest 200 events:"
+  echo
+  tail -n 200 "$DIAG_EVENT_LOG"
+}
+
+diagnostics_show_details() {
+  diagnostic_prepare_logs || { err_msg "Cannot create/read $DIAG_LOG_DIR"; return 1; }
+  show_header "Detailed Failure Evidence"
+  if [ ! -s "$DIAG_DETAIL_LOG" ]; then
+    warn_msg "No detailed failure snapshot has been recorded yet."
+    return 0
+  fi
+  echo "Log file: $DIAG_DETAIL_LOG"
+  echo "Showing the latest 350 lines:"
+  echo
+  tail -n 350 "$DIAG_DETAIL_LOG"
+}
+
+diagnostics_show_services() {
+  diagnostic_prepare_logs || { err_msg "Cannot create/read $DIAG_LOG_DIR"; return 1; }
+  show_header "Raw Tunnel Service Messages"
+  if [ ! -s "$DIAG_SERVICE_LOG" ]; then
+    warn_msg "No tunnel service message has been recorded yet."
+    echo "Services will write here after their next start/restart."
+    return 0
+  fi
+  echo "Log file: $DIAG_SERVICE_LOG"
+  echo "Showing the latest 300 service messages:"
+  echo
+  tail -n 300 "$DIAG_SERVICE_LOG"
+}
+
+diagnostics_export_report() {
+  local report="/root/gretun-diagnostic-$(date '+%Y%m%d-%H%M%S').log"
+  diagnostics_collect_current || true
+  {
+    echo "GRE-TUN diagnostic report"
+    echo "Generated: $(date '+%Y-%m-%d %H:%M:%S %z')"
+    echo "Version: $APP_VERSION"
+    echo
+    echo "===== health timer ====="
+    systemctl status gretun-health.timer gretun-health.service --no-pager 2>&1 || true
+    echo
+    echo "===== recorded events ====="
+    cat "$DIAG_EVENT_LOG" 2>/dev/null || true
+    echo
+    echo "===== raw tunnel service output ====="
+    cat "$DIAG_SERVICE_LOG" 2>/dev/null || true
+    echo
+    echo "===== detailed snapshots ====="
+    cat "$DIAG_DETAIL_LOG" 2>/dev/null || true
+  } > "$report" 2>&1
+  chmod 600 "$report" 2>/dev/null || true
+  ok_msg "Complete report created: $report"
+  echo "Send this file for analysis after the next interruption."
+}
+
+diagnostics_clear_logs() {
+  if ! confirm_yes "Delete the saved diagnostic logs?"; then
+    echo "Cancelled."
+    return 0
+  fi
+  diagnostic_prepare_logs || return 1
+  : > "$DIAG_EVENT_LOG"
+  : > "$DIAG_DETAIL_LOG"
+  : > "$DIAG_SERVICE_LOG"
+  rm -f "${DIAG_EVENT_LOG}.1" "${DIAG_DETAIL_LOG}.1" "${DIAG_SERVICE_LOG}.1" 2>/dev/null || true
+  ok_msg "Saved diagnostic logs cleared."
+}
+
+diagnostics_menu() {
+  diagnostic_prepare_logs || { err_msg "Cannot initialize diagnostic log storage."; return 1; }
+  while true; do
+    show_header "Tunnel Disconnect / Restart Logs"
+    echo -e "${C_BOLD}${C_WHITE}Diagnostics Menu${C_RESET}"
+    echo -e "  ${C_YELLOW}1)${C_RESET} view recent errors and restarts"
+    echo -e "  ${C_BLUE}2)${C_RESET} view raw tunnel service messages"
+    echo -e "  ${C_CYAN}3)${C_RESET} view detailed failure evidence"
+    echo -e "  ${C_GREEN}4)${C_RESET} capture current tunnel state now"
+    echo -e "  ${C_MAGENTA}5)${C_RESET} export complete report to /root"
+    echo -e "  ${C_RED}6)${C_RESET} clear saved logs"
+    echo -e "  ${C_DIM}00) Back to main menu${C_RESET}"
+    echo
+    echo "Automatic event log : $DIAG_EVENT_LOG"
+    echo "Raw service output  : $DIAG_SERVICE_LOG"
+    echo "Detailed snapshots  : $DIAG_DETAIL_LOG"
+    echo
+    read -rp "Choose diagnostics option [1-6/00]: " DIAG_CHOICE
+    case "$DIAG_CHOICE" in
+      1) diagnostics_show_events; pause ;;
+      2) diagnostics_show_services; pause ;;
+      3) diagnostics_show_details; pause ;;
+      4) diagnostics_collect_current; pause ;;
+      5) diagnostics_export_report; pause ;;
+      6) diagnostics_clear_logs; pause ;;
+      00) return_main_msg; return 0 ;;
+      *) err_msg "Invalid option"; sleep 1 ;;
+    esac
+  done
 }
 
 # -----------------------------
@@ -5688,7 +6004,7 @@ haproxy_prompt_protocol() {
 }
 
 haproxy_target_inventory() {
-  build_tunnel_inventory
+  build_tunnel_inventory 0
   local count="${#INV_TYPE[@]}"
   [ "$count" -gt 0 ] || return 1
 
@@ -5713,29 +6029,18 @@ haproxy_target_inventory() {
   done
   echo
 
-  local agg_ids agg_id
-  agg_ids="$(aggregate_collect_ids || true)"
-  if [ -n "$agg_ids" ]; then
-    echo -e "${C_BOLD}${C_WHITE}Aggregate targets (all healthy member tunnels):${C_RESET}"
-    while IFS= read -r agg_id; do
-      [ -n "$agg_id" ] || continue
-      aggregate_load_config "$agg_id" || continue
-      printf "  a%-3s  peer=%-15s  local=%-15s  members=%s\n" "$agg_id" "$REMOTE_AGG_IP" "$LOCAL_AGG_IP" "$AGG_MEMBERS"
-    done <<< "$agg_ids"
-    echo
-  fi
 }
 
 # Sets HAP_TARGET_IP. The operator may choose a numbered tunnel row or type any IPv4.
 haproxy_prompt_target_ip() {
   local prompt_label="${1:-Select target tunnel number or enter target IPv4}"
-  local input idx count target agg_id
+  local input idx count target
 
-  build_tunnel_inventory
+  build_tunnel_inventory 0
   count="${#INV_TYPE[@]}"
   if [ "$count" -gt 0 ]; then
     haproxy_target_inventory || true
-    echo "Choose a tunnel row, an aggregate target such as a1, or type a custom IPv4."
+    echo "Choose a tunnel row or type a custom IPv4."
   else
     warn_msg "No managed tunnel was found. You can still enter a target IPv4 manually."
   fi
@@ -5746,17 +6051,6 @@ haproxy_prompt_target_ip() {
   if validate_ipv4 "$input"; then
     HAP_TARGET_IP="$input"
     return 0
-  fi
-
-  if [[ "$input" =~ ^[aA]([0-9]+)$ ]]; then
-    agg_id="${BASH_REMATCH[1]}"
-    if aggregate_load_config "$agg_id"; then
-      HAP_TARGET_IP="$REMOTE_AGG_IP"
-      info_msg "Selected aggregate profile $agg_id -> $HAP_TARGET_IP"
-      return 0
-    fi
-    err_msg "Aggregate profile $agg_id was not found."
-    return 1
   fi
 
   if [[ "$input" =~ ^[0-9]+$ ]] && [ "$input" -ge 1 ] && [ "$input" -le "$count" ]; then
@@ -5793,24 +6087,12 @@ HAP_UDP_FWD_CHAIN="GRETUN_HAP_UDP_FWD"       # legacy v8.8.0 migration only
 # Prefer the saved tunnel inventory, then fall back to the kernel route lookup
 # so manually-entered target IPs continue to work exactly like before.
 haproxy_udp_resolve_path() {
-  local target="$1" i inv_target route agg_id
+  local target="$1" i inv_target route
   HAP_UDP_IFACE=""
   HAP_UDP_LOCAL_IP=""
   HAP_UDP_AGGREGATE=0
 
-  if agg_id="$(aggregate_profile_for_remote_ip "$target" 2>/dev/null)"; then
-    aggregate_apply_profile "$agg_id" >/dev/null 2>&1 || true
-    if ip route show "$target/32" 2>/dev/null | grep -q 'nexthop'; then
-      HAP_UDP_IFACE="MULTIPATH"
-      if aggregate_load_config "$agg_id"; then
-        HAP_UDP_LOCAL_IP="$LOCAL_AGG_IP"
-      fi
-      HAP_UDP_AGGREGATE=1
-      validate_ipv4 "$HAP_UDP_LOCAL_IP" && return 0
-    fi
-  fi
-
-  build_tunnel_inventory
+  build_tunnel_inventory 0
   for i in "${!INV_TYPE[@]}"; do
     inv_target="${INV_TARGET[$i]:-}"; inv_target="${inv_target%%/*}"
     if [ "$inv_target" = "$target" ]; then
@@ -6603,8 +6885,8 @@ show_menu() {
   echo -e "  ${C_YELLOW}3)${C_RESET} reset all tunnels"
   echo -e "  ${C_CYAN}4)${C_RESET} ping test tunnels"
   echo -e "  ${C_MAGENTA}5)${C_RESET} throughput speed test ${C_DIM}(iperf3)${C_RESET}"
-  echo -e "  ${C_BLUE}6)${C_RESET} aggregate multiple tunnels ${C_DIM}(persistent ECMP + local IP)${C_RESET}"
-  echo -e "  ${C_MAGENTA}7)${C_RESET} haproxy port manager"
+  echo -e "  ${C_MAGENTA}6)${C_RESET} haproxy port manager"
+  echo -e "  ${C_YELLOW}7)${C_RESET} disconnect / error / restart logs"
   echo -e "  ${C_DIM}00) Main menu / back${C_RESET}"
   echo -e "  ${C_DIM}0) Exit${C_RESET}"
   echo
@@ -6615,8 +6897,8 @@ show_menu() {
     3) if reset_all_tunnels; then pause; fi ;;
     4) if test_tunnels_menu; then pause; fi ;;
     5) if tunnel_speed_test_menu; then pause; fi ;;
-    6) tunnel_aggregation_menu || true ;;
-    7) haproxy_menu || true ;;
+    6) haproxy_menu || true ;;
+    7) diagnostics_menu || true ;;
     00) return_main_msg ;;
     0) echo "Bye"; exit 0 ;;
     *) err_msg "Invalid option"; sleep 1 ;;
@@ -6641,11 +6923,6 @@ if [[ "${1:-}" == "--service" ]]; then
       tunnel_health_check_all
       exit $?
       ;;
-    apply-aggregate)
-      ensure_root
-      aggregate_apply_profile "${3:-}"
-      exit $?
-      ;;
     start)
       # Backward compatibility with older gre-tunnel@ service template.
       ensure_root
@@ -6667,9 +6944,21 @@ if [[ "${1:-}" == "--service" ]]; then
       vira7_restart_one_tunnel "${3:-}"
       exit $?
       ;;
+    run-vira7-logged)
+      ensure_root
+      validate_tunnel_id "${3:-}" || exit 1
+      run_logged_tunnel_engine "vira7" "${3:-}" "$VIRA7_BINARY" "$VIRA7_CONFIG_DIR/tunnel-${3:-}.conf"
+      exit $?
+      ;;
     start-viratcp)
       ensure_root
       viratcp_restart_one_tunnel "${3:-}"
+      exit $?
+      ;;
+    run-viratcp-logged)
+      ensure_root
+      validate_tunnel_id "${3:-}" || exit 1
+      run_logged_tunnel_engine "viratcp" "${3:-}" "$VIRATCP_BINARY" "$VIRATCP_CONFIG_DIR/tunnel-${3:-}.conf"
       exit $?
       ;;
     haproxy-udp-sync)
@@ -6683,7 +6972,7 @@ if [[ "${1:-}" == "--service" ]]; then
       exit $?
       ;;
     *)
-      echo "Unknown service command. Use --service supervise-gre <id>, apply-aggregate <id>, health-check-all, haproxy-udp-sync, or haproxy-udp-repair." >&2
+      echo "Unknown service command. Use --service supervise-gre <id>, health-check-all, run-vira7-logged <id>, run-viratcp-logged <id>, haproxy-udp-sync, or haproxy-udp-repair." >&2
       exit 1
       ;;
   esac
