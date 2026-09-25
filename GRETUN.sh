@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + GRE Plus + WireGuard + HAProxy tunnel manager v12.0.0
+# GRE + GRE Plus + WireGuard + HAProxy tunnel manager v12.0.2
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
@@ -34,10 +34,12 @@ set -euo pipefail
 #   10.30.N.x addressing, separate configs/services/keys, adaptive MTU, fq scheduling,
 #   strict peer firewall rules and larger queues.
 # - v12.0.1 stops GRE Plus supervisors from rewriting UFW every 10 seconds.
+# - v12.0.2 stops destructive tunnel recreation/restarts caused only by transient ping/ICMP loss,
+#   avoids health-timer/supervisor repair races, and normalizes diagnostic timestamps to Asia/Tehran.
 # - HAProxy fix: preserve an existing global maxconn, use the known-working defaults,
 #   and stop changing system limits or restarting HAProxy simply by opening its menu.
 
-APP_VERSION="12.0.1"
+APP_VERSION="12.0.2"
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -46,6 +48,10 @@ GRE_SERVICE_TEMPLATE="/etc/systemd/system/gre-tunnel@.service"
 GRE_LEGACY_SERVICE_UNIT="/etc/systemd/system/gre-tunnel.service"
 GRE_SUPERVISOR_INTERVAL=10
 GRE_SUPERVISOR_FAIL_LIMIT=3
+# Probe failures are useful for diagnostics, but ICMP loss alone must not tear down a live tunnel.
+AUTO_REPAIR_ON_PROBE_FAILURE=0
+# Real service/interface failures are still repaired automatically.
+AUTO_REPAIR_MISSING_INTERFACE=1
 HEALTH_SERVICE_UNIT="/etc/systemd/system/gretun-health.service"
 HEALTH_TIMER_UNIT="/etc/systemd/system/gretun-health.timer"
 HEALTH_STATE_DIR="/run/gretun-health"
@@ -57,6 +63,9 @@ DIAG_DETAIL_LOG="$DIAG_LOG_DIR/diagnostics.log"
 DIAG_SERVICE_LOG="$DIAG_LOG_DIR/services.log"
 DIAG_EVENT_MAX_BYTES=5242880
 DIAG_DETAIL_MAX_BYTES=20971520
+# Keep all diagnostic logs in one timezone on both Iran and foreign servers.
+# Override when needed: GRETUN_LOG_TIMEZONE=Europe/Berlin /path/to/GRETUN.sh
+DIAG_TIMEZONE="${GRETUN_LOG_TIMEZONE:-Asia/Tehran}"
 SELF_RAW_URL="https://raw.githubusercontent.com/0fariid0/GRE-TUN/refs/heads/main/GRETUN.sh"
 
 WG_META_DIR="/etc/wgtun-tunnels"
@@ -123,6 +132,14 @@ warn_msg() { echo -e "${C_YELLOW}[WARN]${C_RESET} $*"; }
 err_msg() { echo -e "${C_RED}[ERR]${C_RESET} $*"; }
 info_msg() { echo -e "${C_CYAN}[INFO]${C_RESET} $*"; }
 
+diag_now() {
+  TZ="$DIAG_TIMEZONE" date '+%Y-%m-%d %H:%M:%S %z'
+}
+
+diag_filename_stamp() {
+  TZ="$DIAG_TIMEZONE" date '+%Y%m%d-%H%M%S'
+}
+
 diagnostic_prepare_logs() {
   mkdir -p "$DIAG_LOG_DIR" 2>/dev/null || return 1
   touch "$DIAG_EVENT_LOG" "$DIAG_DETAIL_LOG" "$DIAG_SERVICE_LOG" 2>/dev/null || return 1
@@ -168,10 +185,10 @@ diagnostic_event() {
   if command -v flock >/dev/null 2>&1; then
     (
       flock -x 9
-      printf '%s [%s] [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S %z')" "$level" "$component" "$message" >&9
+      printf '%s [%s] [%s] %s\n' "$(diag_now)" "$level" "$component" "$message" >&9
     ) 9>>"$DIAG_EVENT_LOG" || true
   else
-    printf '%s [%s] [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S %z')" "$level" "$component" "$message" >> "$DIAG_EVENT_LOG" 2>/dev/null || true
+    printf '%s [%s] [%s] %s\n' "$(diag_now)" "$level" "$component" "$message" >> "$DIAG_EVENT_LOG" 2>/dev/null || true
   fi
 }
 
@@ -184,7 +201,7 @@ diagnostic_capture() {
   {
     echo
     echo "======================================================================"
-    printf 'Captured : %s\n' "$(date '+%Y-%m-%d %H:%M:%S %z')"
+    printf 'Captured : %s\n' "$(diag_now)"
     printf 'Tunnel   : %s %s\n' "$kind" "$id"
     printf 'Reason   : %s\n' "$reason"
     printf 'Service  : %s\n' "${svc:-N/A}"
@@ -212,10 +229,10 @@ diagnostic_capture() {
     ip -4 route show default 2>&1 || true
     if [ -n "$svc" ] && command -v journalctl >/dev/null 2>&1; then
       echo "[recent service journal: last 5 minutes / 80 lines]"
-      journalctl -u "$svc" --since '-5 minutes' -n 80 --no-pager -o short-iso 2>&1 || true
+      TZ="$DIAG_TIMEZONE" journalctl -u "$svc" --since '-5 minutes' -n 80 --no-pager -o short-iso 2>&1 || true
     fi
     echo "[recent kernel network messages]"
-    journalctl -k --since '-5 minutes' -n 40 --no-pager -o short-iso 2>&1 || true
+    TZ="$DIAG_TIMEZONE" journalctl -k --since '-5 minutes' -n 40 --no-pager -o short-iso 2>&1 || true
     echo "======================================================================"
   } >> "$DIAG_DETAIL_LOG" 2>&1 || true
 }
@@ -238,10 +255,10 @@ diagnostic_service_line() {
   if command -v flock >/dev/null 2>&1; then
     (
       flock -x 9
-      printf '%s [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S %z')" "$component" "$line" >&9
+      printf '%s [%s] %s\n' "$(diag_now)" "$component" "$line" >&9
     ) 9>>"$DIAG_SERVICE_LOG" || true
   else
-    printf '%s [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S %z')" "$component" "$line" >> "$DIAG_SERVICE_LOG" 2>/dev/null || true
+    printf '%s [%s] %s\n' "$(diag_now)" "$component" "$line" >> "$DIAG_SERVICE_LOG" 2>/dev/null || true
   fi
 }
 
@@ -971,33 +988,44 @@ gre_supervisor() {
     ensure_public_endpoint_route "${REMOTE_PUBLIC_IP:-}" "${LOCAL_PUBLIC_IP:-}"
 
     if ! tunnel_iface_is_up "$ifc"; then
-      echo "GRE supervisor: $ifc is missing/down; recreating tunnel $id" >&2
-      diagnostic_event "ERROR" "gre-$id" "interface $ifc is missing/down; recreating tunnel"
-      diagnostic_capture "gre" "$id" "$ifc" "$(gre_service_name "$id")" "$target" "interface missing or down"
-      if gre_create_tunnel 0; then
-        diagnostic_event "RESTART" "gre-$id" "tunnel recreation succeeded after interface disappeared"
-        failures=0
-        restart_wg_dependents_for_transport gre "$id"
+      if [ "$AUTO_REPAIR_MISSING_INTERFACE" -eq 1 ]; then
+        echo "GRE supervisor: $ifc is missing/down; recreating tunnel $id" >&2
+        diagnostic_event "ERROR" "gre-$id" "interface $ifc is missing/down; recreating tunnel"
+        diagnostic_capture "gre" "$id" "$ifc" "$(gre_service_name "$id")" "$target" "interface missing or down"
+        if gre_create_tunnel 0; then
+          diagnostic_event "RESTART" "gre-$id" "tunnel recreation succeeded after interface disappeared"
+          failures=0
+          restart_wg_dependents_for_transport gre "$id"
+        else
+          diagnostic_event "ERROR" "gre-$id" "tunnel recreation FAILED after interface disappeared"
+          sleep "$GRE_SUPERVISOR_INTERVAL"
+          continue
+        fi
       else
-        diagnostic_event "ERROR" "gre-$id" "tunnel recreation FAILED after interface disappeared"
-        sleep "$GRE_SUPERVISOR_INTERVAL"
-        continue
+        diagnostic_event "ERROR" "gre-$id" "interface $ifc is missing/down; automatic repair is disabled"
       fi
     elif transport_has_recent_wg_handshake gre "$id" || quick_tunnel_ping "$ifc" "$target"; then
+      if [ "$failures" -gt 0 ]; then
+        diagnostic_event "RECOVERED" "gre-$id" "inner reachability recovered after $failures failed probe(s); tunnel was not recreated"
+      fi
       failures=0
     else
       failures=$((failures + 1))
-      diagnostic_event "WARN" "gre-$id" "inner reachability check failed ($failures/$GRE_SUPERVISOR_FAIL_LIMIT), interface=$ifc target=$target"
-      if [ "$failures" -ge "$GRE_SUPERVISOR_FAIL_LIMIT" ]; then
-        echo "GRE supervisor: tunnel $id failed $failures health checks; recreating" >&2
+      # Log the first few failures, then only once every ~5 minutes to avoid log spam.
+      if [ "$failures" -le "$GRE_SUPERVISOR_FAIL_LIMIT" ] || [ $((failures % 30)) -eq 0 ]; then
+        diagnostic_event "WARN" "gre-$id" "inner reachability probe failed ($failures), interface=$ifc target=$target; live tunnel left untouched"
+      fi
+      if [ "$AUTO_REPAIR_ON_PROBE_FAILURE" -eq 1 ] && [ "$failures" -ge "$GRE_SUPERVISOR_FAIL_LIMIT" ]; then
         diagnostic_capture "gre" "$id" "$ifc" "$(gre_service_name "$id")" "$target" "$failures consecutive inner reachability failures"
         if gre_create_tunnel 0; then
-          diagnostic_event "RESTART" "gre-$id" "tunnel recreation succeeded after $failures failed checks"
+          diagnostic_event "RESTART" "gre-$id" "tunnel recreation succeeded after $failures failed probes"
           restart_wg_dependents_for_transport gre "$id"
         else
-          diagnostic_event "ERROR" "gre-$id" "tunnel recreation FAILED after $failures failed checks"
+          diagnostic_event "ERROR" "gre-$id" "tunnel recreation FAILED after $failures failed probes"
         fi
         failures=0
+      elif [ "$failures" -eq "$GRE_SUPERVISOR_FAIL_LIMIT" ]; then
+        diagnostic_event "INFO" "gre-$id" "probe threshold reached, but auto-recreate-on-probe-failure is disabled"
       fi
     fi
 
@@ -1017,7 +1045,7 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 ExecStart=/bin/bash $INSTALL_BIN --service supervise-gre %i
-Restart=always
+Restart=on-failure
 RestartSec=2
 TimeoutStopSec=10
 LimitNOFILE=262144
@@ -1048,8 +1076,11 @@ tunnel_health_check_all() {
     svc="$(gre_service_name "$id")"
     if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
       ifc="$(gre_iface "$id")"
-      if ! systemctl is-active --quiet "$svc" 2>/dev/null || ! tunnel_iface_is_up "$ifc"; then
-        restart_service_with_diagnostics "gre" "$id" "$ifc" "$svc" "" "service inactive or interface missing during periodic health check" || true
+      if ! systemctl is-active --quiet "$svc" 2>/dev/null; then
+        restart_service_with_diagnostics "gre" "$id" "$ifc" "$svc" "" "supervisor service inactive during periodic health check" || true
+      elif ! tunnel_iface_is_up "$ifc"; then
+        # The active supervisor owns interface recovery. Do not restart it here and race its repair.
+        diagnostic_event "WARN" "gre-$id" "interface $ifc is missing/down; active supervisor will handle recovery"
       fi
     fi
   done <<< "$ids"
@@ -1061,8 +1092,11 @@ tunnel_health_check_all() {
     svc="$(greplus_service_name "$id")"
     if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
       ifc="$(greplus_iface "$id")"
-      if ! systemctl is-active --quiet "$svc" 2>/dev/null || ! tunnel_iface_is_up "$ifc"; then
-        restart_service_with_diagnostics "greplus" "$id" "$ifc" "$svc" "" "service inactive or interface missing during periodic health check" || true
+      if ! systemctl is-active --quiet "$svc" 2>/dev/null; then
+        restart_service_with_diagnostics "greplus" "$id" "$ifc" "$svc" "" "supervisor service inactive during periodic health check" || true
+      elif ! tunnel_iface_is_up "$ifc"; then
+        # The active supervisor owns interface recovery. Do not restart it here and race its repair.
+        diagnostic_event "WARN" "greplus-$id" "interface $ifc is missing/down; active supervisor will handle recovery"
       fi
     fi
   done <<< "$ids"
@@ -1097,10 +1131,14 @@ tunnel_health_check_all() {
       health_counter_reset wireguard "$id"
     else
       count="$(health_counter_fail wireguard "$id")"
-      diagnostic_event "WARN" "wireguard-$id" "handshake is stale and inner ping failed ($count/$HEALTH_FAIL_LIMIT), interface=$ifc target=$target"
-      if [ "$count" -ge "$HEALTH_FAIL_LIMIT" ]; then
+      if [ "$count" -le "$HEALTH_FAIL_LIMIT" ] || [ $((count % 15)) -eq 0 ]; then
+        diagnostic_event "WARN" "wireguard-$id" "handshake is stale and inner ping failed ($count), interface=$ifc target=$target; interface left untouched"
+      fi
+      if [ "$AUTO_REPAIR_ON_PROBE_FAILURE" -eq 1 ] && [ "$count" -ge "$HEALTH_FAIL_LIMIT" ]; then
         restart_service_with_diagnostics "wireguard" "$id" "$ifc" "$svc" "$target" "$count stale-handshake/inner-ping failures" || true
         health_counter_reset wireguard "$id"
+      elif [ "$count" -eq "$HEALTH_FAIL_LIMIT" ]; then
+        diagnostic_event "INFO" "wireguard-$id" "probe threshold reached, but auto-restart-on-probe-failure is disabled"
       fi
     fi
   done <<< "$ids"
@@ -1116,7 +1154,19 @@ bootstrap_runtime_repairs() {
   local migrate=0 ids id svc ifc
   mkdir -p "$(dirname "$INSTALL_BIN")" 2>/dev/null || true
   install_manager_binary >/dev/null 2>&1 || true
-  if [ ! -f "$GRE_SERVICE_TEMPLATE" ] || ! grep -q 'supervise-gre' "$GRE_SERVICE_TEMPLATE" 2>/dev/null; then
+  # Detect an older supervisor template before overwriting it. This makes the
+  # v12.0.2 behavior take effect immediately with one controlled service restart,
+  # but avoids restarting healthy tunnels every time the manager menu is opened.
+  if [ ! -f "$GRE_SERVICE_TEMPLATE" ] ||
+     ! grep -q 'supervise-gre' "$GRE_SERVICE_TEMPLATE" 2>/dev/null ||
+     ! grep -q '^Restart=on-failure$' "$GRE_SERVICE_TEMPLATE" 2>/dev/null; then
+    migrate=1
+  fi
+  if [ -d "$GREPLUS_CONFIG_DIR" ] && {
+       [ ! -f "$GREPLUS_SERVICE_TEMPLATE" ] ||
+       ! grep -q 'supervise-greplus' "$GREPLUS_SERVICE_TEMPLATE" 2>/dev/null ||
+       ! grep -q '^Restart=on-failure$' "$GREPLUS_SERVICE_TEMPLATE" 2>/dev/null;
+     }; then
     migrate=1
   fi
   gre_write_service_template
@@ -1156,7 +1206,19 @@ bootstrap_runtime_repairs() {
     ifc="$(gre_iface "$id")"
     if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
       if [ "$migrate" -eq 1 ] || ! systemctl is-active --quiet "$svc" 2>/dev/null || ! tunnel_iface_is_up "$ifc"; then
-        restart_service_with_diagnostics "gre" "$id" "$ifc" "$svc" "" "startup repair: service migration, inactive service, or missing interface" || true
+        restart_service_with_diagnostics "gre" "$id" "$ifc" "$svc" "" "startup repair: supervisor template migration, inactive service, or missing interface" || true
+      fi
+    fi
+  done <<< "$ids"
+
+  ids="$(greplus_collect_ids || true)"
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    svc="$(greplus_service_name "$id")"
+    ifc="$(greplus_iface "$id")"
+    if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
+      if [ "$migrate" -eq 1 ] || ! systemctl is-active --quiet "$svc" 2>/dev/null || ! tunnel_iface_is_up "$ifc"; then
+        restart_service_with_diagnostics "greplus" "$id" "$ifc" "$svc" "" "startup repair: supervisor template migration, inactive service, or missing interface" || true
       fi
     fi
   done <<< "$ids"
@@ -1857,7 +1919,7 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 ExecStart=/bin/bash $INSTALL_BIN --service supervise-greplus %i
-Restart=always
+Restart=on-failure
 RestartSec=2
 TimeoutStopSec=10
 LimitNOFILE=262144
@@ -1897,18 +1959,40 @@ greplus_supervisor() {
       greplus_apply_firewall "$id" >/dev/null 2>&1 || true
     fi
     if ! tunnel_iface_is_up "$ifc"; then
-      diagnostic_capture "greplus" "$id" "$ifc" "$(greplus_service_name "$id")" "$target" "interface missing or down"
-      greplus_create_tunnel 0 || true
-      failures=0
+      if [ "$AUTO_REPAIR_MISSING_INTERFACE" -eq 1 ]; then
+        diagnostic_event "ERROR" "greplus-$id" "interface $ifc is missing/down; recreating tunnel"
+        diagnostic_capture "greplus" "$id" "$ifc" "$(greplus_service_name "$id")" "$target" "interface missing or down"
+        if greplus_create_tunnel 0; then
+          diagnostic_event "RESTART" "greplus-$id" "tunnel recreation succeeded after interface disappeared"
+          failures=0
+        else
+          diagnostic_event "ERROR" "greplus-$id" "tunnel recreation FAILED after interface disappeared"
+        fi
+      else
+        diagnostic_event "ERROR" "greplus-$id" "interface $ifc is missing/down; automatic repair is disabled"
+      fi
     elif quick_tunnel_ping "$ifc" "$target"; then
+      if [ "$failures" -gt 0 ]; then
+        diagnostic_event "RECOVERED" "greplus-$id" "inner ping recovered after $failures failed probe(s); tunnel was not recreated"
+      fi
       failures=0
     else
       failures=$((failures + 1))
-      diagnostic_event "WARN" "greplus-$id" "inner ping failed ($failures/$GRE_SUPERVISOR_FAIL_LIMIT), target=$target"
-      if [ "$failures" -ge "$GRE_SUPERVISOR_FAIL_LIMIT" ]; then
-        diagnostic_capture "greplus" "$id" "$ifc" "$(greplus_service_name "$id")" "$target" "$failures consecutive failures"
-        greplus_create_tunnel 0 || true
+      # ICMP can be dropped/throttled while GRE traffic itself is still healthy.
+      # Never destroy a live GRE Plus interface only because ping missed a few times.
+      if [ "$failures" -le "$GRE_SUPERVISOR_FAIL_LIMIT" ] || [ $((failures % 30)) -eq 0 ]; then
+        diagnostic_event "WARN" "greplus-$id" "inner ping failed ($failures), target=$target; live tunnel left untouched"
+      fi
+      if [ "$AUTO_REPAIR_ON_PROBE_FAILURE" -eq 1 ] && [ "$failures" -ge "$GRE_SUPERVISOR_FAIL_LIMIT" ]; then
+        diagnostic_capture "greplus" "$id" "$ifc" "$(greplus_service_name "$id")" "$target" "$failures consecutive ping failures"
+        if greplus_create_tunnel 0; then
+          diagnostic_event "RESTART" "greplus-$id" "tunnel recreation succeeded after $failures failed probes"
+        else
+          diagnostic_event "ERROR" "greplus-$id" "tunnel recreation FAILED after $failures failed probes"
+        fi
         failures=0
+      elif [ "$failures" -eq "$GRE_SUPERVISOR_FAIL_LIMIT" ]; then
+        diagnostic_event "INFO" "greplus-$id" "probe threshold reached, but auto-recreate-on-probe-failure is disabled"
       fi
     fi
     sleep "$GRE_SUPERVISOR_INTERVAL" & wait $! || true
@@ -3966,11 +4050,11 @@ diagnostics_show_services() {
 }
 
 diagnostics_export_report() {
-  local report="/root/gretun-diagnostic-$(date '+%Y%m%d-%H%M%S').log"
+  local report="/root/gretun-diagnostic-$(diag_filename_stamp).log"
   diagnostics_collect_current || true
   {
     echo "GRE-TUN diagnostic report"
-    echo "Generated: $(date '+%Y-%m-%d %H:%M:%S %z')"
+    echo "Generated: $(diag_now)"
     echo "Version: $APP_VERSION"
     echo
     echo "===== health timer ====="
