@@ -33,10 +33,11 @@ set -euo pipefail
 # - v12.0.0 removes WSS and adds fully independent GRE Plus tunnels with greplusN interfaces,
 #   10.30.N.x addressing, separate configs/services/keys, adaptive MTU, fq scheduling,
 #   strict peer firewall rules and larger queues.
+# - v12.0.1 stops GRE Plus supervisors from rewriting UFW every 10 seconds.
 # - HAProxy fix: preserve an existing global maxconn, use the known-working defaults,
 #   and stop changing system limits or restarting HAProxy simply by opening its menu.
 
-APP_VERSION="12.0.0"
+APP_VERSION="12.0.1"
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -1777,9 +1778,18 @@ greplus_apply_firewall() {
     iptables -C FORWARD -i "$ifc" -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$ifc" -j ACCEPT
     iptables -C FORWARD -o "$ifc" -j ACCEPT 2>/dev/null || iptables -A FORWARD -o "$ifc" -j ACCEPT
   fi
-  if command -v ufw >/dev/null 2>&1; then
-    ufw allow proto gre from "$REMOTE_PUBLIC_IP" to "$LOCAL_PUBLIC_IP" >/dev/null 2>&1 || true
-    ufw allow in on "$ifc" from "$REMOTE_GREPLUS_IP" >/dev/null 2>&1 || true
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    (
+      # Serialize changes with auto-firewall and other GRE Plus instances.
+      if command -v flock >/dev/null 2>&1; then
+        exec 8>/run/gretun-ufw.lock
+        flock -w 30 8 || exit 1
+      fi
+      ufw allow proto gre from "$REMOTE_PUBLIC_IP" to "$LOCAL_PUBLIC_IP" >/dev/null 2>&1 || true
+      ufw allow in on "$ifc" from "$REMOTE_GREPLUS_IP" >/dev/null 2>&1 || true
+      ufw route allow in on "$ifc" >/dev/null 2>&1 || true
+      ufw route allow out on "$ifc" >/dev/null 2>&1 || true
+    ) || true
   fi
 }
 
@@ -1879,7 +1889,13 @@ greplus_supervisor() {
     ifc="$(greplus_iface "$id")"; target="$REMOTE_GREPLUS_IP"
     apply_tunnel_sysctls
     ensure_public_endpoint_route "$REMOTE_PUBLIC_IP" "$LOCAL_PUBLIC_IP"
-    greplus_apply_firewall "$id" >/dev/null 2>&1 || true
+    # UFW rules are persistent. Repair the runtime rules only if they went
+    # missing (for example after a firewall reload), not on every poll.
+    if ! command -v iptables >/dev/null 2>&1 ||
+       ! iptables -C INPUT -p gre -s "$REMOTE_PUBLIC_IP" -d "$LOCAL_PUBLIC_IP" -j ACCEPT 2>/dev/null ||
+       ! iptables -C FORWARD -i "$ifc" -j ACCEPT 2>/dev/null; then
+      greplus_apply_firewall "$id" >/dev/null 2>&1 || true
+    fi
     if ! tunnel_iface_is_up "$ifc"; then
       diagnostic_capture "greplus" "$id" "$ifc" "$(greplus_service_name "$id")" "$target" "interface missing or down"
       greplus_create_tunnel 0 || true
