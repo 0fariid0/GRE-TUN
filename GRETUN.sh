@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + GRE Plus + WireGuard + HAProxy tunnel manager v12.0.3
+# GRE + GRE Plus + WireGuard + HAProxy tunnel manager v12.0.4
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - WireGuard can use public UDP or ride over an existing GRE / GRE Plus tunnel as transport
@@ -38,10 +38,12 @@ set -euo pipefail
 #   avoids health-timer/supervisor repair races, and normalizes diagnostic timestamps to Asia/Tehran.
 # - v12.0.3 lets WireGuard use same-number GRE or GRE Plus, prompts when both are up,
 #   and preserves the selected transport across firewall, MTU, boot, health and removal checks.
+# - v12.0.4 fixes UDP socket detection, propagates startup errors, isolates dependency
+#   metadata, waits for the selected GRE transport at startup, and keeps cancelled edits safe.
 # - HAProxy fix: preserve an existing global maxconn, use the known-working defaults,
 #   and stop changing system limits or restarting HAProxy simply by opening its menu.
 
-APP_VERSION="12.0.3"
+APP_VERSION="12.0.4"
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -442,6 +444,7 @@ prompt_tunnel_id() {
     echo "Invalid tunnel number. Use a number from 1 to 254."
     return 1
   fi
+  TUNNEL_ID="$((10#$TUNNEL_ID))"
 }
 
 prompt_role() {
@@ -602,7 +605,9 @@ install_manager_binary() {
 udp_port_is_listening() {
   local port="$1"
   if command -v ss >/dev/null 2>&1; then
-    ss -H -lun 2>/dev/null | awk '{print $5}' | grep -Eq "(^|[:.])$port$"
+    ss -H -lun 2>/dev/null | awk -v port="$port" '
+      {for(i=1;i<=NF;i++) if($i ~ ("[:.]" port "$")) found=1}
+      END {exit found ? 0 : 1}'
     return $?
   fi
   if command -v netstat >/dev/null 2>&1; then
@@ -870,7 +875,7 @@ wg_iface_has_recent_handshake() {
   [ $((now - latest)) -le "$max_age" ]
 }
 
-transport_has_recent_wg_handshake() {
+transport_has_recent_wg_handshake() (
   local transport_type="$1" transport_id="$2" ids wg_id
   ids="$(wg_collect_ids 2>/dev/null || true)"
   while IFS= read -r wg_id; do
@@ -881,7 +886,7 @@ transport_has_recent_wg_handshake() {
     fi
   done <<< "$ids"
   return 1
-}
+)
 
 health_counter_reset() {
   local kind="$1" id="$2" file previous=""
@@ -904,7 +909,7 @@ health_counter_fail() {
   printf '%s\n' "$count"
 }
 
-restart_wg_dependents_for_transport() {
+restart_wg_dependents_for_transport() (
   local transport_type="$1" transport_id="$2"
   local ids wg_id svc
   command -v systemctl >/dev/null 2>&1 || return 0
@@ -926,7 +931,7 @@ restart_wg_dependents_for_transport() {
       fi
     fi
   done <<< "$ids"
-}
+)
 
 install_health_monitor() {
   command -v systemctl >/dev/null 2>&1 || return 0
@@ -979,6 +984,10 @@ gre_supervisor() {
   trap 'exit 0' TERM INT HUP
 
   while true; do
+    if maintenance_is_active; then
+      sleep "$GRE_SUPERVISOR_INTERVAL" & wait $! || true
+      continue
+    fi
     if ! gre_load_config "$id"; then
       echo "GRE supervisor: missing config for tunnel $id" >&2
       diagnostic_event "ERROR" "gre-$id" "supervisor stopped: saved configuration is missing or invalid"
@@ -1297,9 +1306,10 @@ gre_save_config() {
     return 1
   fi
 
-  mkdir -p "$GRE_CONFIG_DIR"
-  local file
+  mkdir -p "$GRE_CONFIG_DIR" || return 1
+  local file temporary
   file="$(gre_config_file "$TUNNEL_ID")"
+  temporary="$(mktemp "$GRE_CONFIG_DIR/.config.XXXXXX")" || return 1
 
   {
     write_var TUNNEL_TYPE "gre"
@@ -1311,8 +1321,9 @@ gre_save_config() {
     write_var REMOTE_PUBLIC_IP "$REMOTE_PUBLIC_IP"
     write_var LOCAL_GRE_IP "$LOCAL_GRE_IP"
     write_var REMOTE_GRE_IP "$REMOTE_GRE_IP"
-  } > "$file"
-  chmod 600 "$file"
+  } > "$temporary" || { rm -f "$temporary"; return 1; }
+  chmod 600 "$temporary" || { rm -f "$temporary"; return 1; }
+  mv -f "$temporary" "$file" || return 1
   echo "Saved GRE tunnel $TUNNEL_ID configuration to $file"
 }
 
@@ -1527,7 +1538,7 @@ gre_create_tunnel() {
 
   if [ "$interactive" -eq 1 ]; then
     # Fewer questions: save and enable persistence automatically.
-    gre_save_config
+    gre_save_config || return 1
     if [ -f "$(gre_config_file "$TUNNEL_ID")" ] && command -v systemctl >/dev/null 2>&1; then
       if gre_install_service "$TUNNEL_ID"; then
         echo "GRE persistence enabled for $(gre_service_name "$TUNNEL_ID")."
@@ -1564,7 +1575,7 @@ gre_menu_config_tunnel() {
   prompt_remote_public_ip "$existing_remote_ip" || return
 
   echo
-  gre_create_tunnel 1 || echo "GRE tunnel creation failed"
+  gre_create_tunnel 1 || { err_msg "GRE tunnel creation failed"; return 1; }
 }
 
 gre_check_one_tunnel() {
@@ -1750,7 +1761,7 @@ gre_service_start() {
 greplus_iface() { echo "${GREPLUS_IFACE_PREFIX}$1"; }
 greplus_config_file() { echo "$GREPLUS_CONFIG_DIR/tunnel-$1.conf"; }
 greplus_service_name() { echo "greplus-tunnel@$1.service"; }
-greplus_key() { echo $((GREPLUS_KEY_BASE + $1)); }
+greplus_key() { echo $((GREPLUS_KEY_BASE + 10#$1)); }
 
 greplus_inner_ip_for_role() {
   local id="$1" role="$2"
@@ -1795,9 +1806,10 @@ greplus_detect_mtu() {
 }
 
 greplus_save_config() {
-  local file
-  mkdir -p "$GREPLUS_CONFIG_DIR"
+  local file temporary
+  mkdir -p "$GREPLUS_CONFIG_DIR" || return 1
   file="$(greplus_config_file "$TUNNEL_ID")"
+  temporary="$(mktemp "$GREPLUS_CONFIG_DIR/.config.XXXXXX")" || return 1
   {
     write_var TUNNEL_TYPE "greplus"
     write_var TUNNEL_ID "$TUNNEL_ID"
@@ -1809,8 +1821,9 @@ greplus_save_config() {
     write_var GREPLUS_MTU "$GREPLUS_MTU"
     write_var GREPLUS_TUN_KEY "$GREPLUS_TUN_KEY"
     write_var GREPLUS_TXQUEUELEN "$GREPLUS_TXQUEUELEN"
-  } > "$file"
-  chmod 600 "$file"
+  } > "$temporary" || { rm -f "$temporary"; return 1; }
+  chmod 600 "$temporary" || { rm -f "$temporary"; return 1; }
+  mv -f "$temporary" "$file" || return 1
   echo "Saved GRE Plus tunnel $TUNNEL_ID configuration to $file"
 }
 
@@ -1829,7 +1842,7 @@ greplus_load_config() {
   GREPLUS_TXQUEUELEN="${GREPLUS_TXQUEUELEN:-$GREPLUS_DEFAULT_TXQUEUELEN}"
 }
 
-greplus_apply_firewall() {
+greplus_apply_firewall() (
   local id="$1" ifc
   greplus_load_config "$id" || return 1
   ifc="$(greplus_iface "$id")"
@@ -1855,21 +1868,39 @@ greplus_apply_firewall() {
       ufw route allow out on "$ifc" >/dev/null 2>&1 || true
     ) || true
   fi
-}
+)
+
+greplus_peer_is_shared() (
+  local removed_id="$1" local_peer="$2" remote_peer="$3" f other_id
+  for f in "$GREPLUS_CONFIG_DIR"/tunnel-*.conf; do
+    [ -f "$f" ] || continue
+    other_id="${f##*/tunnel-}"; other_id="${other_id%.conf}"
+    [ "$other_id" = "$removed_id" ] && continue
+    unset LOCAL_PUBLIC_IP REMOTE_PUBLIC_IP
+    source "$f" || continue
+    if [ "${LOCAL_PUBLIC_IP:-}" = "$local_peer" ] && [ "${REMOTE_PUBLIC_IP:-}" = "$remote_peer" ]; then
+      return 0
+    fi
+  done
+  return 1
+)
 
 greplus_remove_firewall() {
-  local id="$1" ifc
+  local id="$1" ifc shared=0
   greplus_load_config "$id" || return 0
   ifc="$(greplus_iface "$id")"
+  greplus_peer_is_shared "$id" "$LOCAL_PUBLIC_IP" "$REMOTE_PUBLIC_IP" && shared=1
   if command -v iptables >/dev/null 2>&1; then
+    if [ "$shared" -eq 0 ]; then
     while iptables -C INPUT -p gre -s "$REMOTE_PUBLIC_IP" -d "$LOCAL_PUBLIC_IP" -j ACCEPT 2>/dev/null; do iptables -D INPUT -p gre -s "$REMOTE_PUBLIC_IP" -d "$LOCAL_PUBLIC_IP" -j ACCEPT || break; done
     while iptables -C OUTPUT -p gre -s "$LOCAL_PUBLIC_IP" -d "$REMOTE_PUBLIC_IP" -j ACCEPT 2>/dev/null; do iptables -D OUTPUT -p gre -s "$LOCAL_PUBLIC_IP" -d "$REMOTE_PUBLIC_IP" -j ACCEPT || break; done
+    fi
     while iptables -C INPUT -i "$ifc" -s "$REMOTE_GREPLUS_IP" -j ACCEPT 2>/dev/null; do iptables -D INPUT -i "$ifc" -s "$REMOTE_GREPLUS_IP" -j ACCEPT || break; done
     while iptables -C OUTPUT -o "$ifc" -d "$REMOTE_GREPLUS_IP" -j ACCEPT 2>/dev/null; do iptables -D OUTPUT -o "$ifc" -d "$REMOTE_GREPLUS_IP" -j ACCEPT || break; done
     while iptables -C FORWARD -i "$ifc" -j ACCEPT 2>/dev/null; do iptables -D FORWARD -i "$ifc" -j ACCEPT || break; done
     while iptables -C FORWARD -o "$ifc" -j ACCEPT 2>/dev/null; do iptables -D FORWARD -o "$ifc" -j ACCEPT || break; done
   fi
-  command -v ufw >/dev/null 2>&1 && ufw delete allow proto gre from "$REMOTE_PUBLIC_IP" to "$LOCAL_PUBLIC_IP" >/dev/null 2>&1 || true
+  [ "$shared" -eq 0 ] && command -v ufw >/dev/null 2>&1 && ufw delete allow proto gre from "$REMOTE_PUBLIC_IP" to "$LOCAL_PUBLIC_IP" >/dev/null 2>&1 || true
 }
 
 greplus_create_tunnel() {
@@ -1901,9 +1932,9 @@ greplus_create_tunnel() {
   ip addr replace "$LOCAL_GREPLUS_IP" dev "$ifc" || { ip tunnel del "$ifc" 2>/dev/null || true; return 1; }
   ip link set "$ifc" mtu "$GREPLUS_MTU" txqueuelen "$GREPLUS_TXQUEUELEN" up || { ip tunnel del "$ifc" 2>/dev/null || true; return 1; }
   command -v tc >/dev/null 2>&1 && tc qdisc replace dev "$ifc" root fq >/dev/null 2>&1 || true
-  greplus_save_config
-  greplus_apply_firewall "$TUNNEL_ID" || true
-  if [ "$interactive" -eq 1 ]; then greplus_install_service "$TUNNEL_ID"; fi
+  greplus_save_config || return 1
+  greplus_apply_firewall "$TUNNEL_ID" || return 1
+  if [ "$interactive" -eq 1 ]; then greplus_install_service "$TUNNEL_ID" || return 1; fi
   ok_msg "GRE Plus tunnel created: $ifc"
   echo "Local/remote inner IP: $LOCAL_GREPLUS_IP -> $REMOTE_GREPLUS_IP"
   echo "MTU / TX queue / qdisc: $GREPLUS_MTU / $GREPLUS_TXQUEUELEN / fq"
@@ -1937,10 +1968,10 @@ greplus_install_service() {
   local id="$1"
   install_manager_binary || return 1
   diagnostic_prepare_logs || true
-  greplus_write_service_template
-  install_health_monitor
-  systemctl daemon-reload
-  systemctl enable "$(greplus_service_name "$id")" >/dev/null
+  greplus_write_service_template || return 1
+  install_health_monitor || return 1
+  systemctl daemon-reload || return 1
+  systemctl enable "$(greplus_service_name "$id")" >/dev/null || return 1
   systemctl restart "$(greplus_service_name "$id")"
 }
 
@@ -1949,6 +1980,10 @@ greplus_supervisor() {
   validate_tunnel_id "$id" || return 1
   trap 'exit 0' TERM INT HUP
   while true; do
+    if maintenance_is_active; then
+      sleep "$GRE_SUPERVISOR_INTERVAL" & wait $! || true
+      continue
+    fi
     greplus_load_config "$id" || return 1
     ifc="$(greplus_iface "$id")"; target="$REMOTE_GREPLUS_IP"
     apply_tunnel_sysctls
@@ -1967,13 +2002,14 @@ greplus_supervisor() {
         if greplus_create_tunnel 0; then
           diagnostic_event "RESTART" "greplus-$id" "tunnel recreation succeeded after interface disappeared"
           failures=0
+          restart_wg_dependents_for_transport greplus "$id"
         else
           diagnostic_event "ERROR" "greplus-$id" "tunnel recreation FAILED after interface disappeared"
         fi
       else
         diagnostic_event "ERROR" "greplus-$id" "interface $ifc is missing/down; automatic repair is disabled"
       fi
-    elif quick_tunnel_ping "$ifc" "$target"; then
+    elif transport_has_recent_wg_handshake greplus "$id" || quick_tunnel_ping "$ifc" "$target"; then
       if [ "$failures" -gt 0 ]; then
         diagnostic_event "RECOVERED" "greplus-$id" "inner ping recovered after $failures failed probe(s); tunnel was not recreated"
       fi
@@ -1989,6 +2025,7 @@ greplus_supervisor() {
         diagnostic_capture "greplus" "$id" "$ifc" "$(greplus_service_name "$id")" "$target" "$failures consecutive ping failures"
         if greplus_create_tunnel 0; then
           diagnostic_event "RESTART" "greplus-$id" "tunnel recreation succeeded after $failures failed probes"
+          restart_wg_dependents_for_transport greplus "$id"
         else
           diagnostic_event "ERROR" "greplus-$id" "tunnel recreation FAILED after $failures failed probes"
         fi
@@ -2068,7 +2105,7 @@ wg_public_key_file() {
 
 wg_default_port() {
   local id="$1"
-  echo $((51800 + id))
+  echo $((51800 + 10#$id))
 }
 
 wg_transport_iface() {
@@ -2118,6 +2155,7 @@ wg_print_service_failure() {
   echo >&2
   if command -v systemctl >/dev/null 2>&1; then
     systemctl status "$svc" --no-pager -l 2>/dev/null || true
+    journalctl -u "$svc" -n 25 --no-pager -o cat 2>/dev/null || true
   fi
 }
 
@@ -2160,25 +2198,31 @@ wg_ensure_tools() {
 }
 
 wg_generate_keys() {
-  local id="$1"
-  mkdir -p "$WG_KEY_DIR"
+  local id="$1" private public tmp_private derived tmp_public
+  mkdir -p "$WG_KEY_DIR" || return 1
   chmod 700 "$WG_META_DIR" "$WG_KEY_DIR" 2>/dev/null || true
-
-  local private public
-  private="$(wg_private_key_file "$id")"
-  public="$(wg_public_key_file "$id")"
-
+  private="$(wg_private_key_file "$id")"; public="$(wg_public_key_file "$id")"
   if [ ! -s "$private" ]; then
-    umask 077
-    wg genkey > "$private"
-    wg pubkey < "$private" > "$public"
-    chmod 600 "$private"
-    chmod 644 "$public"
-    echo "Generated new WireGuard key pair for tunnel $id."
-  elif [ ! -s "$public" ]; then
-    wg pubkey < "$private" > "$public"
-    chmod 644 "$public"
+    tmp_private="$(mktemp "$WG_KEY_DIR/.private.XXXXXX")" || return 1
+    if ! wg genkey > "$tmp_private"; then rm -f "$tmp_private"; return 1; fi
+    if ! derived="$(wg pubkey < "$tmp_private")" || ! validate_wg_public_key "$derived"; then
+      rm -f "$tmp_private"; err_msg "WireGuard key generation failed."; return 1
+    fi
+    chmod 600 "$tmp_private" || { rm -f "$tmp_private"; return 1; }
+    mv -f "$tmp_private" "$private" || return 1
+    echo "Generated new WireGuard private key for tunnel $id."
+  else
+    if ! derived="$(wg pubkey < "$private")" || ! validate_wg_public_key "$derived"; then
+      err_msg "Saved WireGuard private key is invalid. It was preserved; repair the key file first."
+      return 1
+    fi
   fi
+  # Always derive the public key from the private key; stale public files break handshakes.
+  tmp_public="$(mktemp "$WG_KEY_DIR/.public.XXXXXX")" || return 1
+  printf '%s\n' "$derived" > "$tmp_public" || { rm -f "$tmp_public"; return 1; }
+  chmod 644 "$tmp_public" || { rm -f "$tmp_public"; return 1; }
+  mv -f "$tmp_public" "$public" || return 1
+  chmod 600 "$private" || return 1
 }
 
 wg_save_meta() {
@@ -2187,10 +2231,11 @@ wg_save_meta() {
     return 1
   fi
 
-  mkdir -p "$WG_META_DIR"
+  mkdir -p "$WG_META_DIR" || return 1
   chmod 700 "$WG_META_DIR" 2>/dev/null || true
-  local file
+  local file temporary
   file="$(wg_meta_file "$TUNNEL_ID")"
+  temporary="$(mktemp "$WG_META_DIR/.meta.XXXXXX")" || return 1
 
   {
     write_var TUNNEL_TYPE "wireguard"
@@ -2214,8 +2259,9 @@ wg_save_meta() {
     write_var WG_CONFIG_FILE "$(wg_config_file "$TUNNEL_ID")"
     write_var WG_PRIVATE_KEY_FILE "$(wg_private_key_file "$TUNNEL_ID")"
     write_var WG_PUBLIC_KEY_FILE "$(wg_public_key_file "$TUNNEL_ID")"
-  } > "$file"
-  chmod 600 "$file"
+  } > "$temporary" || { rm -f "$temporary"; return 1; }
+  chmod 600 "$temporary" || { rm -f "$temporary"; return 1; }
+  mv -f "$temporary" "$file" || return 1
   echo "Saved WireGuard tunnel $TUNNEL_ID metadata to $file"
 }
 
@@ -2228,11 +2274,17 @@ wg_load_meta() {
   file="$(wg_meta_file "$id")"
   if [ -f "$file" ]; then
     # Optional transport fields in older files must not inherit another tunnel's state.
-    unset WG_ENDPOINT_MODE WG_ENDPOINT_IP WG_TRANSPORT_IFACE WG_MTU
+    unset TUNNEL_TYPE TUNNEL_ID WG_IFACE ROLE SERVER_ROLE LOCAL_PUBLIC_IP REMOTE_PUBLIC_IP
+    unset LOCAL_WG_IP REMOTE_WG_IP LOCAL_WG_PORT REMOTE_WG_PORT WG_ENDPOINT_MODE WG_ENDPOINT_IP
+    unset WG_TRANSPORT_IFACE WG_MTU REMOTE_WG_PUBLIC_KEY WG_PENDING EXTRA_ALLOWED_IPS
     # shellcheck disable=SC1090
     source "$file"
     TUNNEL_ID="$id"
-    WG_IFACE="${WG_IFACE:-$(wg_iface_name "$id")}"
+    WG_IFACE="$(wg_iface_name "$id")"
+    LOCAL_WG_PORT="${LOCAL_WG_PORT:-$(wg_default_port "$id")}"
+    REMOTE_WG_PORT="${REMOTE_WG_PORT:-$(wg_default_port "$id")}"
+    REMOTE_WG_PUBLIC_KEY="${REMOTE_WG_PUBLIC_KEY:-}"
+    EXTRA_ALLOWED_IPS="${EXTRA_ALLOWED_IPS:-}"
     WG_ENDPOINT_MODE="${WG_ENDPOINT_MODE:-public}"
     WG_ENDPOINT_IP="${WG_ENDPOINT_IP:-${REMOTE_PUBLIC_IP:-}}"
     case "$WG_ENDPOINT_MODE" in
@@ -2324,11 +2376,11 @@ wg_list_tunnels() {
 }
 
 wg_write_config() {
-  local id="$1"
+  local id="$1" temporary
   local private_file conf allowed_ips private_key endpoint_ip endpoint_mode_note mtu_value endpoint_line=""
   private_file="$(wg_private_key_file "$id")"
   conf="$(wg_config_file "$id")"
-  private_key="$(cat "$private_file")"
+  private_key="$(cat "$private_file")" || return 1
   allowed_ips="${REMOTE_WG_IP%%/*}/32"
   endpoint_ip="$(wg_auto_endpoint_ip)"
   endpoint_mode_note="${WG_ENDPOINT_MODE:-public}"
@@ -2345,10 +2397,11 @@ wg_write_config() {
     allowed_ips="$allowed_ips, $EXTRA_ALLOWED_IPS"
   fi
 
-  mkdir -p "$WG_CONFIG_DIR"
+  mkdir -p "$WG_CONFIG_DIR" || return 1
   chmod 700 "$WG_CONFIG_DIR" 2>/dev/null || true
 
-  cat > "$conf" <<EOF_CONF
+  temporary="$(mktemp "$WG_CONFIG_DIR/.wg.XXXXXX")" || return 1
+  if ! cat > "$temporary" <<EOF_CONF
 [Interface]
 PrivateKey = $private_key
 Address = $LOCAL_WG_IP
@@ -2361,7 +2414,9 @@ $endpoint_line
 AllowedIPs = $allowed_ips
 PersistentKeepalive = 25
 EOF_CONF
-  chmod 600 "$conf"
+  then rm -f "$temporary"; return 1; fi
+  chmod 600 "$temporary" || { rm -f "$temporary"; return 1; }
+  mv -f "$temporary" "$conf" || return 1
   echo "WireGuard config written: $conf"
   echo "WireGuard endpoint mode: $endpoint_mode_note -> $endpoint_ip:$REMOTE_WG_PORT"
   echo "WireGuard MTU: $mtu_value"
@@ -2409,7 +2464,7 @@ wg_create_tunnel() {
   REMOTE_WG_PUBLIC_KEY="$(normalize_wg_public_key "${REMOTE_WG_PUBLIC_KEY:-}")"
   WG_PENDING=0
 
-  wg_generate_keys "$TUNNEL_ID"
+  wg_generate_keys "$TUNNEL_ID" || return 1
   local local_pub
   local_pub="$(cat "$(wg_public_key_file "$TUNNEL_ID")")"
 
@@ -2443,9 +2498,11 @@ wg_create_tunnel() {
 
   if [ -z "$REMOTE_WG_PUBLIC_KEY" ]; then
     WG_PENDING=1
+    wg_safe_cleanup_runtime "$TUNNEL_ID" || return 1
+    command -v systemctl >/dev/null 2>&1 && systemctl disable "$(wg_service_name "$TUNNEL_ID")" >/dev/null 2>&1 || true
     echo "Remote public key is empty."
     echo "Saved as PENDING. Nothing will be started yet, so ping will not work until you add the peer key."
-    wg_save_meta
+    wg_save_meta || return 1
     echo
     echo "Next step on the OTHER server: create the same WireGuard tunnel number and copy its public key."
     echo "Then run this script again on this server with the same tunnel number and paste that peer key."
@@ -2459,7 +2516,7 @@ wg_create_tunnel() {
     echo "Detected length: ${#REMOTE_WG_PUBLIC_KEY}. Expected: 44 characters, ending with '='." >&2
     echo "Saved as PENDING. Paste only the peer public key, or a line like: PublicKey = xxxxx=" >&2
     REMOTE_WG_PUBLIC_KEY=""
-    wg_save_meta
+    wg_save_meta || return 1
     return 0
   fi
 
@@ -2468,34 +2525,65 @@ wg_create_tunnel() {
     echo "You pasted this server's own public key, not the OTHER server public key." >&2
     echo "Saved as PENDING. Run the script on the other server and paste its public key here." >&2
     REMOTE_WG_PUBLIC_KEY=""
-    wg_save_meta
+    wg_save_meta || return 1
     return 0
   fi
 
-  wg_write_config "$TUNNEL_ID"
-  wg_save_meta
-  enable_ip_forward
-  wg_apply_firewall_rules "$TUNNEL_ID"
-
-  # Start through one path only. Prefer systemd for persistence; otherwise use wg-quick directly.
-  if command -v systemctl >/dev/null 2>&1; then
-    if wg_install_service "$TUNNEL_ID"; then
-      echo "[OK] WireGuard tunnel created and started as $WG_IFACE"
-    else
-      wg_print_service_failure "$TUNNEL_ID"
-      return 1
-    fi
-  else
-    wg-quick down "$WG_IFACE" >/dev/null 2>&1 || true
-    wg-quick up "$WG_IFACE"
-    echo "[OK] WireGuard tunnel created and started as $WG_IFACE"
-  fi
+  wg_commit_and_start "$TUNNEL_ID" || return 1
+  echo "[OK] WireGuard tunnel created and started as $WG_IFACE"
 
   echo "Local WG IP : $LOCAL_WG_IP"
   echo "Remote WG IP: $REMOTE_WG_IP"
   echo
   echo "After both sides are started, test:"
   echo "  ping $REMOTE_WG_IP"
+}
+
+wg_start_runtime() {
+  local id="$1" ifc
+  ifc="$(wg_iface_name "$id")"
+  if command -v systemctl >/dev/null 2>&1; then
+    wg_install_service "$id" || { wg_print_service_failure "$id"; return 1; }
+  else
+    wg_safe_cleanup_runtime "$id" || return 1
+    wg-quick up "$ifc" || return 1
+    tunnel_iface_is_up "$ifc" || return 1
+  fi
+}
+
+wg_commit_and_start() {
+  local id="$1" backup had_config=0 had_meta=0 was_up=0 conf meta
+  conf="$(wg_config_file "$id")"; meta="$(wg_meta_file "$id")"
+  mkdir -p "$WG_META_DIR" || return 1
+  backup="$(mktemp -d "$WG_META_DIR/.update.XXXXXX")" || return 1
+  if [ -f "$conf" ]; then cp -p "$conf" "$backup/config" || { rm -rf "$backup"; return 1; }; had_config=1; fi
+  if [ -f "$meta" ]; then cp -p "$meta" "$backup/meta" || { rm -rf "$backup"; return 1; }; had_meta=1; fi
+  tunnel_iface_is_up "$(wg_iface_name "$id")" && was_up=1
+
+  if wg_write_config "$id" && wg_save_meta && wg_apply_firewall_rules "$id" && wg_start_runtime "$id"; then
+    enable_ip_forward
+    rm -rf "$backup"
+    return 0
+  fi
+  err_msg "WireGuard $id configuration/startup failed."
+  if [ "$had_config" -eq 1 ] && [ "$had_meta" -eq 1 ]; then
+    cp -p "$backup/config" "$conf" && cp -p "$backup/meta" "$meta" || {
+      err_msg "Could not restore previous files; backup retained at $backup."; return 1;
+    }
+    warn_msg "Previous WireGuard config and metadata restored."
+    if [ "$was_up" -eq 1 ]; then
+      if wg_load_meta "$id" && wg_start_runtime "$id"; then
+        warn_msg "Previous WireGuard tunnel restarted successfully."
+      else
+        err_msg "Previous settings restored, but the previous tunnel could not restart; check its service log."
+      fi
+    fi
+  else
+    # Keep a new failed tunnel's generated config/metadata for repair and diagnostics.
+    warn_msg "Saved files, if generated, were retained for repair; no successful connection was reported."
+  fi
+  rm -rf "$backup"
+  return 1
 }
 
 # interactive=1 only from the menu; background migrations must never wait for input.
@@ -2563,6 +2651,64 @@ wg_choose_auto_endpoint() {
   return 0
 }
 
+wg_select_local_port() {
+  local id="$1" saved="${2:-}" actual=""
+  if [ -n "$saved" ] && tunnel_iface_is_up "$(wg_iface_name "$id")"; then
+    actual="$(wg show "$(wg_iface_name "$id")" listen-port 2>/dev/null || true)"
+    if [ "$actual" = "$saved" ] && ! udp_port_in_saved_configs "$saved" wireguard "$id"; then
+      printf '%s\n' "$saved"
+      return 0
+    fi
+  fi
+  auto_select_udp_port "$(wg_default_port "$id")" "$saved" wireguard "$id"
+}
+
+wg_prompt_remote_port() {
+  local default_port="${1:-$(wg_default_port "$TUNNEL_ID")}" input
+  echo "Use the ListenPort shown on the OTHER server (it may differ from this server)."
+  read -rp "REMOTE WireGuard UDP port [$default_port] (00=menu): " input || return 99
+  if is_main_menu_token "$input"; then return_main_msg; return 99; fi
+  input="${input:-$default_port}"
+  validate_port "$input" || { err_msg "Invalid remote UDP port."; return 1; }
+  REMOTE_WG_PORT="$((10#$input))"
+}
+
+wg_ensure_transport_ready() {
+  local id="$1" ifc="${WG_TRANSPORT_IFACE:-}" service config expected_ip attempt
+  case "${WG_ENDPOINT_MODE:-public}" in
+    gre) service="$(gre_service_name "$id")"; config="$(gre_config_file "$id")" ;;
+    greplus) service="$(greplus_service_name "$id")"; config="$(greplus_config_file "$id")" ;;
+    public) return 0 ;;
+    *) err_msg "Unsupported WireGuard transport: ${WG_ENDPOINT_MODE:-empty}"; return 1 ;;
+  esac
+  [ -n "$ifc" ] || { err_msg "Transport interface is missing from metadata."; return 1; }
+  # Type=simple only means the supervisor has started, not that its interface is ready.
+  if ! tunnel_iface_is_up "$ifc" && [ -f "$config" ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl start "$service" || return 1
+  fi
+  for attempt in 1 2 3 4 5; do
+    if tunnel_iface_is_up "$ifc"; then
+      expected_ip="$(ip -o -4 addr show dev "$ifc" | awk '$3=="inet" {split($4,a,"/"); print a[1]; exit}')"
+      validate_ipv4 "$expected_ip" || { err_msg "$ifc has no IPv4 address."; return 1; }
+      validate_ipv4 "${WG_ENDPOINT_IP:-}" || { err_msg "Invalid transport endpoint."; return 1; }
+      # Pin only the GRE inner peer, so overlay AllowedIPs cannot cause recursive routing.
+      ip -4 route replace "$WG_ENDPOINT_IP/32" dev "$ifc" src "$expected_ip" || return 1
+      return 0
+    fi
+    sleep 1
+  done
+  err_msg "Selected transport $ifc is not UP; WireGuard startup was stopped."
+  return 1
+}
+
+wg_service_preflight() (
+  local id="$1"
+  wg_load_meta "$id" || { err_msg "Missing WireGuard metadata for $id."; return 1; }
+  [ -n "$REMOTE_WG_PUBLIC_KEY" ] || { err_msg "WireGuard $id is pending the remote public key."; return 1; }
+  wg_ensure_transport_ready "$id" || return 1
+  wg_apply_firewall_rules "$id"
+)
+
 wg_migrate_legacy_wss_meta() {
   local id="$1" old_mode
   wg_load_meta "$id" || return 0
@@ -2603,6 +2749,7 @@ wg_mtu_for_gre() {
 }
 
 wg_menu_config_tunnel() {
+  wg_ensure_tools || return 1
   show_header "Configure WireGuard Tunnel"
   prompt_role || return
   local selected_role existing_local_ip existing_remote_ip existing_peer_key
@@ -2640,12 +2787,8 @@ wg_menu_config_tunnel() {
   echo "Use this IP as the REMOTE server Public IPv4 on the other server: $LOCAL_PUBLIC_IP"
   echo
 
-  # Safely stop/delete only this old wgtunN before choosing a port.
-  # This prevents stale WireGuard sockets from causing "Address already in use".
-  wg_safe_cleanup_runtime "$TUNNEL_ID" >/dev/null 2>&1 || true
-
-  LOCAL_WG_PORT="$(auto_select_udp_port "$(wg_default_port "$TUNNEL_ID")" "$existing_wg_port" "wireguard" "$TUNNEL_ID")" || return
-  REMOTE_WG_PORT="$LOCAL_WG_PORT"
+  LOCAL_WG_PORT="${existing_wg_port:-$(wg_default_port "$TUNNEL_ID")}"
+  REMOTE_WG_PORT="${REMOTE_WG_PORT:-$(wg_default_port "$TUNNEL_ID")}"
   EXTRA_ALLOWED_IPS=""
 
   # Remove only a legacy WSS companion for this number.
@@ -2676,7 +2819,7 @@ wg_menu_config_tunnel() {
     echo "Saved remote peer key found."
     echo "Press Enter to keep it, paste a new peer public key to replace it, or type CLEAR to reset this tunnel to pending."
     local peer_key_input
-    read -rp "REMOTE WireGuard public key [keep/CLEAR/new] (00=menu): " peer_key_input
+    read -rp "REMOTE WireGuard public key [keep/CLEAR/new] (00=menu): " peer_key_input || return 99
     if is_main_menu_token "$peer_key_input"; then return_main_msg; return 99; fi
     if [ "${peer_key_input^^}" = "CLEAR" ]; then
       REMOTE_WG_PUBLIC_KEY=""
@@ -2686,7 +2829,27 @@ wg_menu_config_tunnel() {
   fi
   echo
 
-  wg_create_tunnel 1 || echo "WireGuard tunnel creation failed"
+  # Peer key input is completed before deleting the existing runtime interface.
+  if [ -z "$REMOTE_WG_PUBLIC_KEY" ]; then
+    wg_generate_keys "$TUNNEL_ID" || return 1
+    echo "Local WireGuard public key: $(cat "$(wg_public_key_file "$TUNNEL_ID")")"
+    read -rp "REMOTE WireGuard public key (Enter=pending, 00=menu): " REMOTE_WG_PUBLIC_KEY || return 99
+    if is_main_menu_token "$REMOTE_WG_PUBLIC_KEY"; then return_main_msg; return 99; fi
+    REMOTE_WG_PUBLIC_KEY="$(normalize_wg_public_key "$REMOTE_WG_PUBLIC_KEY")"
+  fi
+  if [ -n "$REMOTE_WG_PUBLIC_KEY" ]; then
+    validate_wg_public_key "$REMOTE_WG_PUBLIC_KEY" || { err_msg "Invalid remote public key; current tunnel was left running."; return 1; }
+    wg_generate_keys "$TUNNEL_ID" || return 1
+    if [ "$REMOTE_WG_PUBLIC_KEY" = "$(cat "$(wg_public_key_file "$TUNNEL_ID")")" ]; then
+      err_msg "Use the OTHER server's public key; current tunnel was left running."
+      return 1
+    fi
+  fi
+  wg_prompt_remote_port "$REMOTE_WG_PORT" || return $?
+  if [ -n "$REMOTE_WG_PUBLIC_KEY" ]; then wg_ensure_transport_ready "$TUNNEL_ID" || return 1; fi
+  LOCAL_WG_PORT="$(wg_select_local_port "$TUNNEL_ID" "$existing_wg_port")" || return 1
+  echo "Final UDP ports: LOCAL ListenPort=$LOCAL_WG_PORT / REMOTE Endpoint port=$REMOTE_WG_PORT"
+  wg_create_tunnel 0 || { local rc=$?; [ "$rc" -eq 99 ] || err_msg "WireGuard tunnel creation failed"; return "$rc"; }
 }
 
 wg_check_one_tunnel() {
@@ -2750,7 +2913,7 @@ wg_check_one_tunnel() {
     if wg_load_meta "$id" && [ -n "${REMOTE_WG_IP:-}" ]; then
       echo
       echo "Pinging remote WireGuard inner IP $REMOTE_WG_IP (4 tries)..."
-      if ping -c 4 "$REMOTE_WG_IP" >/tmp/wg_ping_$$.log 2>&1; then
+      if ping -n -I "$ifc" -c 4 "$REMOTE_WG_IP" >/tmp/wg_ping_$$.log 2>&1; then
         cat /tmp/wg_ping_$$.log
         echo "[OK] WireGuard inner tunnel is UP"
       else
@@ -2759,9 +2922,9 @@ wg_check_one_tunnel() {
         last="$(wg show "$ifc" latest-handshakes 2>/dev/null | awk 'NR==1{print $2}' || true)"
         if [ -z "$last" ] || [ "$last" = "0" ]; then
           if [[ "${WG_ENDPOINT_MODE:-public}" == gre || "${WG_ENDPOINT_MODE:-public}" == greplus ]]; then
-            echo "Diagnosis: no WireGuard handshake yet. WireGuard is using ${WG_ENDPOINT_MODE} transport. Check that transport tunnel $id still pings, the peer public key is correct, and UDP $(wg_default_port "$id") is allowed over ${WG_TRANSPORT_IFACE:-transport interface} on both servers."
+            echo "Diagnosis: no WireGuard handshake yet. WireGuard is using ${WG_ENDPOINT_MODE} transport. Check that transport tunnel $id still pings, the peer public key is correct, and UDP ${LOCAL_WG_PORT:-$(wg_default_port "$id")} is allowed over ${WG_TRANSPORT_IFACE:-transport interface} on both servers."
           else
-            echo "Diagnosis: no WireGuard handshake yet. Check the peer public key, remote public IP, UDP port $(wg_default_port "$id"), and firewall/NAT on both servers. If public UDP/WireGuard is blocked but GRE works, re-run create/update after GRE is up; v6 will auto-use GRE as WireGuard transport."
+            echo "Diagnosis: no WireGuard handshake yet. Check the peer public key, remote public IP, UDP port ${REMOTE_WG_PORT:-$(wg_default_port "$id")}, and firewall/NAT on both servers. If public UDP/WireGuard is blocked but GRE works, re-run create/update after GRE is up; v6 will auto-use GRE as WireGuard transport."
           fi
         else
           now="$(date +%s)"
@@ -2886,7 +3049,8 @@ wg_install_service() {
     echo "Failed to install the persistent manager copy at $INSTALL_BIN" >&2
     return 1
   fi
-  install_health_monitor
+  install_health_monitor || return 1
+  diagnostic_prepare_logs || return 1
   mkdir -p "/etc/systemd/system/wg-quick@$ifc.service.d"
   local transport_after=""
   if wg_load_meta "$id"; then
@@ -2902,7 +3066,7 @@ After=network-online.target $transport_after
 Wants=$transport_after
 
 [Service]
-ExecStartPre=/bin/bash $INSTALL_BIN --service firewall-wg $id
+ExecStartPre=/bin/bash $INSTALL_BIN --service prepare-wg $id
 StandardOutput=append:$DIAG_SERVICE_LOG
 StandardError=append:$DIAG_SERVICE_LOG
 EOF_WG_FW
@@ -2912,13 +3076,15 @@ EOF_WG_FW
 After=network-online.target
 
 [Service]
-ExecStartPre=/bin/bash $INSTALL_BIN --service firewall-wg $id
+ExecStartPre=/bin/bash $INSTALL_BIN --service prepare-wg $id
 StandardOutput=append:$DIAG_SERVICE_LOG
 StandardError=append:$DIAG_SERVICE_LOG
 EOF_WG_FW
   fi
 
   systemctl daemon-reload
+
+  wg_service_preflight "$id" || return 1
 
   # Avoid stale interface/socket/route bugs, but only touch this WireGuard tunnel.
   wg_safe_cleanup_runtime "$id" >/dev/null 2>&1 || true
@@ -2931,7 +3097,7 @@ EOF_WG_FW
   fi
 
   systemctl enable "$svc" || return 1
-  if systemctl restart "$svc"; then
+  if systemctl restart "$svc" && tunnel_iface_is_up "$ifc"; then
     echo "WireGuard service enabled and started ($svc)"
     return 0
   fi
@@ -2959,28 +3125,19 @@ wg_restart_one_tunnel() {
     echo "Tunnel $id is pending. Add the OTHER server public key first." >&2
     return 1
   fi
-  if [ ! -f "$(wg_config_file "$id")" ]; then
-    echo "WireGuard config file is missing. Re-run create/update for tunnel $id." >&2
-    return 1
-  fi
-
   wg_ensure_tools || return 1
+  wg_generate_keys "$id" || return 1
+  wg_ensure_transport_ready "$id" || return 1
+  wg_write_config "$id" || return 1
   enable_ip_forward
-  wg_apply_firewall_rules "$id"
+  wg_apply_firewall_rules "$id" || return 1
 
   echo "Restarting WireGuard tunnel $id ($ifc)..."
   if command -v systemctl >/dev/null 2>&1; then
-    systemctl daemon-reload || true
-    wg_safe_cleanup_runtime "$id" >/dev/null 2>&1 || true
-    systemctl enable "$svc" >/dev/null 2>&1 || true
-    if ! systemctl restart "$svc"; then
-      wg_print_service_failure "$id"
-      return 1
-    fi
+    wg_install_service "$id" || { wg_print_service_failure "$id"; return 1; }
   else
-    wg-quick down "$ifc" >/dev/null 2>&1 || true
-    ip link delete "$ifc" 2>/dev/null || true
-    wg-quick up "$ifc"
+    wg_safe_cleanup_runtime "$id" || return 1
+    wg-quick up "$ifc" || return 1
   fi
 
   echo "[OK] Restarted $ifc"
@@ -3010,7 +3167,7 @@ wg_repair_menu() {
   wg_restart_one_tunnel "$selected_id"
 }
 
-wg_apply_firewall_rules() {
+wg_apply_firewall_rules() (
   local id="$1"
   local port endpoint_ip remote_port ifc transport_ifc endpoint_mode
   port="$(wg_default_port "$id")"
@@ -3071,7 +3228,7 @@ wg_apply_firewall_rules() {
     fi
     firewall-cmd --reload >/dev/null 2>&1 || true
   fi
-}
+)
 
 wg_remove_firewall_rules() {
   local id="$1"
@@ -3292,6 +3449,11 @@ enable_ip_forward() {
 declare -a INV_TYPE INV_ID INV_IFACE INV_LOCAL INV_TARGET INV_LOCAL_PUBLIC INV_REMOTE_PUBLIC INV_STATE INV_DESC
 
 build_tunnel_inventory() {
+  local TUNNEL_TYPE TUNNEL_ID TUN_IFACE TUN_KEY ROLE SERVER_ROLE LOCAL_PUBLIC_IP REMOTE_PUBLIC_IP
+  local LOCAL_GRE_IP REMOTE_GRE_IP LOCAL_GREPLUS_IP REMOTE_GREPLUS_IP GREPLUS_MTU GREPLUS_TUN_KEY GREPLUS_TXQUEUELEN
+  local WG_IFACE LOCAL_WG_IP REMOTE_WG_IP LOCAL_WG_PORT REMOTE_WG_PORT WG_ENDPOINT_MODE WG_ENDPOINT_IP
+  local WG_TRANSPORT_IFACE WG_MTU REMOTE_WG_PUBLIC_KEY WG_PENDING EXTRA_ALLOWED_IPS
+  local WG_CONFIG_FILE WG_PRIVATE_KEY_FILE WG_PUBLIC_KEY_FILE
   INV_TYPE=(); INV_ID=(); INV_IFACE=(); INV_LOCAL=(); INV_TARGET=(); INV_LOCAL_PUBLIC=(); INV_REMOTE_PUBLIC=(); INV_STATE=(); INV_DESC=()
   local ids id ifc local_ip target local_pub remote_pub state desc
 
@@ -3340,7 +3502,8 @@ build_tunnel_inventory() {
       remote_pub="${REMOTE_PUBLIC_IP:-${WG_ENDPOINT_IP:-}}"
       if [ -z "${REMOTE_WG_PUBLIC_KEY:-}" ]; then desc="WireGuard/PENDING"; fi
     fi
-    if tunnel_iface_is_up "$ifc"; then state="active"; else state="inactive"; fi
+    if [ "$desc" = "WireGuard/PENDING" ]; then state="pending-key"
+    elif tunnel_iface_is_up "$ifc"; then state="active"; else state="inactive"; fi
     INV_TYPE+=("wireguard"); INV_ID+=("$id"); INV_IFACE+=("$ifc"); INV_LOCAL+=("$local_ip"); INV_TARGET+=("$target"); INV_LOCAL_PUBLIC+=("$local_pub"); INV_REMOTE_PUBLIC+=("$remote_pub"); INV_STATE+=("$state"); INV_DESC+=("$desc")
   done <<< "$ids"
 
@@ -3410,7 +3573,7 @@ selection_has_type_id() {
 }
 
 # Return 0 if WireGuard tunnel <wg_id> uses the selected transport tunnel.
-wg_uses_transport_tunnel() {
+wg_uses_transport_tunnel() (
   local wg_id="$1"
   local transport_type="$2"
   local transport_id="$3"
@@ -3440,7 +3603,7 @@ wg_uses_transport_tunnel() {
 
   # Backward compatibility: older metadata may only use same-number transport.
   [ "$wg_id" = "$transport_id" ]
-}
+)
 
 # Prevent accidental removal of a GRE transport that still has WireGuard on top.
 # This avoids the common "I removed one tunnel and the others stopped" case.
@@ -3473,7 +3636,7 @@ remove_selection_dependency_guard() {
   [ "$blocked" -eq 0 ]
 }
 
-gre_apply_firewall_rules() {
+gre_apply_firewall_rules() (
   local id="$1"
   local ifc
   validate_tunnel_id "$id" || return 1
@@ -3482,7 +3645,7 @@ gre_apply_firewall_rules() {
   enable_ip_forward
   firewall_allow_ip_peer "GRE tunnel $id remote public" "${REMOTE_PUBLIC_IP:-}" "$ifc" >/dev/null 2>&1 || true
   firewall_allow_ip_peer "GRE tunnel $id remote inner" "${REMOTE_GRE_IP:-}" "$ifc" >/dev/null 2>&1 || true
-}
+)
 
 # After deleting selected tunnels, re-apply firewall rules and revive only remaining tunnels
 # that are enabled but inactive. Active tunnels are not restarted.
@@ -3754,6 +3917,11 @@ test_wg_tunnel_ping() {
     echo "[SKIP] WireGuard tunnel $id: pending peer public key"
     return 1
   fi
+  if ! tunnel_iface_is_up "$(wg_iface_name "$id")"; then
+    echo "[REPAIR] WireGuard $id is inactive; repairing its saved transport/config/service..."
+    wg_restart_one_tunnel "$id" || return 1
+    wg_load_meta "$id" || return 1
+  fi
   ping4_target "WireGuard tunnel $id ($(wg_iface_name "$id")) remote inner IP" "${REMOTE_WG_IP:-}" "$(wg_iface_name "$id")"
 }
 
@@ -3947,7 +4115,7 @@ reset_all_tunnels() {
 
   echo
   echo "Stopping WireGuard first..."
-  local ids id
+  local ids id failed=0
 
   ids="$(wg_collect_ids || true)"
   while IFS= read -r id; do
@@ -3969,6 +4137,7 @@ reset_all_tunnels() {
   ids="$(gre_collect_ids || true)"
   while IFS= read -r id; do
     [ -n "$id" ] || continue
+    systemctl stop "$(gre_service_name "$id")" 2>/dev/null || true
     ip link set dev "$(gre_iface "$id")" down 2>/dev/null || true
     ip tunnel del "$(gre_iface "$id")" 2>/dev/null || true
     ip link delete "$(gre_iface "$id")" 2>/dev/null || true
@@ -3983,7 +4152,7 @@ reset_all_tunnels() {
       if gre_create_tunnel 0 && gre_install_service "$id"; then
         echo "[OK] GRE tunnel $id reset"
       else
-        echo "[WARN] GRE tunnel $id reset failed"
+        failed=$((failed + 1)); echo "[WARN] GRE tunnel $id reset failed"
       fi
     fi
   done <<< "$ids"
@@ -3997,7 +4166,7 @@ reset_all_tunnels() {
       if greplus_create_tunnel 0 && greplus_install_service "$id"; then
         echo "[OK] GRE Plus tunnel $id reset"
       else
-        echo "[WARN] GRE Plus tunnel $id reset failed"
+        failed=$((failed + 1)); echo "[WARN] GRE Plus tunnel $id reset failed"
       fi
     fi
   done <<< "$ids"
@@ -4014,11 +4183,12 @@ reset_all_tunnels() {
     if wg_restart_one_tunnel "$id"; then
       echo "[OK] WireGuard tunnel $id reset"
     else
-      echo "[WARN] WireGuard tunnel $id reset failed"
+      failed=$((failed + 1)); echo "[WARN] WireGuard tunnel $id reset failed"
     fi
   done <<< "$ids"
 
   echo
+  if [ "$failed" -gt 0 ]; then err_msg "Reset completed with $failed tunnel failure(s)."; return 1; fi
   echo "[OK] Reset all finished."
   diagnostic_event "MANUAL" "manager" "manual reset-all finished"
 }
@@ -5417,6 +5587,11 @@ if [[ "${1:-}" == "--service" ]]; then
       gre_service_start "${3:-}"
       exit $?
       ;;
+    prepare-wg)
+      ensure_root
+      wg_service_preflight "${3:-}"
+      exit $?
+      ;;
     firewall-wg)
       ensure_root
       wg_apply_firewall_rules "${3:-}"
@@ -5433,7 +5608,7 @@ if [[ "${1:-}" == "--service" ]]; then
       exit $?
       ;;
     *)
-      echo "Unknown service command. Use --service supervise-gre <id>, supervise-greplus <id>, health-check-all, haproxy-udp-sync, or haproxy-udp-repair." >&2
+      echo "Unknown service command. Use --service prepare-wg <id>, supervise-gre <id>, supervise-greplus <id>, health-check-all, haproxy-udp-sync, or haproxy-udp-repair." >&2
       exit 1
       ;;
   esac
