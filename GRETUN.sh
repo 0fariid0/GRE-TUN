@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + GRE Plus + WireGuard + HAProxy tunnel manager v12.0.4
+# GRE + GRE Plus + WireGuard + HAProxy tunnel manager v12.0.5
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - WireGuard can use public UDP or ride over an existing GRE / GRE Plus tunnel as transport
@@ -40,10 +40,12 @@ set -euo pipefail
 #   and preserves the selected transport across firewall, MTU, boot, health and removal checks.
 # - v12.0.4 fixes UDP socket detection, propagates startup errors, isolates dependency
 #   metadata, waits for the selected GRE transport at startup, and keeps cancelled edits safe.
+# - v12.0.5 initializes peer ports for each selected WG ID, re-confirms legacy
+#   peer ports, and provides a persistent port-only repair without regenerating keys.
 # - HAProxy fix: preserve an existing global maxconn, use the known-working defaults,
 #   and stop changing system limits or restarting HAProxy simply by opening its menu.
 
-APP_VERSION="12.0.4"
+APP_VERSION="12.0.5"
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -2249,6 +2251,7 @@ wg_save_meta() {
     write_var REMOTE_WG_IP "$REMOTE_WG_IP"
     write_var LOCAL_WG_PORT "$LOCAL_WG_PORT"
     write_var REMOTE_WG_PORT "$REMOTE_WG_PORT"
+    write_var WG_REMOTE_PORT_CONFIRMED "${WG_REMOTE_PORT_CONFIRMED:-0}"
     write_var WG_ENDPOINT_MODE "${WG_ENDPOINT_MODE:-public}"
     write_var WG_ENDPOINT_IP "${WG_ENDPOINT_IP:-${REMOTE_PUBLIC_IP:-}}"
     write_var WG_TRANSPORT_IFACE "${WG_TRANSPORT_IFACE:-}"
@@ -2275,7 +2278,7 @@ wg_load_meta() {
   if [ -f "$file" ]; then
     # Optional transport fields in older files must not inherit another tunnel's state.
     unset TUNNEL_TYPE TUNNEL_ID WG_IFACE ROLE SERVER_ROLE LOCAL_PUBLIC_IP REMOTE_PUBLIC_IP
-    unset LOCAL_WG_IP REMOTE_WG_IP LOCAL_WG_PORT REMOTE_WG_PORT WG_ENDPOINT_MODE WG_ENDPOINT_IP
+    unset LOCAL_WG_IP REMOTE_WG_IP LOCAL_WG_PORT REMOTE_WG_PORT WG_REMOTE_PORT_CONFIRMED WG_ENDPOINT_MODE WG_ENDPOINT_IP
     unset WG_TRANSPORT_IFACE WG_MTU REMOTE_WG_PUBLIC_KEY WG_PENDING EXTRA_ALLOWED_IPS
     # shellcheck disable=SC1090
     source "$file"
@@ -2283,6 +2286,7 @@ wg_load_meta() {
     WG_IFACE="$(wg_iface_name "$id")"
     LOCAL_WG_PORT="${LOCAL_WG_PORT:-$(wg_default_port "$id")}"
     REMOTE_WG_PORT="${REMOTE_WG_PORT:-$(wg_default_port "$id")}"
+    WG_REMOTE_PORT_CONFIRMED="${WG_REMOTE_PORT_CONFIRMED:-0}"
     REMOTE_WG_PUBLIC_KEY="${REMOTE_WG_PUBLIC_KEY:-}"
     EXTRA_ALLOWED_IPS="${EXTRA_ALLOWED_IPS:-}"
     WG_ENDPOINT_MODE="${WG_ENDPOINT_MODE:-public}"
@@ -2671,6 +2675,7 @@ wg_prompt_remote_port() {
   input="${input:-$default_port}"
   validate_port "$input" || { err_msg "Invalid remote UDP port."; return 1; }
   REMOTE_WG_PORT="$((10#$input))"
+  WG_REMOTE_PORT_CONFIRMED=1
 }
 
 wg_ensure_transport_ready() {
@@ -2698,6 +2703,45 @@ wg_ensure_transport_ready() {
     sleep 1
   done
   err_msg "Selected transport $ifc is not UP; WireGuard startup was stopped."
+  return 1
+}
+
+wg_fix_peer_port() {
+  local id="${1:-}" port="${2:-}" conf meta backup old_port was_up=0
+  validate_tunnel_id "$id" && validate_port "$port" || { err_msg "Usage: --fix-wg-port <tunnel ID> <REMOTE ListenPort>"; return 1; }
+  id="$((10#$id))"; port="$((10#$port))"
+  wg_ensure_tools || return 1
+  install_manager_binary || return 1
+  wg_load_meta "$id" || { err_msg "Missing metadata for WireGuard $id."; return 1; }
+  validate_wg_public_key "$REMOTE_WG_PUBLIC_KEY" || { err_msg "The remote public key is missing/invalid."; return 1; }
+  [ -s "$(wg_private_key_file "$id")" ] || { err_msg "Private key is missing; it was not regenerated."; return 1; }
+  validate_ipv4 "$(wg_auto_endpoint_ip)" || { err_msg "Invalid saved endpoint IP."; return 1; }
+  conf="$(wg_config_file "$id")"; meta="$(wg_meta_file "$id")"
+  [ -f "$conf" ] || { err_msg "Saved WireGuard config is missing."; return 1; }
+  backup="$(mktemp -d "$WG_META_DIR/.port-fix.XXXXXX")" || return 1
+  cp -p "$conf" "$backup/config" && cp -p "$meta" "$backup/meta" || { rm -rf "$backup"; return 1; }
+  tunnel_iface_is_up "$(wg_iface_name "$id")" && was_up=1
+  old_port="$REMOTE_WG_PORT"
+  REMOTE_WG_PORT="$port"; WG_REMOTE_PORT_CONFIRMED=1
+  if wg_write_config "$id" && wg_save_meta && wg_apply_firewall_rules "$id"; then
+    if [ "$was_up" -eq 1 ]; then
+      if wg set "$(wg_iface_name "$id")" peer "$REMOTE_WG_PUBLIC_KEY" endpoint "$(wg_auto_endpoint_ip):$port"; then
+        rm -rf "$backup"
+        ok_msg "WireGuard $id peer port updated: $old_port -> $port (runtime, config, metadata)."
+        echo "Endpoint: $(wg_auto_endpoint_ip):$port; LOCAL ListenPort: $LOCAL_WG_PORT"
+        return 0
+      fi
+    elif wg_start_runtime "$id"; then
+      rm -rf "$backup"
+      ok_msg "WireGuard $id started with remote port $port."
+      return 0
+    fi
+  fi
+  if ! cp -p "$backup/config" "$conf" || ! cp -p "$backup/meta" "$meta"; then
+    err_msg "Repair failed; could not restore files. Backup retained at $backup."; return 1
+  fi
+  rm -rf "$backup"
+  err_msg "Port repair failed; previous config and metadata restored."
   return 1
 }
 
@@ -2760,13 +2804,15 @@ wg_menu_config_tunnel() {
   existing_local_ip=""
   existing_remote_ip=""
   existing_peer_key=""
-  local existing_wg_port
-  existing_wg_port=""
+  local existing_wg_port existing_remote_port existing_remote_port_confirmed
+  existing_wg_port=""; existing_remote_port=""; existing_remote_port_confirmed=0
   if wg_load_meta "$TUNNEL_ID"; then
     existing_local_ip="${LOCAL_PUBLIC_IP:-}"
     existing_remote_ip="${REMOTE_PUBLIC_IP:-}"
     existing_peer_key="${REMOTE_WG_PUBLIC_KEY:-}"
     existing_wg_port="${LOCAL_WG_PORT:-}"
+    existing_remote_port="${REMOTE_WG_PORT:-}"
+    existing_remote_port_confirmed="${WG_REMOTE_PORT_CONFIRMED:-0}"
   fi
   ROLE="$selected_role"
   REMOTE_WG_PUBLIC_KEY="$existing_peer_key"
@@ -2788,7 +2834,15 @@ wg_menu_config_tunnel() {
   echo
 
   LOCAL_WG_PORT="${existing_wg_port:-$(wg_default_port "$TUNNEL_ID")}"
-  REMOTE_WG_PORT="${REMOTE_WG_PORT:-$(wg_default_port "$TUNNEL_ID")}"
+  REMOTE_WG_PORT="$(wg_default_port "$TUNNEL_ID")"
+  WG_REMOTE_PORT_CONFIRMED=0
+  if [ "$existing_remote_port_confirmed" = 1 ] && validate_port "$existing_remote_port"; then
+    REMOTE_WG_PORT="$existing_remote_port"
+    WG_REMOTE_PORT_CONFIRMED=1
+  elif [ -n "$existing_remote_port" ] && [ "$existing_remote_port" != "$REMOTE_WG_PORT" ]; then
+    warn_msg "Old saved peer port $existing_remote_port needs confirmation. The default is now $REMOTE_WG_PORT for tunnel $TUNNEL_ID."
+    echo "If the OTHER server really uses $existing_remote_port, enter it explicitly at the remote-port prompt."
+  fi
   EXTRA_ALLOWED_IPS=""
 
   # Remove only a legacy WSS companion for this number.
@@ -3451,7 +3505,7 @@ declare -a INV_TYPE INV_ID INV_IFACE INV_LOCAL INV_TARGET INV_LOCAL_PUBLIC INV_R
 build_tunnel_inventory() {
   local TUNNEL_TYPE TUNNEL_ID TUN_IFACE TUN_KEY ROLE SERVER_ROLE LOCAL_PUBLIC_IP REMOTE_PUBLIC_IP
   local LOCAL_GRE_IP REMOTE_GRE_IP LOCAL_GREPLUS_IP REMOTE_GREPLUS_IP GREPLUS_MTU GREPLUS_TUN_KEY GREPLUS_TXQUEUELEN
-  local WG_IFACE LOCAL_WG_IP REMOTE_WG_IP LOCAL_WG_PORT REMOTE_WG_PORT WG_ENDPOINT_MODE WG_ENDPOINT_IP
+  local WG_IFACE LOCAL_WG_IP REMOTE_WG_IP LOCAL_WG_PORT REMOTE_WG_PORT WG_REMOTE_PORT_CONFIRMED WG_ENDPOINT_MODE WG_ENDPOINT_IP
   local WG_TRANSPORT_IFACE WG_MTU REMOTE_WG_PUBLIC_KEY WG_PENDING EXTRA_ALLOWED_IPS
   local WG_CONFIG_FILE WG_PRIVATE_KEY_FILE WG_PUBLIC_KEY_FILE
   INV_TYPE=(); INV_ID=(); INV_IFACE=(); INV_LOCAL=(); INV_TARGET=(); INV_LOCAL_PUBLIC=(); INV_REMOTE_PUBLIC=(); INV_STATE=(); INV_DESC=()
@@ -5559,6 +5613,12 @@ show_menu() {
 }
 
 ### Script entry
+if [[ "${1:-}" == "--fix-wg-port" ]]; then
+  ensure_root
+  run_maintenance_action wg_fix_peer_port "${2:-}" "${3:-}"
+  exit $?
+fi
+
 if [[ "${1:-}" == "--service" ]]; then
   case "${2:-}" in
     start-gre)
