@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + GRE Plus + WireGuard + HAProxy tunnel manager v12.0.5
+# GRE + GRE Plus + WireGuard + HAProxy tunnel manager v12.0.6
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - WireGuard can use public UDP or ride over an existing GRE / GRE Plus tunnel as transport
@@ -42,10 +42,12 @@ set -euo pipefail
 #   metadata, waits for the selected GRE transport at startup, and keeps cancelled edits safe.
 # - v12.0.5 initializes peer ports for each selected WG ID, re-confirms legacy
 #   peer ports, and provides a persistent port-only repair without regenerating keys.
+# - v12.0.6 keeps the outside iperf3 server running for all tunnel addresses,
+#   and adds validated multi-row client selection, sequential tests, timeouts and a summary.
 # - HAProxy fix: preserve an existing global maxconn, use the known-working defaults,
 #   and stop changing system limits or restarting HAProxy simply by opening its menu.
 
-APP_VERSION="12.0.5"
+APP_VERSION="12.0.6"
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -4027,66 +4029,141 @@ test_all_tunnels_ping() {
   echo "============================================================"
 }
 
+# Select inventory rows, not tunnel IDs (GRE/GRE Plus/WG may share the same ID).
+speed_test_parse_selection() {
+  local raw="${1:-}" count="${2:-0}" token number
+  local -a tokens=()
+  local -A seen=()
+  SPEED_TEST_SELECTION=()
+  raw="${raw//,/ }"
+  read -r -a tokens <<< "$raw"
+  [ "${#tokens[@]}" -gt 0 ] && [ "$count" -gt 0 ] || { err_msg "No tunnel rows selected."; return 1; }
+  if [ "${#tokens[@]}" -eq 1 ] && [ "${tokens[0]}" = 0 ]; then
+    for ((number=1;number<=count;number++)); do SPEED_TEST_SELECTION+=("$number"); done
+    return 0
+  fi
+  for token in "${tokens[@]}"; do
+    [[ "$token" =~ ^[0-9]{1,9}$ ]] || { SPEED_TEST_SELECTION=(); err_msg "Invalid row: $token"; return 1; }
+    number="$((10#$token))"
+    [ "$number" -ge 1 ] && [ "$number" -le "$count" ] || {
+      SPEED_TEST_SELECTION=(); err_msg "Row $token is outside the list. Use 0 alone for ALL."; return 1;
+    }
+    if [ -z "${seen[$number]+x}" ]; then
+      SPEED_TEST_SELECTION+=("$number"); seen[$number]=1
+    fi
+  done
+}
+
+speed_test_restore_int_trap() {
+  local saved="${1:-}"
+  trap - INT
+  if [ -n "$saved" ]; then eval "$saved"; fi
+}
+
+speed_test_outside_server() {
+  local rc=0 saved_int interrupted=0
+  # One listener accepts every GRE/GRE Plus/WG inner address; do not bind to a single tunnel.
+  iperf3_prepare_firewall || return 1
+  echo "Outside speed-test server: listening on all IPv4 addresses, TCP port 5201."
+  echo "It remains running after each Iran test. Other Iran servers can test in turn."
+  echo "Close it yourself with Ctrl+C when all tests are finished. Keep this SSH window open."
+  echo "Command: iperf3 -s -4 -p 5201"
+  saved_int="$(trap -p INT)"
+  trap 'interrupted=1' INT
+  if iperf3 -s -4 -p 5201; then :; else rc=$?; fi
+  speed_test_restore_int_trap "$saved_int"
+  if [ "$interrupted" -eq 1 ] || [ "$rc" -eq 130 ]; then
+    info_msg "Outside speed-test server closed manually. Returning to the menu."
+    return 0
+  elif [ "$rc" -ne 0 ]; then
+    err_msg "iperf3 server stopped with status $rc. Check whether port 5201 is already in use."
+    return "$rc"
+  fi
+  info_msg "Outside speed-test server stopped."
+}
+
 tunnel_speed_test_menu() {
   show_header "Tunnel Throughput Speed Test"
-  ensure_feature_dependencies "speed-test" "iperf3:iperf3" || return 1
-  build_tunnel_inventory
-  print_tunnel_inventory || return
-  read -rp "Select tunnel number for speed test (00=menu): " selected
-  if is_main_menu_token "$selected"; then return 99; fi
-  [[ "$selected" =~ ^[0-9]+$ ]] && [ "$selected" -ge 1 ] && [ "$selected" -le "${#INV_TYPE[@]}" ] || { err_msg "Invalid tunnel selection."; return 1; }
-  local idx local_ip target role duration answer rc=0 type
-  idx=$((selected - 1))
-  local_ip="${INV_LOCAL[$idx]:-}"
-  local_ip="${local_ip%%/*}"
-  type="${INV_TYPE[$idx]:-}"
+  local role selected duration row idx ifc local_ip target rc saved_int interrupted=0
+  local ok=0 failed=0 skipped=0 completed=0
+  local -a results=() connect_options=() command=()
   echo "Select this server's location:"
-  echo "1) Iran (client)"
-  echo "2) Kharej/outside (iperf3 server)"
-  read -rp "Choose [1-2] (00=menu): " role
-  if is_main_menu_token "$role"; then return 99; fi
-  if [ "$role" = "1" ]; then
-    target="${INV_TARGET[$idx]:-}"
-    read -rp "Remote tunnel IPv4 (inner IP) [${target:-required}]: " answer
-    target="${answer:-$target}"
-    target="${target%%/*}"
-    validate_ipv4 "$target" || { err_msg "Invalid remote IPv4."; return 1; }
-  elif [ "$role" != "2" ]; then
-    err_msg "Invalid role."; return 1
-  fi
-  read -rp "Test duration seconds [10]: " duration
-  duration="${duration:-10}"
-  [[ "$duration" =~ ^[1-9][0-9]*$ ]] || duration=10
-  echo
-  if [ "$role" = "2" ]; then
-    iperf3_prepare_firewall "${INV_IFACE[$idx]:-}"
-    echo "Starting a one-shot iperf3 server on this (Kharej) side."
-    echo "Now start the client test on Iran; this server will stop automatically after that one test."
-    if [ -n "$local_ip" ]; then
-      echo "Command: iperf3 -s -1 -B $local_ip"
-      if iperf3 -s -1 -B "$local_ip"; then :; else rc=$?; fi
-    else
-      echo "Command: iperf3 -s -1"
-      if iperf3 -s -1; then :; else rc=$?; fi
-    fi
-  elif [ "$role" = "1" ]; then
-    echo "Make sure iperf3 -s is running on the Kharej server, then testing through the selected tunnel..."
-    if [ -n "$local_ip" ]; then
-      echo "Command: iperf3 -c $target -B $local_ip -t $duration -P 4"
-      if iperf3 -c "$target" -B "$local_ip" -t "$duration" -P 4; then :; else rc=$?; fi
-    else
-      echo "Command: iperf3 -c $target -t $duration -P 4"
-      if iperf3 -c "$target" -t "$duration" -P 4; then :; else rc=$?; fi
-    fi
-  else
-    err_msg "Invalid role."; return 1
-  fi
+  echo "1) Iran (test selected tunnels)"
+  echo "2) Kharej/outside (keep speed-test server running)"
+  read -rp "Choose [1-2] (00=menu): " role || return 99
+  if is_main_menu_token "$role"; then return_main_msg; return 99; fi
+  case "$role" in
+    2)
+      ensure_feature_dependencies "speed-test" "iperf3:iperf3" || return 1
+      speed_test_outside_server
+      return $?
+      ;;
+    1) ;;
+    *) err_msg "Invalid role."; return 1 ;;
+  esac
 
-  if [ "$rc" -ne 0 ]; then
-    warn_msg "iperf3 ended or was interrupted (status $rc). Returning safely to the menu."
-  else
-    ok_msg "Speed test finished. Returning to the menu."
-  fi
+  build_tunnel_inventory
+  print_tunnel_inventory || return 1
+  echo "Select ONE or MORE row numbers: 1 2 3  /  1,2,3,  /  2"
+  echo "0) Test ALL listed tunnels"
+  echo "Selected rows are tested in your order, once each."
+  read -rp "Tunnel rows (00=menu): " selected || return 99
+  if is_main_menu_token "$selected"; then return_main_msg; return 99; fi
+  speed_test_parse_selection "$selected" "${#INV_TYPE[@]}" || return 1
+  read -rp "Duration per tunnel in seconds [10] (00=menu): " duration || return 99
+  if is_main_menu_token "$duration"; then return_main_msg; return 99; fi
+  duration="${duration:-10}"
+  [[ "$duration" =~ ^[0-9]{1,4}$ ]] && [ "$((10#$duration))" -ge 1 ] && [ "$((10#$duration))" -le 3600 ] || {
+    err_msg "Duration must be from 1 to 3600 seconds."; return 1;
+  }
+  duration="$((10#$duration))"
+  ensure_feature_dependencies "speed-test" "iperf3:iperf3" "timeout:coreutils" || return 1
+  if iperf3 --help 2>&1 | grep -q -- '--connect-timeout'; then connect_options=(--connect-timeout 5000); fi
+  echo "Keep the outside speed-test server running. These client tests stop automatically."
+  echo "TCP upload from Iran, 4 parallel streams, $duration seconds per tunnel."
+  saved_int="$(trap -p INT)"
+  trap 'interrupted=1' INT
+  for row in "${SPEED_TEST_SELECTION[@]}"; do
+    [ "$interrupted" -eq 0 ] || break
+    idx=$((row - 1)); ifc="${INV_IFACE[$idx]:-}"
+    local_ip="${INV_LOCAL[$idx]:-}"; local_ip="${local_ip%%/*}"
+    target="${INV_TARGET[$idx]:-}"; target="${target%%/*}"
+    echo
+    echo "============================================================"
+    echo "[$((completed + 1))/${#SPEED_TEST_SELECTION[@]}] row $row | ${INV_TYPE[$idx]} ID ${INV_ID[$idx]} | $ifc"
+    echo "Local: ${local_ip:-missing} -> Remote: ${target:-missing}"
+    if [ "${INV_STATE[$idx]:-}" = pending-key ] || ! validate_ipv4 "$local_ip" || ! validate_ipv4 "$target" || ! tunnel_iface_is_up "$ifc"; then
+      warn_msg "Skipped: interface is down/pending or a tunnel IP is missing."
+      results+=("SKIPPED"); skipped=$((skipped + 1)); completed=$((completed + 1))
+      continue
+    fi
+    command=(iperf3 -4 -c "$target" -B "$local_ip" -p 5201 -t "$duration" -P 4 "${connect_options[@]}")
+    printf 'Command: '; printf '%q ' "${command[@]}"; printf '\n'
+    rc=0
+    if timeout --signal=INT --kill-after=5s "$((duration + 20))s" "${command[@]}"; then :; else rc=$?; fi
+    completed=$((completed + 1))
+    if [ "$interrupted" -eq 1 ] || [ "$rc" -eq 130 ]; then
+      results+=("INTERRUPTED")
+      warn_msg "Testing cancelled; remaining rows will not run."
+      break
+    elif [ "$rc" -eq 0 ]; then
+      results+=("OK"); ok=$((ok + 1))
+    else
+      results+=("FAILED($rc)"); failed=$((failed + 1))
+      warn_msg "This test failed (status $rc); continuing with the next selected row."
+    fi
+  done
+  speed_test_restore_int_trap "$saved_int"
+  echo
+  echo "Speed test summary"
+  printf '%4s  %-11s %-4s %-12s %s\n' "Row" "Type" "ID" "Interface" "Result"
+  local n
+  for n in "${!SPEED_TEST_SELECTION[@]}"; do
+    row="${SPEED_TEST_SELECTION[$n]}"; idx=$((row - 1))
+    printf '%4s  %-11s %-4s %-12s %s\n' "$row" "${INV_TYPE[$idx]}" "${INV_ID[$idx]}" "${INV_IFACE[$idx]}" "${results[$n]:-NOT-RUN}"
+  done
+  echo "Selected=${#SPEED_TEST_SELECTION[@]} completed=$completed ok=$ok failed=$failed skipped=$skipped"
+  echo "Iran client tests finished. The outside server remains running until you close it."
   return 0
 }
 
@@ -4112,16 +4189,25 @@ aggregate_remove_profile() {
 }
 
 iperf3_prepare_firewall() {
-  local ifc="${1:-}" port=5201
-  [ -n "$ifc" ] || return 0
-  if command -v iptables >/dev/null 2>&1; then
-    if ! iptables -C INPUT -i "$ifc" -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1; then
-      iptables -I INPUT -i "$ifc" -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1 || true
+  local ifc="${1:-}" port=5201 source_range
+  local -a rule=()
+  if [ -n "$ifc" ]; then
+    rule=(-i "$ifc" -p tcp --dport "$port")
+    if command -v iptables >/dev/null 2>&1; then
+      iptables -C INPUT "${rule[@]}" -j ACCEPT >/dev/null 2>&1 || iptables -I INPUT "${rule[@]}" -j ACCEPT || return 1
     fi
+    command -v ufw >/dev/null 2>&1 && ufw allow in on "$ifc" to any port "$port" proto tcp >/dev/null 2>&1 || true
+  else
+    # Current and future managed tunnels can reach the shared listener without a tunnel picker.
+    for source_range in 10.10.0.0/16 10.20.0.0/16 10.30.0.0/16; do
+      rule=(-s "$source_range" -p tcp --dport "$port")
+      if command -v iptables >/dev/null 2>&1; then
+        iptables -C INPUT "${rule[@]}" -j ACCEPT >/dev/null 2>&1 || iptables -I INPUT "${rule[@]}" -j ACCEPT || return 1
+      fi
+      command -v ufw >/dev/null 2>&1 && ufw allow from "$source_range" to any port "$port" proto tcp >/dev/null 2>&1 || true
+    done
   fi
-  if command -v ufw >/dev/null 2>&1; then
-    ufw allow in on "$ifc" to any port "$port" proto tcp >/dev/null 2>&1 || true
-  fi
+  return 0
 }
 
 test_tunnels_menu() {
@@ -5589,7 +5675,7 @@ show_menu() {
   echo -e "  ${C_RED}2)${C_RESET} remove tunnel"
   echo -e "  ${C_YELLOW}3)${C_RESET} reset all tunnels"
   echo -e "  ${C_CYAN}4)${C_RESET} ping test tunnels"
-  echo -e "  ${C_MAGENTA}5)${C_RESET} throughput speed test ${C_DIM}(iperf3)${C_RESET}"
+  echo -e "  ${C_MAGENTA}5)${C_RESET} throughput speed test ${C_DIM}(multi-select / persistent server)${C_RESET}"
   echo -e "  ${C_MAGENTA}6)${C_RESET} haproxy port manager"
   echo -e "  ${C_YELLOW}7)${C_RESET} disconnect / error / restart logs"
   echo -e "  ${C_CYAN}8)${C_RESET} performance / capacity / migration tools"
