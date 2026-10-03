@@ -1,10 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + GRE Plus + WireGuard + HAProxy tunnel manager v12.0.2
+# GRE + GRE Plus + WireGuard + HAProxy tunnel manager v12.0.3
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
-# - WireGuard can use public UDP or automatically ride over an existing GRE tunnel as transport
+# - WireGuard can use public UDP or ride over an existing GRE / GRE Plus tunnel as transport
 # - Local tunnel/bind IPv4 can be selected manually for servers with multiple IPs
 # - v8.5-safe-remove-heal prevents removing active transports used by WireGuard and re-heals remaining tunnels after deletion
 # - v8.6-self-heal keeps GRE under a persistent supervisor, disables rp_filter for encapsulated paths,
@@ -36,10 +36,12 @@ set -euo pipefail
 # - v12.0.1 stops GRE Plus supervisors from rewriting UFW every 10 seconds.
 # - v12.0.2 stops destructive tunnel recreation/restarts caused only by transient ping/ICMP loss,
 #   avoids health-timer/supervisor repair races, and normalizes diagnostic timestamps to Asia/Tehran.
+# - v12.0.3 lets WireGuard use same-number GRE or GRE Plus, prompts when both are up,
+#   and preserves the selected transport across firewall, MTU, boot, health and removal checks.
 # - HAProxy fix: preserve an existing global maxconn, use the known-working defaults,
 #   and stop changing system limits or restarting HAProxy simply by opening its menu.
 
-APP_VERSION="12.0.2"
+APP_VERSION="12.0.3"
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -457,7 +459,7 @@ prompt_role() {
 ask_tunnel_type() {
   echo "Select tunnel type:"
   echo "1) Normal GRE tunnel"
-  echo "2) WireGuard tunnel (direct UDP or automatically over same-number GRE)"
+  echo "2) WireGuard tunnel (direct UDP or over same-number GRE / GRE Plus)"
   echo "3) GRE Plus (separate high-capacity GRE, no encryption)"
   echo
   read -rp "Choose [1-3] (00=menu): " TUNNEL_TYPE_CHOICE
@@ -1101,7 +1103,7 @@ tunnel_health_check_all() {
     fi
   done <<< "$ids"
 
-  # WireGuard is checked last so its optional normal-GRE transport is repaired first.
+  # WireGuard is checked last so its GRE/GRE Plus transport is repaired first.
   ids="$(wg_collect_ids || true)"
   while IFS= read -r id; do
     [ -n "$id" ] || continue
@@ -1113,7 +1115,7 @@ tunnel_health_check_all() {
     target="${REMOTE_WG_IP:-}"
     transport_ok=1
     case "${WG_ENDPOINT_MODE:-public}" in
-      gre)
+      gre|greplus)
         if ! tunnel_iface_is_up "${WG_TRANSPORT_IFACE:-}"; then transport_ok=0; fi
         ;;
     esac
@@ -2080,7 +2082,7 @@ wg_default_public_endpoint_ip() {
 
 wg_auto_endpoint_ip() {
   case "${WG_ENDPOINT_MODE:-public}" in
-    gre) printf '%s' "${WG_ENDPOINT_IP:-}" ;;
+    gre|greplus) printf '%s' "${WG_ENDPOINT_IP:-}" ;;
     *) wg_default_public_endpoint_ip ;;
   esac
 }
@@ -2131,7 +2133,7 @@ wg_print_ip_plan() {
   echo "  Default UDP port: $port (auto-increments if busy)"
   echo "  Iran role IP    : 10.20.$id.1/30"
   echo "  Kharej role IP  : 10.20.$id.2/30"
-  echo "  GRE transport   : if gre$id is up/reachable, WireGuard can use 10.10.$id.x"
+  echo "  Transport       : active gre$id (10.10.$id.x) or greplus$id (10.30.$id.x)"
   echo
   echo "Normal GRE uses 10.10.N.x, WireGuard uses 10.20.N.x, and GRE Plus uses 10.30.N.x."
 }
@@ -2225,10 +2227,19 @@ wg_load_meta() {
   local file
   file="$(wg_meta_file "$id")"
   if [ -f "$file" ]; then
+    # Optional transport fields in older files must not inherit another tunnel's state.
+    unset WG_ENDPOINT_MODE WG_ENDPOINT_IP WG_TRANSPORT_IFACE WG_MTU
     # shellcheck disable=SC1090
     source "$file"
     TUNNEL_ID="$id"
     WG_IFACE="${WG_IFACE:-$(wg_iface_name "$id")}"
+    WG_ENDPOINT_MODE="${WG_ENDPOINT_MODE:-public}"
+    WG_ENDPOINT_IP="${WG_ENDPOINT_IP:-${REMOTE_PUBLIC_IP:-}}"
+    case "$WG_ENDPOINT_MODE" in
+      gre) WG_TRANSPORT_IFACE="${WG_TRANSPORT_IFACE:-$(gre_iface "$id")}" ;;
+      greplus) WG_TRANSPORT_IFACE="${WG_TRANSPORT_IFACE:-$(greplus_iface "$id")}" ;;
+      *) WG_TRANSPORT_IFACE="" ;;
+    esac
     return 0
   fi
   return 1
@@ -2323,7 +2334,7 @@ wg_write_config() {
   endpoint_mode_note="${WG_ENDPOINT_MODE:-public}"
   mtu_value="${WG_MTU:-1420}"
   case "$endpoint_mode_note" in
-    gre) mtu_value="${WG_MTU:-1280}" ;;
+    gre|greplus) mtu_value="${WG_MTU:-1280}" ;;
   esac
   if [ -z "$endpoint_ip" ]; then
     echo "WireGuard endpoint IP is empty. Cannot write config." >&2
@@ -2390,7 +2401,7 @@ wg_create_tunnel() {
   WG_TRANSPORT_IFACE="${WG_TRANSPORT_IFACE:-}"
   if [ -z "${WG_MTU:-}" ]; then
     case "$WG_ENDPOINT_MODE" in
-      gre) WG_MTU="$(wg_mtu_for_gre "$TUNNEL_ID")" ;;
+      gre|greplus) WG_MTU="$(wg_mtu_for_gre "$TUNNEL_ID")" ;;
       *) WG_MTU="1420" ;;
     esac
   fi
@@ -2413,7 +2424,7 @@ wg_create_tunnel() {
   echo "[*] WireGuard endpoint mode: ${WG_ENDPOINT_MODE:-public}"
   echo "[*] WireGuard endpoint: ${WG_ENDPOINT_IP:-${REMOTE_PUBLIC_IP:-UNKNOWN}}:$REMOTE_WG_PORT"
   echo "[*] WireGuard MTU: ${WG_MTU:-1420}"
-  if [ "${WG_ENDPOINT_MODE:-public}" = "gre" ]; then
+  if [[ "${WG_ENDPOINT_MODE:-public}" == gre || "${WG_ENDPOINT_MODE:-public}" == greplus ]]; then
     echo "[*] WireGuard transport: inside GRE interface ${WG_TRANSPORT_IFACE:-gre$TUNNEL_ID}"
   fi
   echo
@@ -2487,29 +2498,69 @@ wg_create_tunnel() {
   echo "  ping $REMOTE_WG_IP"
 }
 
+# interactive=1 only from the menu; background migrations must never wait for input.
 wg_choose_auto_endpoint() {
-  local id="$1"
-  local role="$2"
-  local gre_ifc gre_remote_ip gre_ok
-
-  gre_ifc="$(wg_transport_iface "$id")"
-  gre_remote_ip="$(gre_remote_inner_ip_for_role "$id" "$role")"
-
+  local id="$1" role="$2" interactive="${3:-0}"
+  local gre_up=0 plus_up=0 selected="" choice
   WG_ENDPOINT_MODE="public"
   WG_ENDPOINT_IP="${REMOTE_PUBLIC_IP:-}"
   WG_TRANSPORT_IFACE=""
+  tunnel_iface_is_up "$(gre_iface "$id")" && gre_up=1
+  tunnel_iface_is_up "$(greplus_iface "$id")" && plus_up=1
 
-  gre_ok=0
-  if ip link show "$gre_ifc" >/dev/null 2>&1; then
-    gre_ok=1
-  fi
-
-  if [ "$gre_ok" -eq 1 ]; then
-    WG_ENDPOINT_MODE="gre"
-    WG_ENDPOINT_IP="$gre_remote_ip"
-    WG_TRANSPORT_IFACE="$gre_ifc"
+  if [ "$gre_up" -eq 1 ] && [ "$plus_up" -eq 1 ]; then
+    if [ "$interactive" -eq 1 ]; then
+      echo "Both GRE and GRE Plus tunnel $id are active."
+      echo "1) Normal GRE ($(gre_iface "$id"))"
+      echo "2) GRE Plus ($(greplus_iface "$id"))"
+      echo "Choose the SAME transport on the other server."
+      while true; do
+        read -rp "WireGuard transport [1-2] (00=menu): " choice || return 99
+        if is_main_menu_token "$choice"; then return_main_msg; return 99; fi
+        case "$choice" in
+          1) selected="gre"; break ;;
+          2) selected="greplus"; break ;;
+          *) echo "Invalid choice. Enter 1 or 2." ;;
+        esac
+      done
+    else
+      selected="gre"
+    fi
+  elif [ "$gre_up" -eq 1 ]; then
+    selected="gre"
+  elif [ "$plus_up" -eq 1 ]; then
+    selected="greplus"
+  else
     return 0
   fi
+
+  local config remote_inner transport_role remote_public
+  case "$selected" in
+    gre)
+      WG_TRANSPORT_IFACE="$(gre_iface "$id")"
+      remote_inner="$(gre_remote_inner_ip_for_role "$id" "$role")"
+      config="$(gre_config_file "$id")"
+      ;;
+    greplus)
+      WG_TRANSPORT_IFACE="$(greplus_iface "$id")"
+      remote_inner="$(greplus_remote_inner_ip_for_role "$id" "$role")"
+      config="$(greplus_config_file "$id")"
+      ;;
+  esac
+  # Read saved transport data in a subshell: sourcing it directly would overwrite WG state.
+  if [ -f "$config" ]; then
+    transport_role="$(source "$config"; printf '%s' "${ROLE:-}")"
+    if [ -n "$transport_role" ] && [ "$transport_role" != "$role" ]; then
+      echo "Selected transport role differs from WireGuard role. Choose the matching server role." >&2
+      return 1
+    fi
+    remote_public="$(source "$config"; printf '%s' "${REMOTE_PUBLIC_IP:-}")"
+    if [ -n "$remote_public" ]; then REMOTE_PUBLIC_IP="$remote_public"; fi
+  fi
+  WG_ENDPOINT_MODE="$selected"
+  WG_ENDPOINT_IP="$remote_inner"
+  echo "WireGuard transport: $selected ($WG_TRANSPORT_IFACE), endpoint $WG_ENDPOINT_IP"
+  return 0
 }
 
 wg_migrate_legacy_wss_meta() {
@@ -2525,7 +2576,7 @@ wg_migrate_legacy_wss_meta() {
   WG_TRANSPORT_IFACE=""
   WG_MTU="1420"
   wg_choose_auto_endpoint "$id" "${ROLE:-1}" || true
-  if [ "$WG_ENDPOINT_MODE" = "gre" ]; then
+  if [[ "$WG_ENDPOINT_MODE" == gre || "$WG_ENDPOINT_MODE" == greplus ]]; then
     WG_MTU="$(wg_mtu_for_gre "$id")"
   fi
 
@@ -2541,8 +2592,9 @@ wg_migrate_legacy_wss_meta() {
 }
 
 wg_mtu_for_gre() {
-  local id="$1" parent_mtu="" calculated
-  parent_mtu="$(ip -o link show dev "$(gre_iface "$id")" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="mtu") {print $(i+1); exit}}')"
+  local id="$1" parent_mtu="" calculated parent_ifc
+  parent_ifc="${WG_TRANSPORT_IFACE:-$(gre_iface "$id")}"
+  parent_mtu="$(ip -o link show dev "$parent_ifc" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="mtu") {print $(i+1); exit}}')"
   [[ "$parent_mtu" =~ ^[0-9]+$ ]] || parent_mtu=1390
   calculated=$((parent_mtu - 60))
   [ "$calculated" -lt 1280 ] && calculated=1280
@@ -2561,8 +2613,6 @@ wg_menu_config_tunnel() {
   existing_local_ip=""
   existing_remote_ip=""
   existing_peer_key=""
-  local gre_saved_remote
-  gre_saved_remote=""
   local existing_wg_port
   existing_wg_port=""
   if wg_load_meta "$TUNNEL_ID"; then
@@ -2574,11 +2624,11 @@ wg_menu_config_tunnel() {
   ROLE="$selected_role"
   REMOTE_WG_PUBLIC_KEY="$existing_peer_key"
 
-  # Reuse the remote public IP saved by a same-number GRE tunnel when available.
-  # Run these in subshells so tunnel variables do not overwrite the selected WireGuard role.
-  gre_saved_remote="$(bash -c 'set -e; f="'"$GRE_CONFIG_DIR""'/tunnel-'"$TUNNEL_ID""'.conf"; [ -f "$f" ] && . "$f" && printf "%s" "${REMOTE_PUBLIC_IP:-}"' 2>/dev/null || true)"
-  if [ -z "$existing_remote_ip" ] && [ -n "$gre_saved_remote" ]; then
-    existing_remote_ip="$gre_saved_remote"
+  REMOTE_PUBLIC_IP="$existing_remote_ip"
+  wg_choose_auto_endpoint "$TUNNEL_ID" "$ROLE" 1 || return $?
+  if [ "${WG_ENDPOINT_MODE:-public}" = "public" ]; then
+    prompt_remote_public_ip "$existing_remote_ip" || return
+    WG_ENDPOINT_IP="$REMOTE_PUBLIC_IP"
   fi
 
   echo
@@ -2598,29 +2648,13 @@ wg_menu_config_tunnel() {
   REMOTE_WG_PORT="$LOCAL_WG_PORT"
   EXTRA_ALLOWED_IPS=""
 
-  REMOTE_PUBLIC_IP="$existing_remote_ip"
-  WG_ENDPOINT_MODE="public"
-  WG_ENDPOINT_IP=""
-  WG_TRANSPORT_IFACE=""
-
-  # Remove a legacy WSS companion for this number before configuring v12.
+  # Remove only a legacy WSS companion for this number.
   if [ -f "$(wss_config_file "$TUNNEL_ID")" ]; then
     wss_remove_one "$TUNNEL_ID" || true
   fi
-  wg_choose_auto_endpoint "$TUNNEL_ID" "$ROLE" || return
-  if [ "${WG_ENDPOINT_MODE:-public}" = "public" ]; then
-    prompt_remote_public_ip "$existing_remote_ip" || return
-    WG_ENDPOINT_MODE="public"
-    WG_ENDPOINT_IP="$REMOTE_PUBLIC_IP"
-    WG_TRANSPORT_IFACE=""
-  else
-    echo "Same-number normal GRE tunnel exists."
-    echo "WireGuard will use normal GRE as its transport. GRE Plus remains independent."
-    REMOTE_PUBLIC_IP="${REMOTE_PUBLIC_IP:-$existing_remote_ip}"
-  fi
 
   case "${WG_ENDPOINT_MODE:-public}" in
-    gre) WG_MTU="$(wg_mtu_for_gre "$TUNNEL_ID")" ;;
+    gre|greplus) WG_MTU="$(wg_mtu_for_gre "$TUNNEL_ID")" ;;
     *) WG_MTU="1420" ;;
   esac
 
@@ -2632,7 +2666,7 @@ wg_menu_config_tunnel() {
   echo "  Endpoint mode          : ${WG_ENDPOINT_MODE:-public}"
   echo "  Endpoint IP            : ${WG_ENDPOINT_IP:-${REMOTE_PUBLIC_IP:-UNKNOWN}}"
   echo "  MTU                    : $WG_MTU"
-  if [ "${WG_ENDPOINT_MODE:-public}" = "gre" ]; then
+  if [[ "${WG_ENDPOINT_MODE:-public}" == gre || "${WG_ENDPOINT_MODE:-public}" == greplus ]]; then
     echo "  Transport interface    : ${WG_TRANSPORT_IFACE:-gre$TUNNEL_ID}"
   fi
   echo "  AllowedIPs             : peer /32 only"
@@ -2673,7 +2707,7 @@ wg_check_one_tunnel() {
     echo "Endpoint mode       : ${WG_ENDPOINT_MODE:-public}"
     echo "Remote endpoint     : ${WG_ENDPOINT_IP:-${REMOTE_PUBLIC_IP:-unknown}}:${REMOTE_WG_PORT:-$(wg_default_port "$id")}" 
     case "${WG_ENDPOINT_MODE:-public}" in
-      gre) echo "Transport interface : ${WG_TRANSPORT_IFACE:-}" ;;
+      gre|greplus) echo "Transport interface : ${WG_TRANSPORT_IFACE:-}" ;;
     esac
     echo "Local UDP port      : ${LOCAL_WG_PORT:-$(wg_default_port "$id")}" 
     echo "WireGuard MTU       : ${WG_MTU:-unknown}" 
@@ -2724,7 +2758,7 @@ wg_check_one_tunnel() {
         echo "[WARN] WireGuard inner ping failed"
         last="$(wg show "$ifc" latest-handshakes 2>/dev/null | awk 'NR==1{print $2}' || true)"
         if [ -z "$last" ] || [ "$last" = "0" ]; then
-          if [ "${WG_ENDPOINT_MODE:-public}" = "gre" ]; then
+          if [[ "${WG_ENDPOINT_MODE:-public}" == gre || "${WG_ENDPOINT_MODE:-public}" == greplus ]]; then
             echo "Diagnosis: no WireGuard handshake yet. WireGuard is using ${WG_ENDPOINT_MODE} transport. Check that transport tunnel $id still pings, the peer public key is correct, and UDP $(wg_default_port "$id") is allowed over ${WG_TRANSPORT_IFACE:-transport interface} on both servers."
           else
             echo "Diagnosis: no WireGuard handshake yet. Check the peer public key, remote public IP, UDP port $(wg_default_port "$id"), and firewall/NAT on both servers. If public UDP/WireGuard is blocked but GRE works, re-run create/update after GRE is up; v6 will auto-use GRE as WireGuard transport."
@@ -2858,6 +2892,7 @@ wg_install_service() {
   if wg_load_meta "$id"; then
     case "${WG_ENDPOINT_MODE:-public}" in
       gre) transport_after="gre-tunnel@$id.service" ;;
+      greplus) transport_after="$(greplus_service_name "$id")" ;;
     esac
   fi
   if [ -n "$transport_after" ]; then
@@ -3012,7 +3047,7 @@ wg_apply_firewall_rules() {
     if [ -n "$endpoint_ip" ] && [ -n "$remote_port" ]; then
       iptables -C OUTPUT -p udp -d "$endpoint_ip" --dport "$remote_port" -j ACCEPT 2>/dev/null || iptables -A OUTPUT -p udp -d "$endpoint_ip" --dport "$remote_port" -j ACCEPT || true
     fi
-    if [ "$endpoint_mode" = "gre" ] && [ -n "$transport_ifc" ]; then
+    if [[ "$endpoint_mode" == gre || "$endpoint_mode" == greplus ]] && [ -n "$transport_ifc" ]; then
       iptables -C INPUT -i "$transport_ifc" -p udp --dport "$port" -j ACCEPT 2>/dev/null || iptables -A INPUT -i "$transport_ifc" -p udp --dport "$port" -j ACCEPT || true
       if [ -n "$endpoint_ip" ]; then
         iptables -C OUTPUT -o "$transport_ifc" -p udp -d "$endpoint_ip" --dport "$remote_port" -j ACCEPT 2>/dev/null || iptables -A OUTPUT -o "$transport_ifc" -p udp -d "$endpoint_ip" --dport "$remote_port" -j ACCEPT || true
@@ -3023,7 +3058,7 @@ wg_apply_firewall_rules() {
   if command -v ufw >/dev/null 2>&1; then
     ufw allow "$port/udp" comment "wgtun$id" >/dev/null 2>&1 || true
     ufw allow in on "$ifc" >/dev/null 2>&1 || true
-    if [ "$endpoint_mode" = "gre" ] && [ -n "$transport_ifc" ]; then
+    if [[ "$endpoint_mode" == gre || "$endpoint_mode" == greplus ]] && [ -n "$transport_ifc" ]; then
       ufw allow in on "$transport_ifc" to any port "$port" proto udp >/dev/null 2>&1 || true
     fi
   fi
@@ -3031,7 +3066,7 @@ wg_apply_firewall_rules() {
   if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
     firewall-cmd --permanent --add-port="$port/udp" >/dev/null 2>&1 || true
     firewall-cmd --permanent --add-interface="$ifc" >/dev/null 2>&1 || true
-    if [ "$endpoint_mode" = "gre" ] && [ -n "$transport_ifc" ]; then
+    if [[ "$endpoint_mode" == gre || "$endpoint_mode" == greplus ]] && [ -n "$transport_ifc" ]; then
       firewall-cmd --permanent --add-interface="$transport_ifc" >/dev/null 2>&1 || true
     fi
     firewall-cmd --reload >/dev/null 2>&1 || true
@@ -3388,6 +3423,10 @@ wg_uses_transport_tunnel() {
       expected_ifc="$(gre_iface "$transport_id")"
       [ "${WG_ENDPOINT_MODE:-}" = "gre" ] || return 1
       ;;
+    greplus)
+      expected_ifc="$(greplus_iface "$transport_id")"
+      [ "${WG_ENDPOINT_MODE:-}" = "greplus" ] || return 1
+      ;;
     *)
       return 1
       ;;
@@ -3397,6 +3436,7 @@ wg_uses_transport_tunnel() {
   if [ -n "${WG_TRANSPORT_IFACE:-}" ] && [ "${WG_TRANSPORT_IFACE}" = "$expected_ifc" ]; then
     return 0
   fi
+  [ -z "${WG_TRANSPORT_IFACE:-}" ] || return 1
 
   # Backward compatibility: older metadata may only use same-number transport.
   [ "$wg_id" = "$transport_id" ]
@@ -3414,7 +3454,7 @@ remove_selection_dependency_guard() {
     id="${INV_ID[$i]:-}"
 
     case "$type" in
-      gre)
+      gre|greplus)
         wg_ids="$(wg_collect_ids || true)"
         while IFS= read -r wg_id; do
           [ -n "$wg_id" ] || continue
@@ -3541,7 +3581,7 @@ remove_tun() {
     fi
 
     local ids id
-    # Remove WireGuard first because it may depend on normal GRE. GRE Plus is independent.
+    # Remove WireGuard first because it may depend on GRE or GRE Plus.
     ids="$(wg_collect_ids || true)"
     while IFS= read -r id; do [ -n "$id" ] && wg_remove_one_tunnel "$id"; done <<< "$ids"
     ids="$(greplus_collect_ids || true)"
