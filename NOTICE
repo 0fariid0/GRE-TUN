@@ -1,0 +1,8 @@
+GRE-TUN optional BackPack engine integration
+
+Based on BackPack by Amin Mohammadi (AminMGMT)
+https://github.com/AminMGMT/BackPack
+
+The unmodified upstream BackPack v1.8.5 engine, complete corresponding source,
+license and attribution notices are distributed in engines/backpack and
+third_party/backpack. The upstream NOTICE and TRADEMARK.md are preserved in full.

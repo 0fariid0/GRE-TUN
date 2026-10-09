@@ -1,0 +1,13 @@
+Based on BackPack by Amin Mohammadi (AminMGMT)
+https://github.com/AminMGMT/BackPack
+
+Unmodified upstream engine: v1.8.5
+Source commit: ff86354bcafbd054e7888e48343145323c9b2207
+Source archive: BackPack-v1.8.5-source.tar.gz (complete tracked source at tag)
+Binary origin: https://github.com/AminMGMT/BackPack/releases/tag/v1.8.5
+Included official release binaries: linux/amd64 and linux/arm64.
+Checksums checked against upstream SHA256SUMS and pinned in GRETUN.sh.
+The engine is executed only in L3 engine mode with ports = [].
+Original license, NOTICE, trademark terms and all source/build files accompany it.
+The GRE-TUN Bash adapter is separate from the unmodified upstream engine.
+For rebuilding, extract the source archive and see its Makefile, go.mod and docs/releasing.md.

@@ -1,0 +1,39 @@
+test_backpack_edit_lock (test_integration.Integration.test_backpack_edit_lock) ... ok
+test_deferred_bootstrap_once (test_integration.Integration.test_deferred_bootstrap_once) ... ok
+test_failed_edit_restores_config_token_and_service (test_integration.Integration.test_failed_edit_restores_config_token_and_service) ... ok
+test_failed_new_commit_cleans_files (test_integration.Integration.test_failed_new_commit_cleans_files) ... ok
+test_firewall_scoped_and_no_nat (test_integration.Integration.test_firewall_scoped_and_no_nat) ... ok
+test_health_keeps_manual_stop (test_integration.Integration.test_health_keeps_manual_stop) ... ok
+test_health_repairs_rules_without_restart (test_integration.Integration.test_health_repairs_rules_without_restart) ... ok
+test_install_offline_verified_engine (test_integration.Integration.test_install_offline_verified_engine) ... ok
+test_install_rejects_bad_archive (test_integration.Integration.test_install_rejects_bad_archive) ... ok
+test_invalid_edit_leaves_service_untouched (test_integration.Integration.test_invalid_edit_leaves_service_untouched) ... ok
+test_inventory_haproxy_mapping (test_integration.Integration.test_inventory_haproxy_mapping) ... ok
+test_inventory_pending_without_interface (test_integration.Integration.test_inventory_pending_without_interface) ... ok
+test_menu_opens_without_mutations_or_network (test_integration.Integration.test_menu_opens_without_mutations_or_network) ... ok
+test_new_commit (test_integration.Integration.test_new_commit) ... ok
+test_new_interface_collision (test_integration.Integration.test_new_interface_collision) ... ok
+test_new_listen_port_busy_rolls_back (test_integration.Integration.test_new_listen_port_busy_rolls_back) ... ok
+test_no_stale_metadata (test_integration.Integration.test_no_stale_metadata) ... ok
+test_original_menu_setup_and_forward_functions_unchanged (test_integration.Integration.test_original_menu_setup_and_forward_functions_unchanged) ... ok
+test_original_types_and_backpack (test_integration.Integration.test_original_types_and_backpack) ... ok
+test_plain_tun_no_port_forwarder (test_integration.Integration.test_plain_tun_no_port_forwarder) ... ok
+test_quic_can_be_saved_before_peer (test_integration.Integration.test_quic_can_be_saved_before_peer) ... ok
+test_real_engine_accepts_each_carrier_both_roles (test_integration.Integration.test_real_engine_accepts_each_carrier_both_roles) ... ok
+test_reject_bad_parameters (test_integration.Integration.test_reject_bad_parameters) ... ok
+test_reject_token_injection (test_integration.Integration.test_reject_token_injection) ... ok
+test_remove_inventory_dispatch (test_integration.Integration.test_remove_inventory_dispatch) ... ok
+test_remove_only_selected_backpack (test_integration.Integration.test_remove_only_selected_backpack) ... ok
+test_remove_selection_includes_backpack (test_integration.Integration.test_remove_selection_includes_backpack) ... ok
+test_saved_listener_port_conflict (test_integration.Integration.test_saved_listener_port_conflict) ... ok
+test_shell_syntax (test_integration.Integration.test_shell_syntax) ... ok
+test_speed_test_selection_preserved (test_integration.Integration.test_speed_test_selection_preserved) ... ok
+test_type_cancel (test_integration.Integration.test_type_cancel) ... ok
+test_udp_missing_interface_is_failure (test_integration.Integration.test_udp_missing_interface_is_failure) ... ok
+test_unit_engine_only (test_integration.Integration.test_unit_engine_only) ... ok
+
+----------------------------------------------------------------------
+Ran 33 tests in 2.100s
+
+OK
+  Menu open+exit in 0.021s (local container, no network)
