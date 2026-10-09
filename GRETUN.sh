@@ -1,7 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + GRE Plus + WireGuard + HAProxy tunnel manager v12.1.0
+# GRE + GRE Plus + WireGuard + HAProxy tunnel manager v12.1.1
+# v12.1.1: Kharej generates the token; Iran pastes it visibly. Existing tokens preserved.
 # v12.1.0: deferred startup repairs, optional BackPack L3 adapter (ports=[]).
 # Main menu and original forwarding workflow retained.
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
@@ -49,7 +50,7 @@ set -euo pipefail
 # - HAProxy fix: preserve an existing global maxconn, use the known-working defaults,
 #   and stop changing system limits or restarting HAProxy simply by opening its menu.
 
-APP_VERSION="12.1.0"
+APP_VERSION="12.1.1"
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -1527,6 +1528,45 @@ bp_commit() (
   bp_start "$id" || exit 1
   committed=1
 )
+# Kharej owns token creation. Iran pastes it visibly with readline editing.
+# Existing secrets are never regenerated just by opening the edit wizard.
+bp_prepare_token() {
+  local existing="${1:-}" answer
+  case "$BP_ROLE" in
+    2)
+      if [ -n "$existing" ]; then
+        BP_TOKEN="$existing"
+        echo "Keeping the existing Kharej token."
+      else
+        BP_TOKEN="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')" || return 1
+        echo "New shared token generated on Kharej."
+      fi
+      [[ "$BP_TOKEN" =~ ^[a-fA-F0-9]{64}$ ]] || { err_msg "Could not obtain a valid token."; return 1; }
+      echo "Copy this token and paste it on Iran:"
+      printf '\n%s\n\n' "$BP_TOKEN"
+      ;;
+    1)
+      echo "Set up Kharej first, then paste its token here. Pasted text is visible."
+      if [ -n "$existing" ]; then echo "Enter keeps the existing token; paste Kharej's token to replace it."; fi
+      while true; do
+        IFS= read -er -p "Kharej token (00=menu): " answer || return 1
+        # Accept a copied Token: line, surrounding spaces, tabs and Windows CR.
+        answer="${answer//$'\r'/}"; answer="${answer// /}"; answer="${answer//$'\t'/}"
+        answer="${answer#Token:}"; answer="${answer#token:}"
+        if is_main_menu_token "$answer"; then return 99; fi
+        answer="${answer:-$existing}"
+        if [[ "$answer" =~ ^[a-fA-F0-9]{64}$ ]]; then
+          BP_TOKEN="$answer"
+          ok_msg "Token accepted."
+          return 0
+        fi
+        err_msg "Paste the complete 64-character hexadecimal token from Kharej (or 00 to return)."
+      done
+      ;;
+    *) err_msg "Invalid server role"; return 1 ;;
+  esac
+}
+
 bp_menu_config() (
   local ROLE TUNNEL_ID LOCAL_PUBLIC_IP REMOTE_PUBLIC_IP answer old_token="" old_local="" old_remote="" old_carrier=udp old_port="" old_mtu=1380
   show_header "Configure BackPack L3 Tunnel"
@@ -1550,14 +1590,7 @@ bp_menu_config() (
   BP_PORT="${answer:-${old_port:-$((52000 + BP_ID))}}"
   validate_port "$BP_PORT" || { err_msg "Invalid port"; return 1; }
   BP_PORT="$((10#$BP_PORT))"
-  echo "Shared token: 64 hexadecimal characters; use exactly the same token on both servers."
-  if [ -n "$old_token" ]; then echo "Enter keeps the existing token."
-  elif [ "$BP_ROLE" = 1 ]; then echo "Enter generates a new token on Iran."
-  else echo "Paste the token generated on Iran."; fi
-  read -rsp "Token (00=menu): " answer || return 1; echo
-  is_main_menu_token "$answer" && return 99
-  BP_TOKEN="${answer:-$old_token}"
-  if [ -z "$BP_TOKEN" ] && [ "$BP_ROLE" = 1 ]; then BP_TOKEN="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"; fi
+  bp_prepare_token "$old_token" || return
   read -rp "Starting MTU 1280-1400 [$old_mtu] (00=menu): " answer || return 1
   is_main_menu_token "$answer" && return 99
   BP_MTU="${answer:-$old_mtu}"
