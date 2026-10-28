@@ -8,7 +8,11 @@ bash -n "$package_dir/GRETUN.sh"
 (cd "$package_dir/engines/backpack" && sha256sum -c BUNDLE-SHA256SUMS)
 install -d -m 0755 /usr/local/bin /usr/local/lib/gretun /usr/local/share/gretun/engines/backpack
 python3 -m py_compile "$package_dir/transparent_forward.py"
-install -m 0755 "$package_dir/transparent_forward.py" /usr/local/lib/gretun/transparent_forward.py
+expected_helper="$(sed -n 's/^TRANSPARENT_SHA256="\([a-f0-9]*\)"/\1/p' "$package_dir/GRETUN.sh")"
+actual_helper="$(sha256sum "$package_dir/transparent_forward.py" | awk '{print $1}')"
+[ -n "$expected_helper" ] && [ "$expected_helper" = "$actual_helper" ] || { echo 'Manager/helper checksum mismatch; installation stopped.' >&2; exit 1; }
+install -m 0755 "$package_dir/transparent_forward.py" /usr/local/lib/gretun/transparent_forward.py.new
+mv -f /usr/local/lib/gretun/transparent_forward.py.new /usr/local/lib/gretun/transparent_forward.py
 for asset in backpack_linux_amd64.tar.gz backpack_linux_arm64.tar.gz; do
   install -m 0644 "$package_dir/engines/backpack/$asset" "/usr/local/share/gretun/engines/backpack/$asset.new"
   mv -f "/usr/local/share/gretun/engines/backpack/$asset.new" "/usr/local/share/gretun/engines/backpack/$asset"

@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + GRE Plus + WireGuard + HAProxy tunnel manager v12.4.0
+# GRE + GRE Plus + WireGuard + HAProxy tunnel manager v12.5.0
 # v12.2.0: optional transparent TCP module with trial, connection-aware return routes and drain.
 # v12.1.1: Kharej generates the token; Iran pastes it visibly. Existing tokens preserved.
 # v12.1.0: deferred startup repairs, optional BackPack L3 adapter (ports=[]).
@@ -51,7 +51,7 @@ set -euo pipefail
 # - HAProxy fix: preserve an existing global maxconn, use the known-working defaults,
 #   and stop changing system limits or restarting HAProxy simply by opening its menu.
 
-APP_VERSION="12.4.0"
+APP_VERSION="12.5.0"
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -5983,7 +5983,7 @@ haproxy_run_action() {
 }
 
 # Pinned to the helper shipped with this manager; mutable upstream cannot mix versions.
-TRANSPARENT_SHA256="01ebe372fa0eb41ade69727b5466239ec725020e3946bd1daec994f773c5c02d"
+TRANSPARENT_SHA256="f4856cd8b479e41267853de72aa46331781ca2f6fcdd7cc83a6e315be7262d2a"
 transparent_install_module() {
   local target=/usr/local/lib/gretun/transparent_forward.py candidate tmp
   if [ -f "$target" ] && [ "$(sha256sum "$target" | awk '{print $1}')" = "$TRANSPARENT_SHA256" ]; then

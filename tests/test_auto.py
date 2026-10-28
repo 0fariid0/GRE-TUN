@@ -154,7 +154,7 @@ class AutoPlanning(unittest.TestCase):
             self.assertFalse(tp.readiness_response('10.30.1.2','10.30.1.1',dict(version=1,backend_port=2044))['ready'])
 
     def test_readiness_unit_runs_only_read_only_responder(self):
-        tp.ensure_readiness_service()
+        with patch.object(tp,'socket_listeners',return_value=[dict(port=45123)]): tp.ensure_readiness_service()
         text=(tp.SYSTEMD/tp.READY_UNIT).read_text()
         self.assertIn('serve-ready',text);self.assertNotIn(' outside ',text.split('ExecStart=')[1].split('\n')[0]);self.assertNotIn('promote',text)
         self.assertIn(('systemctl','restart',tp.READY_UNIT),self.k.calls)

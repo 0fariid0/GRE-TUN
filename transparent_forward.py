@@ -22,7 +22,7 @@ import sys
 import tempfile
 import time
 
-VERSION = '12.4.0'
+VERSION = '12.5.0'
 STATE = Path('/etc/gretun-transparent')
 CONFIG = Path('/etc/haproxy/haproxy.cfg')
 MODULE = Path('/usr/local/lib/gretun/transparent_forward.py')
@@ -216,6 +216,54 @@ backend {name}_out
 # {PREFIX}{p['id']} END
 '''
 
+def direct_config(text,p):
+    forward(text,p['frontend_port'])
+    name='gtp_'+p['id']
+    if re.search(r'^backend '+re.escape(name)+r'_out\s*$',text,re.M):
+        raise Error('Managed backend already exists; refusing duplicate configuration.')
+    updated=text.rstrip()+f"""\n\n# {PREFIX}{p['id']} BEGIN
+backend {name}_out
+    mode tcp
+    timeout connect 10s
+    timeout server 2h
+    source 0.0.0.0 usesrc clientip interface {p['iface']}
+    server transparent {p['outside']}:{p['backend_port']}
+# {PREFIX}{p['id']} END
+"""
+    return promote_text(updated,p)
+
+
+def capture_failure(p,problem):
+    # No keys, tokens, packet payloads or full application configuration.
+    commands=[('ip','-4','rule','show'),('ip','-4','route','show','table','all'),
+              ('iptables-save','-t','mangle'),('iptables-save','-t','nat'),
+              ('ss','-H','-nt'),('systemctl','is-active','haproxy')]
+    try:
+        lines=[f"Version: {VERSION}\nInterface: {p['iface']}\nPort: {p['frontend_port']}\nError: {problem}\n"]
+        for command in commands:
+            result=run(*command,check=False,timeout=3)
+            lines.append(shlex.join(command)+'\n'+result.stdout[:24000]+result.stderr[:2000])
+        atomic(STATE/'last-error.log','\n'.join(lines))
+        print('Diagnostic saved:',STATE/'last-error.log')
+    except Exception: pass  # Never prevent rollback because diagnostics failed.
+
+
+def probe_transparent(p):
+    # Exercise non-local source routing, unlike a ping or inner-address readiness.
+    source='198.18.255.254'
+    if any(x.get('address')==source for x in interfaces()):
+        raise Error('Reserved probe source is local; cannot verify transparent return routing.')
+    try:
+        with socket.socket(socket.AF_INET,socket.SOCK_STREAM) as sock:
+            sock.settimeout(5)
+            sock.setsockopt(socket.SOL_IP,19,1)  # IP_TRANSPARENT
+            sock.setsockopt(socket.SOL_SOCKET,socket.SO_BINDTODEVICE,(p['iface']+'\0').encode())
+            sock.bind((source,0))
+            sock.connect((p['outside'],p['backend_port']))
+    except OSError as exc:
+        raise Error(f"Transparent TCP return-path check failed on {p['iface']} to {p['outside']}:{p['backend_port']}: {exc}. Production forward was not switched. Check outside return policy, source filtering and tunnel firewall.") from exc
+
+
 def promote_text(text,p,disable=False):
     name=f"ws_{p['frontend_port']}_in"
     current=block(text,'frontend',name)
@@ -325,7 +373,7 @@ def rules_for(r):
         add('nat','POSTROUTING','no-snat','-o',iface,'-d',outside,'-p','tcp','--dport',bp,'-j','ACCEPT')
         add('filter','INPUT','reply','-i',iface,'-s',outside,'-p','tcp','--sport',bp,'-j','ACCEPT')
         add('filter','OUTPUT','output','-o',iface,'-d',outside,'-p','tcp','--dport',bp,'-j','ACCEPT')
-        if r['phase']!='draining':
+        if r['phase']!='draining' and not r.get('direct'):
             add('filter','INPUT','trial','-p','tcp','--dport',str(p['test_port']),'-j','ACCEPT')
     return rules
 
@@ -507,7 +555,7 @@ def reload_config(old,new):
         run('systemctl','reload','haproxy',check=False)
         raise
 
-def stage(p,role,automatic=False):
+def stage(p,role,automatic=False,direct=False):
     root_checks(role); check_interface(p,role)
     if any(r['plan']['id']==p['id'] for r in records()):
         raise Error('This profile already exists; use status/promote/drain instead.')
@@ -518,6 +566,7 @@ def stage(p,role,automatic=False):
     if shared and shared['role']!=role: raise Error('Do not combine Iran/outside roles on one interface.')
     r=dict(plan=p,role=role,phase='trial' if role=='iran' else 'ready',slot=allocate_slot(),
            original_rp=shared['original_rp'] if shared else rp_path(p['iface']).read_text().strip())
+    if direct and role=='iran': r['direct']=True; r['phase']='active'
     old=None
     if p['kind']=='wireguard' and not shutil.which('wg'): raise Error('WireGuard tools are missing.')
     if role=='iran':
@@ -525,8 +574,9 @@ def stage(p,role,automatic=False):
         if bp!=p['backend_port']: raise Error('Backend port differs from the plan.')
         # Reject an existing kernel listener on the new external test port.
         listeners=run('ss','-H','-lnt').stdout
-        if re.search(r':'+str(p['test_port'])+r'\s',listeners): raise Error('Trial port is busy.')
-        new=add_trial(old,p); validate_config(new)
+        if not direct and re.search(r':'+str(p['test_port'])+r'\s',listeners): raise Error('Trial port is busy.')
+        new=direct_config(old,p) if direct else add_trial(old,p)
+        validate_config(new)
         directory=STATE/('backup-'+p['id']); directory.mkdir(mode=0o700,exist_ok=True)
         atomic(directory/'haproxy.cfg',old)
         r['original_target']=original_target
@@ -540,9 +590,11 @@ def stage(p,role,automatic=False):
     try:
         r['phase']=r.pop('phase_before_apply')
         apply_network(r)
+        if direct and role=='iran': probe_transparent(p)
         if old is not None: reload_config(old,new)
         save(r); persist()
     except (Exception, KeyboardInterrupt) as problem:
+        capture_failure(p,problem)
         # If reload succeeded, undo the generated listener before removing its return path.
         if old is not None and CONFIG.exists() and CONFIG.read_text()!=old:
             try: reload_config(CONFIG.read_text(),old)
@@ -556,7 +608,9 @@ def stage(p,role,automatic=False):
         (STATE/f"profile-{p['id']}.json").unlink(missing_ok=True)
         raise
     print(f"Prepared {role} profile {p['id']}. Main default gateway and Xray settings were not changed.")
-    if role=='iran':
+    if role=='iran' and direct:
+        print(f"ON: existing public TCP port {p['frontend_port']}; no client port change.")
+    elif role=='iran':
         print(f"TRIAL ONLY: test one client using the SAME credentials/transport, external port {p['test_port']}.")
         print('After a successful client test, choose Activate in the automatic wizard.' if automatic else 'Only after confirming handshake, real client IP and traffic, use promote '+p['id'])
     else: print('Run automatic setup on Iran next; no token is needed.' if automatic else 'Now prepare the Iran side with the same token. Keep this outside profile enabled.')
@@ -742,9 +796,9 @@ def iran_plans(selected):
                 p=previous['plan']
                 if (p['iface'],p['iran'],p['outside'],p['backend_port'])!=(iface,link['address'],outside,bp):
                     raise Error('Existing profile does not match the current forward; drain it before changing routes.')
-                if previous['phase'] not in ('trial','active'): raise Error('Existing profile needs drain/cleanup or recovery.')
+                if previous['phase'] not in ('trial','active','draining'): raise Error('Existing profile needs recovery.')
                 plans.append(dict(p)); continue
-            plans.append(make_plan(iface,link['address'],outside,bp,fp,free_trial_port(fp,used),link['kind']))
+            plans.append(make_plan(iface,link['address'],outside,bp,fp,(fp+10000 if fp+10000<=65535 else 40000),link['kind']))
         except (Error,OSError,KeyError,ValueError) as problem: skipped.append((str(fp),str(problem)))
     return plans,skipped
 
@@ -765,7 +819,7 @@ def outside_plans(selected):
                 skipped.append((f"{link['iface']}:{bp}",'Backend does not listen on this tunnel IPv4.')); continue
             existing=next((r for r in records() if r['role']=='outside' and r['plan']['iface']==link['iface'] and r['plan']['outside']==link['address'] and r['plan']['backend_port']==bp),None)
             if existing:
-                if existing['phase']!='ready':
+                if existing['phase'] not in ('ready','draining'):
                     skipped.append((str(key),'Existing profile needs cleanup/recovery.')); continue
                 plans.append(dict(existing['plan'])); continue
             # Outside does not need the Iran public/trial port: return routing depends
@@ -810,9 +864,13 @@ def outside_is_ready(p):
             with sock.makefile('rb') as stream: data=stream.readline(4097)
         if len(data)>4096: return False
         answer=json.loads(data)
+        if not isinstance(answer,dict): return False
+        if answer.get('ready') is not True: print('Outside refused readiness:',answer.get('reason','route, firewall or backend check failed'))
         return (answer.get('ready') is True and answer.get('version')==1 and answer.get('iran')==p['iran']
                 and answer.get('outside')==p['outside'] and answer.get('backend_port')==p['backend_port'] and answer.get('kind')==p['kind'])
-    except (OSError,ValueError): return False
+    except (OSError,ValueError) as exc:
+        print('Outside readiness error:',p['outside'],READY_PORT,str(exc))
+        return False
 
 
 class ReadyHandler(socketserver.StreamRequestHandler):
@@ -826,7 +884,10 @@ class ReadyHandler(socketserver.StreamRequestHandler):
             if len(raw)>1024 or not raw.endswith(b'\n'): return
             result=readiness_response(local,remote,json.loads(raw))
             self.wfile.write((json.dumps(result)+'\n').encode())
-        except (Error,OSError,ValueError,KeyError,subprocess.SubprocessError): return
+        except (Error,OSError,ValueError,KeyError,subprocess.SubprocessError) as exc:
+            print('Readiness failed:',str(exc),file=sys.stderr,flush=True)
+            try: self.wfile.write(b'{"ready":false,"reason":"outside check failed; see readiness service journal"}\n')
+            except OSError: pass
 
 
 class ReadyServer(socketserver.ThreadingTCPServer):
@@ -868,9 +929,44 @@ WantedBy=multi-user.target
     # restart only our own responder so an installed older Python process is updated.
     run('systemctl','enable',READY_UNIT)
     run('systemctl','restart',READY_UNIT)
+    for attempt in range(10):
+        if run('systemctl','is-active','--quiet',READY_UNIT,check=False).returncode==0:
+            if any(x['port']==READY_PORT for x in socket_listeners()): return
+        time.sleep(0.2)
+    raise Error('Outside readiness service did not start listening; see journalctl -u '+READY_UNIT+'.')
 
 
-def auto_apply(plans,role):
+def enable_existing(match,direct):
+    p=match['plan']; role=match['role']
+    expected=('trial','active','draining') if role=='iran' and direct else (('trial','active') if role=='iran' else ('ready','draining'))
+    if match['phase'] not in expected: raise Error('Existing profile needs cleanup/recovery.')
+    previous=dict(match); old=CONFIG.read_text() if role=='iran' else None
+    check_interface(p,role)
+    try:
+        if match['phase']=='draining': match['phase']='active' if role=='iran' else 'ready'
+        apply_network(match)
+        if direct and role=='iran':
+            probe_transparent(p)
+            if not match.get('direct') or previous['phase']=='draining':
+                base=promote_text(old,p,disable=True) if previous['phase']=='active' else old
+                if previous['phase']!='draining': base=remove_trial(base,p)
+                reload_config(old,direct_config(base,p))
+                match['direct']=True; match['phase']='active'
+                for rule in rules_for(previous):
+                    if rule[-1].endswith(':trial'): delete_rule(rule)
+        save(match); persist()
+    except (Exception,KeyboardInterrupt) as problem:
+        capture_failure(p,problem)
+        # Existing sessions own these resources; never tear their routes down on retry failure.
+        if old is not None and CONFIG.read_text()!=old: reload_config(CONFIG.read_text(),old)
+        for rule in rules_for(match):
+            if rule not in rules_for(previous): delete_rule(rule)
+        apply_network(previous); save(previous)
+        raise
+    print('ON:',p['frontend_port'],p['iface'],match['phase'])
+
+
+def auto_apply(plans,role,direct=False):
     successful=[]; failed=[]
     for p in plans:
         try:
@@ -879,11 +975,8 @@ def auto_apply(plans,role):
             with locked():
                 match=next((r for r in records() if r['role']==role and r['plan']['id']==p['id']),None)
                 if match:
-                    expected=('trial','active') if role=='iran' else ('ready',)
-                    if match['phase'] not in expected: raise Error('Existing profile needs cleanup/recovery.')
-                    # Keep production mapping intact on repeat runs; repair only owned network state.
-                    check_interface(p,role); apply_network(match); persist()
-                    print('Already configured:',p['id'],match['phase'])
+                    enable_existing(match,direct)
+                elif direct: stage(p,role,automatic=True,direct=True)
                 else: stage(p,role,automatic=True)
             successful.append(p)
         except (Error,OSError,ValueError,subprocess.SubprocessError) as problem:
@@ -920,24 +1013,20 @@ def auto_disable(role):
 
 def auto_menu():
     while True:
+        try: return _auto_menu()
+        except (Error,OSError,ValueError,subprocess.SubprocessError) as exc:
+            print('ERROR:',exc)
+        except (EOFError,KeyboardInterrupt):
+            print('Back.'); return
+
+
+def _auto_menu():
+    while True:
         print('\nAutomatic Transparent Setup |',VERSION)
-        print('1) Turn ON / automatic setup\n2) Turn OFF / drain connections')
-        print('3) Activate tested Iran trials\n4) Status\n6) Advanced manual menu\n00) Back')
-        choice=input('Choose [1-6/00]: ').strip()
+        print('1) ON\n2) OFF')
+        print('00) Back')
+        choice=input('Choose [1-2/00]: ').strip()
         if choice=='00': return
-        if choice=='4': status(); continue
-        if choice=='6': menu(); continue
-        if choice=='3':
-            trials=[r for r in records() if r['role']=='iran' and r['phase']=='trial']
-            for n,r in enumerate(trials,1): print(n,'public',r['plan']['frontend_port'],'trial',r['plan']['test_port'],r['plan']['iface'])
-            if not trials: print('No Iran trials waiting.'); continue
-            selected=parse_ports(input('Trial row(s), e.g. 1,2 or 0=all: '),range(1,len(trials)+1))
-            if input('After a successful real-client trial, type ACTIVATE: ').strip()!='ACTIVATE': continue
-            for row in selected:
-                p=trials[row-1]['plan']
-                if not outside_is_ready(p): print('Outside not ready; production forward kept:',p['frontend_port']); continue
-                with locked(): promote(p['id'])
-            continue
         if choice not in ('1','2'): print('Invalid option.'); continue
         side=input('Server role: 1) Iran  2) Outside  00) Back: ').strip()
         if side=='00': continue
@@ -964,17 +1053,17 @@ def auto_menu():
         selected=parse_ports(input(f'Port(s), comma/space, 0=all [{default}]: ').strip() or default,ports)
         plans,skipped=iran_plans(selected) if role=='iran' else outside_plans(selected)
         for name,reason in skipped: print('SKIPPED:',name,reason)
-        for p in plans: print(role,p['iface'],p['iran'],'<->',p['outside'], 'backend',p['backend_port'],'public',p['frontend_port'],'trial',p['test_port'])
+        for p in plans: print(role,p['iface'],p['iran'],'<->',p['outside'], 'backend',p['backend_port'],'public',p['frontend_port'])
         if not plans: print('No safe automatic plans available.'); continue
         if role=='outside' and any(p['kind']=='wireguard' for p in plans):
             print('Outside single-peer WireGuard: broad AllowedIPs with Table=off; keys/endpoints stay unchanged.')
         if input('Press Enter to apply this server setup, or 00 to cancel: ').strip()=='00': continue
-        successful,failed=auto_apply(plans,role)
+        successful,failed=auto_apply(plans,role,direct=True)
         print(f'Finished: ready={len(successful)} skipped/failed={len(failed)+len(skipped)}')
         if role=='outside' and successful:
             print('Outside ready. Run this same automatic wizard on each Iran. No token/IP copying is needed.')
         elif role=='iran' and successful:
-            print('Trial ports are ready. Test one copied client config on its trial port; then choose 3 here to activate.')
+            print('ON: selected original ports are active. Clients keep their existing ports. Use 2 to turn OFF.')
 
 def menu():
     while True:
