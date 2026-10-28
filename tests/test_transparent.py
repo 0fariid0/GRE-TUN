@@ -175,7 +175,7 @@ class LifecycleTests(unittest.TestCase):
         self.rp=rp
         self.patches=[patch.object(tp,'STATE',self.state),patch.object(tp,'CONFIG',self.cfg),
             patch.object(tp,'MODULE',self.root/'installed.py'),patch.object(tp,'UNIT',self.root/'transparent.service'),patch.object(tp,'SYSTEMD',self.root/'systemd'),
-            patch.object(tp,'run',self.k),patch.object(tp,'rp_path',rp),patch.object(tp,'root_checks',lambda role:None),
+            patch.object(tp,'accept_local_path',lambda iface:rp(iface+'.accept')),patch.object(tp,'run',self.k),patch.object(tp,'rp_path',rp),patch.object(tp,'root_checks',lambda role:None),
             patch.object(tp,'check_interface',lambda p,role:dict(iface=p['iface'],up=True)),patch.object(tp,'jrun',self.jrun)]
         for item in self.patches: item.start()
         self.state.mkdir()

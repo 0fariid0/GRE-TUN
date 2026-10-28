@@ -22,7 +22,7 @@ import sys
 import tempfile
 import time
 
-VERSION = '12.5.1'
+VERSION = '12.5.2'
 STATE = Path('/etc/gretun-transparent')
 CONFIG = Path('/etc/haproxy/haproxy.cfg')
 MODULE = Path('/usr/local/lib/gretun/transparent_forward.py')
@@ -390,6 +390,23 @@ def delete_rule(rule):
 def rp_path(iface):
     return Path('/proc/sys/net/ipv4/conf')/iface/'rp_filter'
 
+def accept_local_path(iface):
+    return Path('/proc/sys/net/ipv4/conf')/iface/'accept_local'
+
+
+def prepare_source_validation(r):
+    if r['role']!='iran': return
+    if 'original_accept_local' not in r:
+        shared=next((x for x in records() if x['plan']['iface']==r['plan']['iface'] and 'original_accept_local' in x),None)
+        r['original_accept_local']=shared['original_accept_local'] if shared else accept_local_path(r['plan']['iface']).read_text().strip()
+        # Persist the original before mutation, preserving a preparing transaction phase.
+        stored=load(r['plan']['id']); stored['original_accept_local']=r['original_accept_local']; save(stored)
+    # With src_valid_mark=1 the marked local-default table also participates in
+    # reverse-source lookup. RTN_LOCAL is rejected unless accept_local is set.
+    # Keep all/global settings intact; only the dedicated Iran tunnel is changed.
+    accept_local_path(r['plan']['iface']).write_text('1')
+
+
 def wg_settings(text):
     sections_found=re.findall(r'^\s*\[([^]]+)\]',text,re.M)
     if sections_found!=['Interface','Peer']: raise Error('WireGuard requires exactly one peer.')
@@ -478,6 +495,7 @@ def apply_network(r):
             raise Error('Policy routing priority was taken by another service.')
     else: run('ip','-4','rule','add','priority',priority,'fwmark',mark,'table',table)
     if r.get('wg'): apply_wg(r)
+    prepare_source_validation(r)
     rp_path(p['iface']).write_text('2') # Per-interface loose RPF; leave global settings alone.
     for rule in rules_for(r): apply_rule(rule)
 
@@ -502,6 +520,8 @@ def remove_network(r):
     restore_wg(r)
     if not any(x['plan']['id']!=r['plan']['id'] and x['plan']['iface']==r['plan']['iface'] for x in records()):
         rp_path(r['plan']['iface']).write_text(r['original_rp'])
+        original=r.get('original_accept_local',load(r['plan']['id']).get('original_accept_local'))
+        if original is not None: accept_local_path(r['plan']['iface']).write_text(original)
 
 def persist():
     MODULE.parent.mkdir(parents=True,exist_ok=True)
