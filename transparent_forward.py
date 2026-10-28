@@ -22,7 +22,7 @@ import sys
 import tempfile
 import time
 
-VERSION = '12.5.0'
+VERSION = '12.5.1'
 STATE = Path('/etc/gretun-transparent')
 CONFIG = Path('/etc/haproxy/haproxy.cfg')
 MODULE = Path('/usr/local/lib/gretun/transparent_forward.py')
@@ -999,7 +999,6 @@ def auto_disable(role):
     selected=parse_ports(value,ports)
     if role=='outside':
         print('Turn OFF the matching Iran ports FIRST. This server cannot change remote HAProxy.')
-        if input('After turning OFF those Iran ports, type IRAN-OFF to continue: ').strip()!='IRAN-OFF': return
     for r in rows:
         if r['plan'][key] not in selected: continue
         try:
@@ -1010,6 +1009,52 @@ def auto_disable(role):
                 else: print('OFF / draining:',r['plan']['iface'],r['plan'][key],'- rerun OFF after sessions finish.')
         except Error as exc:
             print('Retained for safety:',r['plan']['iface'],r['plan'][key],str(exc))
+
+def port_status_rows(profiles,text,listeners,links,role=None):
+    rows=[]; covered=set()
+    labels={'active':'ON','ready':'READY (outside)','draining':'OFF / draining',
+            'trial':'TRIAL (legacy)','preparing':'APPLYING','recovery-needed':'ERROR / recovery'}
+    for r in profiles:
+        if role and r['role']!=role: continue
+        p=r['plan']; number=p['frontend_port'] if r['role']=='iran' else p['backend_port']
+        state=labels.get(r['phase'],'UNKNOWN')
+        if r['role']=='iran' and r['phase']=='active':
+            try:
+                front=block(text,'frontend',f'ws_{number}_in')
+                if not re.search(r'^\s*default_backend\s+gtp_'+re.escape(p['id'])+r'_out\s*$',front,re.M):
+                    state='MISMATCH / check config'
+            except Error: state='MISMATCH / check config'
+        rows.append((r['role'],number,p['iface'],state));covered.add((r['role'],number,p['iface']))
+    if role in (None,'iran'):
+        for value in re.findall(r'^frontend ws_(\d+)_in\s*$',text,re.M):
+            number=int(value)
+            if not any(x[0]=='iran' and x[1]==number for x in rows):
+                rows.append(('iran',number,'-','OFF / normal forward'))
+    if role in (None,'outside'):
+        for listener in listeners:
+            if not re.search('xray',listener['process'],re.I): continue
+            for link in links:
+                if not link['up'] or listener['address'] not in ('*','0.0.0.0',link['address']): continue
+                key=('outside',listener['port'],link['iface'])
+                if key not in covered:
+                    rows.append((*key,'OFF / not prepared'));covered.add(key)
+    return sorted(set(rows),key=lambda x:(x[0],x[1],x[2]))
+
+
+def display_port_status(role=None):
+    print('\nPort status on THIS server (configuration; not a live client handshake):')
+    try:
+        profiles=records()
+        text=CONFIG.read_text() if CONFIG.exists() else ''
+        listeners=socket_listeners() if role!='iran' else []
+        links=interfaces() if any(re.search('xray',x['process'],re.I) for x in listeners) else []
+        rows=port_status_rows(profiles,text,listeners,links,role)
+        print(f"{'Role':<9} {'Port':<6} {'Interface':<16} Status")
+        for side,number,iface,state in rows: print(f'{side:<9} {number:<6} {iface:<16} {state}')
+        if not rows: print('No managed forwards/profiles or detectable Xray tunnel ports.')
+    except (Error,OSError,ValueError,subprocess.SubprocessError) as exc:
+        print('Status unavailable:',exc)
+
 
 def auto_menu():
     while True:
@@ -1023,6 +1068,7 @@ def auto_menu():
 def _auto_menu():
     while True:
         print('\nAutomatic Transparent Setup |',VERSION)
+        display_port_status()
         print('1) ON\n2) OFF')
         print('00) Back')
         choice=input('Choose [1-2/00]: ').strip()
@@ -1033,6 +1079,7 @@ def _auto_menu():
         if side not in ('1','2'): print('Invalid role.'); continue
         role='iran' if side=='1' else 'outside'
         root_checks(role)
+        display_port_status(role)
         if choice=='2': auto_disable(role); continue
         links=interfaces()
         print('Detected tunnel interfaces (names are not hard-coded):')
@@ -1057,7 +1104,6 @@ def _auto_menu():
         if not plans: print('No safe automatic plans available.'); continue
         if role=='outside' and any(p['kind']=='wireguard' for p in plans):
             print('Outside single-peer WireGuard: broad AllowedIPs with Table=off; keys/endpoints stay unchanged.')
-        if input('Press Enter to apply this server setup, or 00 to cancel: ').strip()=='00': continue
         successful,failed=auto_apply(plans,role,direct=True)
         print(f'Finished: ready={len(successful)} skipped/failed={len(failed)+len(skipped)}')
         if role=='outside' and successful:

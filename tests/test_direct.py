@@ -101,6 +101,6 @@ class Probe(unittest.TestCase):
         with patch.object(tp,'interfaces',return_value=[]),patch.object(tp.socket,'socket',return_value=fake),self.assertRaisesRegex(tp.Error,'Production forward was not switched'):tp.probe_transparent(p)
     def test_simple_menu_only_two_actions(self):
         output=io.StringIO()
-        with patch('builtins.input',return_value='00'),contextlib.redirect_stdout(output):tp.auto_menu()
+        with patch.object(tp,'display_port_status'),patch('builtins.input',return_value='00'),contextlib.redirect_stdout(output):tp.auto_menu()
         self.assertIn('1) ON',output.getvalue());self.assertIn('2) OFF',output.getvalue())
         self.assertNotIn('Activate',output.getvalue());self.assertNotIn('Advanced',output.getvalue())

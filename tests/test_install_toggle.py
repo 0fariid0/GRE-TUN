@@ -67,11 +67,9 @@ class Toggle(unittest.TestCase):
     def test_active_sessions_keep_return_routes(self):
         with patch('builtins.input',return_value='0'),patch.object(tp,'marked_connections',return_value=4):tp.auto_disable('iran')
         self.drain.assert_called_once_with('a');self.cleanup.assert_not_called()
-    def test_outside_requires_iran_off_acknowledgement(self):
-        with patch('builtins.input',side_effect=['2044','']):tp.auto_disable('outside')
-        self.drain.assert_not_called();self.cleanup.assert_not_called()
-    def test_outside_selects_backend_ports_and_supports_all(self):
-        with patch('builtins.input',side_effect=['0','IRAN-OFF']),patch.object(tp,'marked_connections',return_value=0):tp.auto_disable('outside')
+    def test_outside_has_no_confirmation_prompt(self):
+        with patch('builtins.input',side_effect=['2044']) as ask,patch.object(tp,'marked_connections',return_value=0):tp.auto_disable('outside')
+        self.assertEqual(ask.call_count,1)
         self.drain.assert_called_once_with('b');self.cleanup.assert_called_once_with('b')
     def test_cancel_leaves_profiles_unchanged(self):
         with patch('builtins.input',return_value='00'):tp.auto_disable('iran')
