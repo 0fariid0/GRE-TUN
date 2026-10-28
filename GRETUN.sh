@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + GRE Plus + WireGuard + HAProxy tunnel manager v12.2.0
+# GRE + GRE Plus + WireGuard + HAProxy tunnel manager v12.3.0
 # v12.2.0: optional transparent TCP module with trial, connection-aware return routes and drain.
 # v12.1.1: Kharej generates the token; Iran pastes it visibly. Existing tokens preserved.
 # v12.1.0: deferred startup repairs, optional BackPack L3 adapter (ports=[]).
@@ -51,7 +51,7 @@ set -euo pipefail
 # - HAProxy fix: preserve an existing global maxconn, use the known-working defaults,
 #   and stop changing system limits or restarting HAProxy simply by opening its menu.
 
-APP_VERSION="12.2.0"
+APP_VERSION="12.3.0"
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -4920,7 +4920,7 @@ diagnostics_menu() {
     echo -e "  ${C_GREEN}4)${C_RESET} capture current tunnel state now"
     echo -e "  ${C_MAGENTA}5)${C_RESET} export complete report to /root"
     echo -e "  ${C_RED}6)${C_RESET} clear saved logs"
-    echo -e "  ${C_CYAN}9)${C_RESET} transparent client IP (trial / promote / drain)"
+    echo -e "  ${C_CYAN}9)${C_RESET} automatic transparent IP (Iran / outside)"
     echo -e "  ${C_DIM}00) Back to main menu${C_RESET}"
     echo
     echo "Automatic event log : $DIAG_EVENT_LOG"
@@ -6008,8 +6008,9 @@ transparent_repair_routes() {
 transparent_menu() {
   local module
   module="$(transparent_module_path)" || return 1
-  command -v python3 >/dev/null 2>&1 || { err_msg "Python 3 is required for the optional transparent module."; return 1; }
-  python3 "$module" menu
+  ensure_feature_dependencies "transparent-forward" "python3:python3" "ip:iproute2" "ss:iproute2" "iptables:iptables" "iptables-save:iptables" "conntrack:conntrack" || return 1
+  install_manager_binary || return 1
+  python3 "$module" auto
 }
 
 haproxy_menu() {
@@ -6206,6 +6207,11 @@ show_menu() {
 }
 
 ### Script entry
+if [[ "${1:-}" == "--transparent" ]]; then
+  ensure_root
+  transparent_menu
+  exit $?
+fi
 # Allow function-level tests without executing privileged startup.
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then return 0; fi
 if [[ "${1:-}" == "--fix-wg-port" ]]; then

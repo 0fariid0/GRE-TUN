@@ -15,12 +15,14 @@ import re
 import shlex
 import shutil
 import socket
+import socketserver
+import threading
 import subprocess
 import sys
 import tempfile
 import time
 
-VERSION = '12.2.0'
+VERSION = '12.3.0'
 STATE = Path('/etc/gretun-transparent')
 CONFIG = Path('/etc/haproxy/haproxy.cfg')
 MODULE = Path('/usr/local/lib/gretun/transparent_forward.py')
@@ -28,6 +30,8 @@ UNIT = Path('/etc/systemd/system/gretun-transparent.service')
 SYSTEMD = Path('/etc/systemd/system')
 MASK = '0xffff0000'
 PREFIX = 'gretun-tp:'
+READY_PORT = 45123
+READY_UNIT = 'gretun-transparent-ready.service'
 
 class Error(Exception):
     pass
@@ -146,7 +150,7 @@ def interfaces():
         for address in addresses.get(name,{}).get('addr_info',[]):
             if address.get('family') == 'inet':
                 result.append(dict(iface=name, kind=kind, address=address['local'], prefix=address['prefixlen'],
-                                   up='UP' in link.get('flags',[])))
+                                   up='UP' in link.get('flags',[]), peer=address.get('peer')))
     return result
 
 def check_interface(p, role):
@@ -156,7 +160,7 @@ def check_interface(p, role):
         raise Error(f"{p['iface']} must be UP with {expected} on this {role} server.")
     peer = p['iran' if role=='outside' else 'outside']
     network = ipaddress.IPv4Network(f"{expected}/{found['prefix']}", strict=False)
-    if ipaddress.IPv4Address(peer) not in network or peer in (str(network.network_address),str(network.broadcast_address)):
+    if found['prefix']<32 and (ipaddress.IPv4Address(peer) not in network or (network.prefixlen<31 and peer in (str(network.network_address),str(network.broadcast_address)))):
         raise Error('The two inner addresses must be usable hosts in the same subnet.')
     route = jrun('ip','-j','-4','route','get',peer)
     if not route or route[0].get('dev') != p['iface']:
@@ -309,6 +313,8 @@ def rules_for(r):
             '-m','connmark','--mark',marked,'-j','ACCEPT')
         add('filter','INPUT','input','-i',iface,'-d',outside,'-p','tcp','--dport',bp,'-j','ACCEPT')
         add('filter','OUTPUT','output','-o',iface,'-s',outside,'-p','tcp','--sport',bp,'-j','ACCEPT')
+        add('filter','INPUT','ready-in','-i',iface,'-s',p['iran'],'-d',outside,'-p','tcp','--dport',str(READY_PORT),'-j','ACCEPT')
+        add('filter','OUTPUT','ready-out','-o',iface,'-s',outside,'-d',p['iran'],'-p','tcp','--sport',str(READY_PORT),'-j','ACCEPT')
     else:
         add('mangle','PREROUTING','socket','-i',iface,'-s',outside,'-p','tcp','--sport',bp,
             '-m','socket','--transparent','-j','MARK','--set-xmark',marked)
@@ -346,11 +352,15 @@ def wg_settings(text):
     return peer[1],allowed[1],table[1] if table else None
 
 def patch_wg(text):
-    wg_settings(text)
+    _,old_allowed,_=wg_settings(text)
+    address=re.search(r'^\s*Address\s*=\s*(\d+\.\d+\.\d+\.\d+)/32\s*$',text,re.M)
+    peer_route=old_allowed.strip() if address and re.fullmatch(r'\d+\.\d+\.\d+\.\d+/32',old_allowed.strip()) else None
     text=re.sub(r'(^\s*AllowedIPs\s*=).*$',r'\1 0.0.0.0/0',text,flags=re.M)
     if re.search(r'^\s*Table\s*=',text,re.M):
         text=re.sub(r'(^\s*Table\s*=).*$',r'\1 off',text,flags=re.M)
     else: text=re.sub(r'(^\s*\[Interface\]\s*\n)',r'\1Table = off\n',text,count=1,flags=re.M)
+    if peer_route and '# GRE-TUN peer route' not in text:
+        text=re.sub(r'(^[ \t]*Table[ \t]*=[ \t]*off[ \t]*\n)',lambda m:m[1]+'# GRE-TUN peer route\nPostUp = ip -4 route replace '+peer_route+' dev %i\n',text,count=1,flags=re.M)
     return text
 
 def wireguard_path(iface):
@@ -384,7 +394,13 @@ def apply_wg(r):
     original=Path(w['backup']).read_bytes()
     if text.encode()!=original and hashlib.sha256(text.encode()).hexdigest()!=w['patched_hash']:
         raise Error('WireGuard config changed since preparation; refusing to overwrite it.')
-    atomic(path,patch_wg(text))
+    patched=patch_wg(original.decode())
+    peers=run('wg','show',r['plan']['iface'],'peers').stdout.split()
+    if peers!=[w['key']]: raise Error('WireGuard runtime peer changed; refusing to add or replace peers.')
+    live=run('wg','show',r['plan']['iface'],'allowed-ips').stdout.split()
+    if live not in ([w['key'],'0.0.0.0/0'],[w['key'],w['allowed']]): raise Error('WireGuard runtime AllowedIPs changed; review before restoring.')
+    if path.read_bytes()!=patched.encode(): atomic(path,patched)
+    if live==[w['key'],'0.0.0.0/0']: return
     run('wg','set',r['plan']['iface'],'peer',w['key'],'allowed-ips','0.0.0.0/0')
 
 def restore_wg(r):
@@ -491,7 +507,7 @@ def reload_config(old,new):
         run('systemctl','reload','haproxy',check=False)
         raise
 
-def stage(p,role):
+def stage(p,role,automatic=False):
     root_checks(role); check_interface(p,role)
     if any(r['plan']['id']==p['id'] for r in records()):
         raise Error('This profile already exists; use status/promote/drain instead.')
@@ -542,8 +558,8 @@ def stage(p,role):
     print(f"Prepared {role} profile {p['id']}. Main default gateway and Xray settings were not changed.")
     if role=='iran':
         print(f"TRIAL ONLY: test one client using the SAME credentials/transport, external port {p['test_port']}.")
-        print('Only after confirming handshake, real client IP and traffic, use promote '+p['id'])
-    else: print('Now prepare the Iran side with the same token. Keep this outside profile enabled.')
+        print('After a successful client test, choose Activate in the automatic wizard.' if automatic else 'Only after confirming handshake, real client IP and traffic, use promote '+p['id'])
+    else: print('Run automatic setup on Iran next; no token is needed.' if automatic else 'Now prepare the Iran side with the same token. Keep this outside profile enabled.')
 
 
 def marked_connections(r):
@@ -605,6 +621,11 @@ def cleanup(identifier):
     else:
         run('systemctl','disable','gretun-transparent.service')
         UNIT.unlink(missing_ok=True); run('systemctl','daemon-reload')
+    if not any(x['role']=='outside' for x in records()):
+        ready_path=SYSTEMD/READY_UNIT
+        if ready_path.exists() and ready_path.read_text().startswith('# GRE-TUN transparent'):
+            run('systemctl','disable','--now',READY_UNIT)
+            ready_path.unlink(); run('systemctl','daemon-reload')
     print('Profile removed after its connections drained. Backups retained under',STATE)
 
 def status():
@@ -630,6 +651,312 @@ def restore(iface=None):
     if errors:
         raise Error('Other valid profiles were restored. Problems: '+'; '.join(errors))
 
+
+def inner_peer(link):
+    # Discover a unique inner peer without relying on greN/wgtunN names.
+    own=ipv4(link['address']); network=ipaddress.IPv4Network(f"{own}/{link['prefix']}",strict=False)
+    previous={r['plan']['iran'] for r in records() if r['role']=='outside' and r['plan']['iface']==link['iface'] and r['plan']['outside']==own}
+    if len(previous)==1: return ipv4(previous.pop())
+    if link.get('peer'):
+        return ipv4(link['peer'].split('/')[0])
+    if network.prefixlen in (30,31):
+        return next(str(h) for h in network.hosts() if str(h)!=own)
+    if link['kind']=='wireguard':
+        rows=run('wg','show',link['iface'],'allowed-ips').stdout.splitlines()
+        if len(rows)==1:
+            prefixes=rows[0].split()[1:]
+            candidates=[str(ipaddress.IPv4Network(c).network_address) for c in prefixes if c.endswith('/32')]
+            if len(candidates)==1 and candidates[0]!=own: return ipv4(candidates[0])
+    candidates=set()
+    for route in jrun('ip','-j','-4','route','show','dev',link['iface']):
+        destination=route.get('dst','')
+        try: subnet=ipaddress.IPv4Network(destination,strict=False)
+        except ValueError: continue
+        if subnet.prefixlen==32 and str(subnet.network_address)!=own:
+            candidates.add(str(subnet.network_address))
+    if len(candidates)==1: return ipv4(candidates.pop())
+    raise Error('Inner peer is ambiguous; interface skipped instead of guessing an address.')
+
+
+def socket_listeners():
+    result=[]
+    for line in run('ss','-H','-lntp').stdout.splitlines():
+        fields=line.split()
+        if len(fields)<5: continue
+        address,separator,number=fields[3].rpartition(':')
+        if not separator or not number.isdigit(): continue
+        try: number=port(number)
+        except Error: continue
+        if address in ('[::]','::'): address='*'
+        elif ':' in address:
+            try:
+                mapped=ipaddress.IPv6Address(address.strip('[]')).ipv4_mapped
+                if mapped is None: continue
+                address=str(mapped)
+            except ValueError: continue
+        result.append(dict(address=address,port=number,process=line))
+    return result
+
+
+def parse_ports(value,available):
+    available=set(available)
+    words=value.replace(',',' ').split()
+    if words==['0']: return sorted(available)
+    if not words: raise Error('Select at least one TCP port.')
+    result=[]
+    for word in words:
+        number=port(word)
+        if number not in available: raise Error(f'Port {number} is not in the detected list.')
+        if number not in result: result.append(number)
+    return result
+
+
+def free_trial_port(frontend,used):
+    preferred=frontend+10000 if frontend+10000<=65535 else 40000
+    for low,high in [(preferred,65536),(20000,preferred)]:
+        for number in range(low,high):
+            if number not in used:
+                used.add(number); return number
+    raise Error('No unused trial TCP port is available.')
+
+
+def iran_plans(selected):
+    text=CONFIG.read_text(); links=interfaces(); used={x['port'] for x in socket_listeners()}
+    # Include configured bind ports even if an old HAProxy worker has not opened them yet.
+    used.update(int(x) for x in re.findall(r'^\s*bind\s+\S*:(\d+)(?:\s|$)',text,re.M))
+    plans=[]; skipped=[]
+    for fp in selected:
+        try:
+            outside,bp=forward(text,fp)
+            route=jrun('ip','-j','-4','route','get',outside)
+            iface=route[0].get('dev') if route else None
+            choices=[x for x in links if x['iface']==iface and x['up']]
+            preferred=route[0].get('prefsrc') if route else None
+            if preferred: choices=[x for x in choices if x['address']==preferred] or choices
+            if len(choices)>1:
+                choices=[x for x in choices if ipaddress.IPv4Address(outside) in ipaddress.IPv4Network(f"{x['address']}/{x['prefix']}",strict=False)]
+            if len(choices)!=1: raise Error('The backend route has no unique UP GRE/GRE Plus/WireGuard address.')
+            link=choices[0]
+            previous=next((r for r in records() if r['role']=='iran' and r['plan']['frontend_port']==fp),None)
+            if previous:
+                p=previous['plan']
+                if (p['iface'],p['iran'],p['outside'],p['backend_port'])!=(iface,link['address'],outside,bp):
+                    raise Error('Existing profile does not match the current forward; drain it before changing routes.')
+                if previous['phase'] not in ('trial','active'): raise Error('Existing profile needs drain/cleanup or recovery.')
+                plans.append(dict(p)); continue
+            plans.append(make_plan(iface,link['address'],outside,bp,fp,free_trial_port(fp,used),link['kind']))
+        except (Error,OSError,KeyError,ValueError) as problem: skipped.append((str(fp),str(problem)))
+    return plans,skipped
+
+
+def outside_plans(selected):
+    plans=[]; skipped=[]; listeners=socket_listeners(); known=set()
+    for link in interfaces():
+        if not link['up']:
+            skipped.append((link['iface'],'Interface is DOWN.')); continue
+        try: peer=inner_peer(link)
+        except (Error,OSError,ValueError) as problem:
+            skipped.append((link['iface'],str(problem))); continue
+        for bp in selected:
+            key=(link['iface'],link['address'],bp)
+            if key in known: continue
+            known.add(key)
+            if not any(x['port']==bp and x['address'] in ('*','0.0.0.0',link['address']) for x in listeners):
+                skipped.append((f"{link['iface']}:{bp}",'Backend does not listen on this tunnel IPv4.')); continue
+            existing=next((r for r in records() if r['role']=='outside' and r['plan']['iface']==link['iface'] and r['plan']['outside']==link['address'] and r['plan']['backend_port']==bp),None)
+            if existing:
+                if existing['phase']!='ready':
+                    skipped.append((str(key),'Existing profile needs cleanup/recovery.')); continue
+                plans.append(dict(existing['plan'])); continue
+            # Outside does not need the Iran public/trial port: return routing depends
+            # only on local tunnel, its peer and the backend port. No cross-host token.
+            trial=bp+10000 if bp+10000<=65535 else (40000 if bp!=40000 else 40001)
+            plans.append(make_plan(link['iface'],peer,link['address'],bp,bp,trial,link['kind']))
+    return plans,skipped
+
+
+def backend_accepts_ipv4(address,number):
+    try:
+        with socket.create_connection((address,number),timeout=2): return True
+    except OSError: return False
+
+
+def readiness_response(local,remote,request):
+    if not isinstance(request,dict) or set(request)!={'version','backend_port'} or request['version']!=1:
+        return {'ready':False}
+    bp=port(request['backend_port'])
+    record=next((r for r in records() if r['role']=='outside' and r['phase']=='ready'
+                 and r['plan']['outside']==local and r['plan']['iran']==remote and r['plan']['backend_port']==bp),None)
+    if not record: return {'ready':False}
+    p=record['plan']; check_interface(p,'outside')
+    for rule in rules_for(record):
+        table,chain,*args=rule
+        if run('iptables','-w','5','-t',table,'-C',chain,*args,check=False).returncode:
+            return {'ready':False}
+    mark=hex(0x6d000000+(record['slot']<<16))
+    route=jrun('ip','-j','-4','route','get','198.18.0.1','from',p['outside'],'mark',mark)
+    if not route or route[0].get('dev')!=p['iface']: return {'ready':False}
+    if record.get('wg'):
+        runtime=run('wg','show',p['iface'],'allowed-ips').stdout.split()
+        if runtime!=[record['wg']['key'],'0.0.0.0/0']: return {'ready':False}
+    if not backend_accepts_ipv4(local,bp): return {'ready':False}
+    return dict(ready=True,version=1,iran=remote,outside=local,backend_port=bp,kind=p['kind'])
+
+
+def outside_is_ready(p):
+    try:
+        with socket.create_connection((p['outside'],READY_PORT),timeout=3,source_address=(p['iran'],0)) as sock:
+            sock.sendall((json.dumps(dict(version=1,backend_port=p['backend_port']))+'\n').encode())
+            with sock.makefile('rb') as stream: data=stream.readline(4097)
+        if len(data)>4096: return False
+        answer=json.loads(data)
+        return (answer.get('ready') is True and answer.get('version')==1 and answer.get('iran')==p['iran']
+                and answer.get('outside')==p['outside'] and answer.get('backend_port')==p['backend_port'] and answer.get('kind')==p['kind'])
+    except (OSError,ValueError): return False
+
+
+class ReadyHandler(socketserver.StreamRequestHandler):
+    def handle(self):
+        self.request.settimeout(3)
+        try:
+            local=self.request.getsockname()[0]; remote=self.client_address[0]
+            # Refuse public addresses/other clients before reading any data.
+            if not any(r['role']=='outside' and r['phase']=='ready' and r['plan']['outside']==local and r['plan']['iran']==remote for r in records()): return
+            raw=self.rfile.readline(1025)
+            if len(raw)>1024 or not raw.endswith(b'\n'): return
+            result=readiness_response(local,remote,json.loads(raw))
+            self.wfile.write((json.dumps(result)+'\n').encode())
+        except (Error,OSError,ValueError,KeyError,subprocess.SubprocessError): return
+
+
+class ReadyServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address=True
+    daemon_threads=True
+    request_queue_size=16
+    def __init__(self,*args,**kwargs):
+        self.slots=threading.BoundedSemaphore(16)
+        super().__init__(*args,**kwargs)
+    def process_request(self,request,address):
+        if not self.slots.acquire(False): self.shutdown_request(request); return
+        try: super().process_request(request,address)
+        except BaseException: self.slots.release(); raise
+    def process_request_thread(self,request,address):
+        try: super().process_request_thread(request,address)
+        finally: self.slots.release()
+
+
+def ensure_readiness_service():
+    path=SYSTEMD/READY_UNIT
+    if path.exists() and not path.read_text().startswith('# GRE-TUN transparent'):
+        raise Error('Readiness service path is already owned by another service.')
+    if run('systemctl','is-active','--quiet',READY_UNIT,check=False).returncode:
+        if any(x['port']==READY_PORT for x in socket_listeners()):
+            raise Error(f'Readiness TCP port {READY_PORT} is busy; that listener was not stopped.')
+    atomic(path,f'''# GRE-TUN transparent readiness (read-only, inner peers only)
+[Unit]
+Description=GRE-TUN outside readiness responder
+After=network-online.target gretun-transparent.service
+Wants=network-online.target gretun-transparent.service
+[Service]
+ExecStart=/usr/bin/python3 {MODULE} serve-ready
+Restart=on-failure
+RestartSec=3
+[Install]
+WantedBy=multi-user.target
+''',0o644)
+    run('systemctl','daemon-reload')
+    # restart only our own responder so an installed older Python process is updated.
+    run('systemctl','enable',READY_UNIT)
+    run('systemctl','restart',READY_UNIT)
+
+
+def auto_apply(plans,role):
+    successful=[]; failed=[]
+    for p in plans:
+        try:
+            if role=='iran' and not outside_is_ready(p):
+                raise Error('Outside is not ready for this interface/backend. Run automatic OUTSIDE setup there first.')
+            with locked():
+                match=next((r for r in records() if r['role']==role and r['plan']['id']==p['id']),None)
+                if match:
+                    expected=('trial','active') if role=='iran' else ('ready',)
+                    if match['phase'] not in expected: raise Error('Existing profile needs cleanup/recovery.')
+                    # Keep production mapping intact on repeat runs; repair only owned network state.
+                    check_interface(p,role); apply_network(match); persist()
+                    print('Already configured:',p['id'],match['phase'])
+                else: stage(p,role,automatic=True)
+            successful.append(p)
+        except (Error,OSError,ValueError,subprocess.SubprocessError) as problem:
+            failed.append((p['iface']+':'+str(p['frontend_port']),str(problem)))
+            print('SKIPPED/FAILED:',failed[-1][0],failed[-1][1])
+    # Must be outside the file lock: the service dependency's restore needs that lock.
+    if role=='outside' and successful: ensure_readiness_service()
+    return successful,failed
+
+
+def auto_menu():
+    while True:
+        print('\nAutomatic Transparent Setup |',VERSION)
+        print('1) Iran: discover forwards/routes and prepare trials\n2) Outside: discover tunnels and prepare return paths')
+        print('3) Activate tested Iran trials\n4) Status\n5) Drain / cleanup\n6) Advanced manual menu\n00) Back')
+        choice=input('Choose [1-6/00]: ').strip()
+        if choice=='00': return
+        if choice=='4': status(); continue
+        if choice=='6': menu(); continue
+        if choice=='5':
+            rows=records()
+            for n,r in enumerate(rows,1): print(n,r['role'],r['phase'],r['plan']['iface'],r['plan']['frontend_port'])
+            selected=int(input('Profile row: '))-1
+            if not 0<=selected<len(rows): raise Error('Invalid profile row.')
+            r=rows[selected]
+            with locked():
+                if r['phase']=='draining': cleanup(r['plan']['id'])
+                else: drain(r['plan']['id'])
+            continue
+        if choice=='3':
+            trials=[r for r in records() if r['role']=='iran' and r['phase']=='trial']
+            for n,r in enumerate(trials,1): print(n,'public',r['plan']['frontend_port'],'trial',r['plan']['test_port'],r['plan']['iface'])
+            if not trials: print('No Iran trials waiting.'); continue
+            selected=parse_ports(input('Trial row(s), e.g. 1,2 or 0=all: '),range(1,len(trials)+1))
+            if input('After a successful real-client trial, type ACTIVATE: ').strip()!='ACTIVATE': continue
+            for row in selected:
+                p=trials[row-1]['plan']
+                if not outside_is_ready(p): print('Outside not ready; production forward kept:',p['frontend_port']); continue
+                with locked(): promote(p['id'])
+            continue
+        if choice not in ('1','2'): print('Invalid option.'); continue
+        role='iran' if choice=='1' else 'outside'
+        root_checks(role)
+        links=interfaces()
+        print('Detected tunnel interfaces (names are not hard-coded):')
+        for x in links: print(x['iface'],x['kind'],x['address'],'UP' if x['up'] else 'DOWN')
+        if role=='iran':
+            ports=[]
+            for number in re.findall(r'^frontend ws_(\d+)_in\s*$',CONFIG.read_text(),re.M):
+                try: forward(CONFIG.read_text(),int(number)); ports.append(int(number))
+                except Error: pass
+            default='2044' if 2044 in ports else ''
+        else:
+            listeners=socket_listeners()
+            ports=sorted({x['port'] for x in listeners if x['address'] not in ('127.0.0.1','localhost') and x['port'] not in (22,READY_PORT) and 'sshd' not in x['process'].lower()})
+            detected=sorted({x['port'] for x in listeners if re.search('xray',x['process'],re.I) and x['port'] in ports})
+            default=' '.join(str(x) for x in detected)
+        if not ports: print('No eligible TCP ports found. Iran needs existing TCP forwards; outside needs a listening backend.'); continue
+        print('Detected TCP ports (enter PORT numbers, not row numbers):',' '.join(map(str,ports)))
+        selected=parse_ports(input(f'Port(s), comma/space, 0=all [{default}]: ').strip() or default,ports)
+        plans,skipped=iran_plans(selected) if role=='iran' else outside_plans(selected)
+        for name,reason in skipped: print('SKIPPED:',name,reason)
+        for p in plans: print(role,p['iface'],p['iran'],'<->',p['outside'], 'backend',p['backend_port'],'public',p['frontend_port'],'trial',p['test_port'])
+        if not plans: print('No safe automatic plans available.'); continue
+        if role=='outside' and any(p['kind']=='wireguard' for p in plans):
+            print('Outside single-peer WireGuard: broad AllowedIPs with Table=off; keys/endpoints stay unchanged.')
+        if input('Press Enter to apply this server setup, or 00 to cancel: ').strip()=='00': continue
+        successful,failed=auto_apply(plans,role)
+        print(f'Finished: ready={len(successful)} skipped/failed={len(failed)+len(skipped)}')
+        if role=='outside' and successful:
+            print('Outside ready. Run this same automatic wizard on each Iran. No token/IP copying is needed.')
+        elif role=='iran' and successful:
+            print('Trial ports are ready. Test one copied client config on its trial port; then choose 3 here to activate.')
 
 def menu():
     while True:
@@ -686,7 +1013,7 @@ def menu():
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action',choices=['menu','outside','iran','promote','drain','cleanup','status','restore','guard'],nargs='?',default='menu')
+    parser.add_argument('action',choices=['auto','serve-ready','menu','outside','iran','promote','drain','cleanup','status','restore','guard'],nargs='?',default='menu')
     parser.add_argument('value',nargs='?')
     args=parser.parse_args()
     if args.action=='guard':
@@ -694,6 +1021,10 @@ def main():
         if active and (args.value in (None,'all','haproxy') or any(r['plan']['iface']==args.value for r in active)):
             print('Transparent profiles protect this configuration. Drain/cleanup the matching profile before changing it.',file=sys.stderr)
             return 1
+        return 0
+    if args.action=='auto': auto_menu(); return 0
+    if args.action=='serve-ready':
+        with ReadyServer(('0.0.0.0',READY_PORT),ReadyHandler) as server: server.serve_forever()
         return 0
     if args.action=='status': status(); return 0
     if args.action=='menu': menu(); return 0
