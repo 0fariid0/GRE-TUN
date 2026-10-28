@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "iface": "greplus3",
+  "iran": "10.30.3.1",
+  "outside": "10.30.3.2",
+  "backend_port": 2044,
+  "frontend_port": 2044,
+  "test_port": 12044,
+  "kind": "gre",
+  "id": "e169a0147fef"
+}

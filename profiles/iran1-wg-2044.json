@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "iface": "wgtun1",
+  "iran": "10.20.1.1",
+  "outside": "10.20.1.2",
+  "backend_port": 2044,
+  "frontend_port": 2044,
+  "test_port": 12044,
+  "kind": "wireguard",
+  "id": "87f1ccf2408e"
+}

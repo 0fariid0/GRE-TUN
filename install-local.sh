@@ -6,7 +6,9 @@ package_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 bash -n "$package_dir/GRETUN.sh"
 # All shipped engine bytes must match before replacing the local manager.
 (cd "$package_dir/engines/backpack" && sha256sum -c BUNDLE-SHA256SUMS)
-install -d -m 0755 /usr/local/bin /usr/local/share/gretun/engines/backpack
+install -d -m 0755 /usr/local/bin /usr/local/lib/gretun /usr/local/share/gretun/engines/backpack
+python3 -m py_compile "$package_dir/transparent_forward.py"
+install -m 0755 "$package_dir/transparent_forward.py" /usr/local/lib/gretun/transparent_forward.py
 for asset in backpack_linux_amd64.tar.gz backpack_linux_arm64.tar.gz; do
   install -m 0644 "$package_dir/engines/backpack/$asset" "/usr/local/share/gretun/engines/backpack/$asset.new"
   mv -f "/usr/local/share/gretun/engines/backpack/$asset.new" "/usr/local/share/gretun/engines/backpack/$asset"

@@ -1,7 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + GRE Plus + WireGuard + HAProxy tunnel manager v12.1.1
+# GRE + GRE Plus + WireGuard + HAProxy tunnel manager v12.2.0
+# v12.2.0: optional transparent TCP module with trial, connection-aware return routes and drain.
 # v12.1.1: Kharej generates the token; Iran pastes it visibly. Existing tokens preserved.
 # v12.1.0: deferred startup repairs, optional BackPack L3 adapter (ports=[]).
 # Main menu and original forwarding workflow retained.
@@ -50,7 +51,7 @@ set -euo pipefail
 # - HAProxy fix: preserve an existing global maxconn, use the known-working defaults,
 #   and stop changing system limits or restarting HAProxy simply by opening its menu.
 
-APP_VERSION="12.1.1"
+APP_VERSION="12.2.0"
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -1176,6 +1177,10 @@ tunnel_health_check_all() {
 # Defer legacy migrations until an operator requests a mutating action.
 # Opening/exiting the menu never downloads, repairs or restarts any tunnel.
 prepare_runtime_once() {
+  if compgen -G '/etc/gretun-transparent/profile-*.json' >/dev/null; then
+    RUNTIME_PREPARED=1
+    return 0
+  fi
   [ "${RUNTIME_PREPARED:-0}" = 1 ] && return 0
   info_msg "Preparing tunnel services for this management session..."
   bootstrap_runtime_repairs || return 1
@@ -1961,6 +1966,7 @@ gre_create_tunnel() {
   firewall_allow_ip_peer "GRE tunnel $TUNNEL_ID remote public" "$REMOTE_PUBLIC_IP" "$TUN_IFACE"
   firewall_allow_ip_peer "GRE tunnel $TUNNEL_ID remote inner" "$REMOTE_GRE_IP" "$TUN_IFACE"
 
+  transparent_repair_routes "$TUN_IFACE" || warn_msg "Review transparent return routes for $TUN_IFACE"
   echo "[OK] GRE tunnel created as $TUN_IFACE"
   echo "Local GRE IP : $LOCAL_GRE_IP"
   echo "Remote GRE IP: $REMOTE_GRE_IP"
@@ -1985,6 +1991,7 @@ gre_menu_config_tunnel() {
   selected_role="$ROLE"
   echo
   prompt_tunnel_id "Enter GRE tunnel number before IP [1-254]: " || return
+  transparent_guard "$(gre_iface "$TUNNEL_ID")" || return 1
 
   existing_local_ip=""
   existing_remote_ip=""
@@ -2074,6 +2081,7 @@ gre_status_check() {
 
 gre_remove_one_tunnel() {
   local id="$1"
+  transparent_guard "$(gre_iface "$id")" || return 1
   local ifc file
   ifc="$(gre_iface "$id")"
   file="$(gre_config_file "$id")"
@@ -2364,6 +2372,7 @@ greplus_create_tunnel() {
   greplus_save_config || return 1
   greplus_apply_firewall "$TUNNEL_ID" || return 1
   if [ "$interactive" -eq 1 ]; then greplus_install_service "$TUNNEL_ID" || return 1; fi
+  transparent_repair_routes "$ifc" || warn_msg "Review transparent return routes for $ifc"
   ok_msg "GRE Plus tunnel created: $ifc"
   echo "Local/remote inner IP: $LOCAL_GREPLUS_IP -> $REMOTE_GREPLUS_IP"
   echo "MTU / TX queue / qdisc: $GREPLUS_MTU / $GREPLUS_TXQUEUELEN / fq"
@@ -2472,6 +2481,7 @@ greplus_menu_config_tunnel() {
   prompt_role || return
   local selected_role="$ROLE" existing_local="" existing_remote=""
   prompt_tunnel_id "Enter GRE Plus tunnel number [1-254]: " || return
+  transparent_guard "$(greplus_iface "$TUNNEL_ID")" || return 1
   if greplus_load_config "$TUNNEL_ID"; then
     existing_local="${LOCAL_PUBLIC_IP:-}"; existing_remote="${REMOTE_PUBLIC_IP:-}"
   fi
@@ -2499,6 +2509,7 @@ greplus_list_tunnels() {
 
 greplus_remove_one_tunnel() {
   local id="$1" ifc
+  transparent_guard "$(greplus_iface "$id")" || return 1
   ifc="$(greplus_iface "$id")"
   systemctl disable --now "$(greplus_service_name "$id")" >/dev/null 2>&1 || true
   greplus_remove_firewall "$id" || true
@@ -2807,6 +2818,7 @@ wg_list_tunnels() {
 }
 
 wg_write_config() {
+  transparent_guard "$(wg_iface_name "$1")" || return 1
   local id="$1" temporary
   local private_file conf allowed_ips private_key endpoint_ip endpoint_mode_note mtu_value endpoint_line=""
   private_file="$(wg_private_key_file "$id")"
@@ -3227,6 +3239,7 @@ wg_menu_config_tunnel() {
   selected_role="$ROLE"
   echo
   prompt_tunnel_id "Enter WireGuard tunnel number before IP [1-254]: " || return
+  transparent_guard "$(wg_iface_name "$TUNNEL_ID")" || return 1
 
   existing_local_ip=""
   existing_remote_ip=""
@@ -3765,6 +3778,7 @@ wg_remove_firewall_rules() {
 
 wg_remove_one_tunnel() {
   local id="$1"
+  transparent_guard "$(wg_iface_name "$id")" || return 1
   local ifc conf meta private public endpoint_mode=""
   ifc="$(wg_iface_name "$id")"
   conf="$(wg_config_file "$id")"
@@ -4687,6 +4701,7 @@ test_tunnels_menu() {
 
 
 reset_all_tunnels() {
+  transparent_guard all || return 1
   show_header "Reset All Tunnels"
   echo "This will restart/recreate all saved normal GRE, GRE Plus, WireGuard, and BackPack tunnels from their saved configs."
   echo "It will also re-enable their systemd services for boot."
@@ -4905,6 +4920,7 @@ diagnostics_menu() {
     echo -e "  ${C_GREEN}4)${C_RESET} capture current tunnel state now"
     echo -e "  ${C_MAGENTA}5)${C_RESET} export complete report to /root"
     echo -e "  ${C_RED}6)${C_RESET} clear saved logs"
+    echo -e "  ${C_CYAN}9)${C_RESET} transparent client IP (trial / promote / drain)"
     echo -e "  ${C_DIM}00) Back to main menu${C_RESET}"
     echo
     echo "Automatic event log : $DIAG_EVENT_LOG"
@@ -5512,6 +5528,7 @@ haproxy_open_firewall_tcp() {
 }
 
 haproxy_validate_and_restart() {
+  transparent_guard haproxy || return 1
   local tmp="$1" backup=""
   # Validate quietly first so HAProxy NOTICE/WARNING lines do not confuse the menu output.
   # If validation fails, run it again without -q to print the real error.
@@ -5550,6 +5567,7 @@ haproxy_validate_and_restart() {
 }
 
 haproxy_write_entries_file() {
+  transparent_guard haproxy || return 1
   local entries_file="$1"
   local tmp proto
   tmp="$(mktemp)"
@@ -5964,6 +5982,36 @@ haproxy_run_action() {
   return 0
 }
 
+transparent_module_path() {
+  local local_module
+  local_module="$(dirname -- "${BASH_SOURCE[0]}")/transparent_forward.py"
+  if [ -f "$local_module" ]; then printf '%s' "$local_module"
+  elif [ -f /usr/local/lib/gretun/transparent_forward.py ]; then printf '%s' /usr/local/lib/gretun/transparent_forward.py
+  else err_msg "Use the full ZIP and install-local.sh; the optional transparent module is missing." >&2; return 1
+  fi
+}
+
+transparent_guard() {
+  local scope="${1:-all}" module
+  compgen -G '/etc/gretun-transparent/profile-*.json' >/dev/null || return 0
+  module="$(transparent_module_path)" || return 1
+  python3 "$module" guard "$scope"
+}
+
+transparent_repair_routes() {
+  local iface="$1" module
+  compgen -G '/etc/gretun-transparent/profile-*.json' >/dev/null || return 0
+  module="$(transparent_module_path)" || return 1
+  python3 "$module" restore "$iface"
+}
+
+transparent_menu() {
+  local module
+  module="$(transparent_module_path)" || return 1
+  command -v python3 >/dev/null 2>&1 || { err_msg "Python 3 is required for the optional transparent module."; return 1; }
+  python3 "$module" menu
+}
+
 haproxy_menu() {
   haproxy_ensure_ready || return 1
   while true; do
@@ -5979,7 +6027,7 @@ haproxy_menu() {
     echo -e "  ${C_GREEN}8)${C_RESET} repair UDP for all TCP ports ${C_DIM}(detect + rebuild + verify)${C_RESET}"
     echo -e "  ${C_DIM}00) Back to main menu${C_RESET}"
     echo
-    read -rp "Choose HAProxy option [1-8/00]: " HAP_CHOICE
+    read -rp "Choose HAProxy option [1-9/00]: " HAP_CHOICE
     case "$HAP_CHOICE" in
       1) haproxy_run_action haproxy_list_forwards || return 0 ;;
       2) haproxy_run_action haproxy_add_port || return 0 ;;
@@ -5989,6 +6037,7 @@ haproxy_menu() {
       6) haproxy_run_action haproxy_change_protocol || return 0 ;;
       7) haproxy_run_action haproxy_optimize_websocket_nolog || return 0 ;;
       8) haproxy_run_action haproxy_repair_udp || return 0 ;;
+      9) transparent_menu || true ;;
       00) return_main_msg; return 0 ;;
       *) err_msg "Invalid option"; sleep 1 ;;
     esac
@@ -6024,6 +6073,7 @@ performance_status() {
 }
 
 apply_capacity_profile() {
+  transparent_guard all || return 1
   mkdir -p /etc/sysctl.d /etc/systemd/system/haproxy.service.d 2>/dev/null || true
   cat > "$PERFORMANCE_SYSCTL_FILE" <<'EOF_PERFORMANCE'
 # GRETUN v12 balanced high-capacity profile. Buffer values are maxima, not pre-allocation.
