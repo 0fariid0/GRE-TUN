@@ -22,7 +22,7 @@ import sys
 import tempfile
 import time
 
-VERSION = '12.3.0'
+VERSION = '12.4.0'
 STATE = Path('/etc/gretun-transparent')
 CONFIG = Path('/etc/haproxy/haproxy.cfg')
 MODULE = Path('/usr/local/lib/gretun/transparent_forward.py')
@@ -894,25 +894,39 @@ def auto_apply(plans,role):
     return successful,failed
 
 
+def auto_disable(role):
+    rows=[r for r in records() if r['role']==role]
+    key='frontend_port' if role=='iran' else 'backend_port'
+    if not rows:
+        print('No transparent profiles on this role.'); return
+    ports=sorted({r['plan'][key] for r in rows})
+    print('Configured ports:', ' '.join(map(str,ports)))
+    value=input('Port(s) to turn OFF, comma/space, 0=all, 00=back: ').strip()
+    if value=='00': return
+    selected=parse_ports(value,ports)
+    if role=='outside':
+        print('Turn OFF the matching Iran ports FIRST. This server cannot change remote HAProxy.')
+        if input('After turning OFF those Iran ports, type IRAN-OFF to continue: ').strip()!='IRAN-OFF': return
+    for r in rows:
+        if r['plan'][key] not in selected: continue
+        try:
+            with locked():
+                drain(r['plan']['id'])
+                current=load(r['plan']['id'])
+                if marked_connections(current)==0: cleanup(r['plan']['id'])
+                else: print('OFF / draining:',r['plan']['iface'],r['plan'][key],'- rerun OFF after sessions finish.')
+        except Error as exc:
+            print('Retained for safety:',r['plan']['iface'],r['plan'][key],str(exc))
+
 def auto_menu():
     while True:
         print('\nAutomatic Transparent Setup |',VERSION)
-        print('1) Iran: discover forwards/routes and prepare trials\n2) Outside: discover tunnels and prepare return paths')
-        print('3) Activate tested Iran trials\n4) Status\n5) Drain / cleanup\n6) Advanced manual menu\n00) Back')
+        print('1) Turn ON / automatic setup\n2) Turn OFF / drain connections')
+        print('3) Activate tested Iran trials\n4) Status\n6) Advanced manual menu\n00) Back')
         choice=input('Choose [1-6/00]: ').strip()
         if choice=='00': return
         if choice=='4': status(); continue
         if choice=='6': menu(); continue
-        if choice=='5':
-            rows=records()
-            for n,r in enumerate(rows,1): print(n,r['role'],r['phase'],r['plan']['iface'],r['plan']['frontend_port'])
-            selected=int(input('Profile row: '))-1
-            if not 0<=selected<len(rows): raise Error('Invalid profile row.')
-            r=rows[selected]
-            with locked():
-                if r['phase']=='draining': cleanup(r['plan']['id'])
-                else: drain(r['plan']['id'])
-            continue
         if choice=='3':
             trials=[r for r in records() if r['role']=='iran' and r['phase']=='trial']
             for n,r in enumerate(trials,1): print(n,'public',r['plan']['frontend_port'],'trial',r['plan']['test_port'],r['plan']['iface'])
@@ -925,8 +939,12 @@ def auto_menu():
                 with locked(): promote(p['id'])
             continue
         if choice not in ('1','2'): print('Invalid option.'); continue
-        role='iran' if choice=='1' else 'outside'
+        side=input('Server role: 1) Iran  2) Outside  00) Back: ').strip()
+        if side=='00': continue
+        if side not in ('1','2'): print('Invalid role.'); continue
+        role='iran' if side=='1' else 'outside'
         root_checks(role)
+        if choice=='2': auto_disable(role); continue
         links=interfaces()
         print('Detected tunnel interfaces (names are not hard-coded):')
         for x in links: print(x['iface'],x['kind'],x['address'],'UP' if x['up'] else 'DOWN')

@@ -136,7 +136,7 @@ class AutoPlanning(unittest.TestCase):
         links=[link('custom-name','10.30.1.2')]
         detected=[dict(address='*',port=2044,process='users:(("xray",pid=1))')]
         p=tp.make_plan('custom-name','10.30.1.1','10.30.1.2',2044,2044,12044,'gre')
-        with patch.object(tp,'interfaces',return_value=links),patch.object(tp,'socket_listeners',return_value=detected),patch.object(tp,'auto_apply',return_value=([p],[])) as apply,patch('builtins.input',side_effect=['2','','','00']) as inputs:
+        with patch.object(tp,'interfaces',return_value=links),patch.object(tp,'socket_listeners',return_value=detected),patch.object(tp,'auto_apply',return_value=([p],[])) as apply,patch('builtins.input',side_effect=['1','2','','','00']) as inputs:
             tp.auto_menu()
         apply.assert_called_once()
         self.assertEqual(apply.call_args[0][1],'outside')
@@ -144,7 +144,7 @@ class AutoPlanning(unittest.TestCase):
         self.assertNotIn('token',prompts.lower());self.assertNotIn('IPv4',prompts);self.assertNotIn('interface row',prompts.lower())
     def test_iran_wizard_detects_its_interface_from_forward_without_token(self):
         links=[link('custom-wire','10.20.1.1',kind='wireguard')]
-        with patch.object(tp,'interfaces',return_value=links),patch.object(tp,'socket_listeners',return_value=[]),patch.object(tp,'jrun',return_value=[dict(dev='custom-wire')]),patch.object(tp,'auto_apply',return_value=([],[])) as apply,patch('builtins.input',side_effect=['1','','','00']):
+        with patch.object(tp,'interfaces',return_value=links),patch.object(tp,'socket_listeners',return_value=[]),patch.object(tp,'jrun',return_value=[dict(dev='custom-wire')]),patch.object(tp,'auto_apply',return_value=([],[])) as apply,patch('builtins.input',side_effect=['1','1','','','00']):
             tp.auto_menu()
         plan=apply.call_args[0][0][0]
         self.assertEqual(plan['iface'],'custom-wire');self.assertEqual(plan['outside'],'10.20.1.2')

@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + GRE Plus + WireGuard + HAProxy tunnel manager v12.3.0
+# GRE + GRE Plus + WireGuard + HAProxy tunnel manager v12.4.0
 # v12.2.0: optional transparent TCP module with trial, connection-aware return routes and drain.
 # v12.1.1: Kharej generates the token; Iran pastes it visibly. Existing tokens preserved.
 # v12.1.0: deferred startup repairs, optional BackPack L3 adapter (ports=[]).
@@ -51,7 +51,7 @@ set -euo pipefail
 # - HAProxy fix: preserve an existing global maxconn, use the known-working defaults,
 #   and stop changing system limits or restarting HAProxy simply by opening its menu.
 
-APP_VERSION="12.3.0"
+APP_VERSION="12.4.0"
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -549,13 +549,13 @@ ensure_feature_dependencies() {
   elif command -v dnf >/dev/null 2>&1; then
     packages=()
     for pkg in "${unique_packages[@]}"; do
-      case "$pkg" in iproute2) packages+=(iproute) ;; iputils-ping) packages+=(iputils) ;; *) packages+=("$pkg") ;; esac
+      case "$pkg" in iproute2) packages+=(iproute) ;; iputils-ping) packages+=(iputils) ;; conntrack) packages+=(conntrack-tools) ;; *) packages+=("$pkg") ;; esac
     done
     dnf install -y "${packages[@]}" || return 1
   elif command -v yum >/dev/null 2>&1; then
     packages=()
     for pkg in "${unique_packages[@]}"; do
-      case "$pkg" in iproute2) packages+=(iproute) ;; iputils-ping) packages+=(iputils) ;; *) packages+=("$pkg") ;; esac
+      case "$pkg" in iproute2) packages+=(iproute) ;; iputils-ping) packages+=(iputils) ;; conntrack) packages+=(conntrack-tools) ;; *) packages+=("$pkg") ;; esac
     done
     yum install -y "${packages[@]}" || return 1
   else
@@ -5982,6 +5982,33 @@ haproxy_run_action() {
   return 0
 }
 
+# Pinned to the helper shipped with this manager; mutable upstream cannot mix versions.
+TRANSPARENT_SHA256="01ebe372fa0eb41ade69727b5466239ec725020e3946bd1daec994f773c5c02d"
+transparent_install_module() {
+  local target=/usr/local/lib/gretun/transparent_forward.py candidate tmp
+  if [ -f "$target" ] && [ "$(sha256sum "$target" | awk '{print $1}')" = "$TRANSPARENT_SHA256" ]; then
+    printf '%s' "$target"; return 0
+  fi
+  mkdir -p /usr/local/lib/gretun || return 1
+  tmp="$(mktemp /usr/local/lib/gretun/.transparent.XXXXXXXX)" || return 1
+  candidate="$(dirname -- "${BASH_SOURCE[0]}")/transparent_forward.py"
+  if [ -f "$candidate" ] && [ "$(sha256sum "$candidate" | awk '{print $1}')" = "$TRANSPARENT_SHA256" ]; then
+    cp -- "$candidate" "$tmp" || { rm -f "$tmp"; return 1; }
+  elif command -v curl >/dev/null 2>&1; then
+    curl -fLsS --ipv4 --connect-timeout 10 --max-time 45 "${SELF_RAW_URL%/*}/transparent_forward.py" -o "$tmp" || { rm -f "$tmp"; return 1; }
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q --timeout=15 --tries=2 -O "$tmp" "${SELF_RAW_URL%/*}/transparent_forward.py" || { rm -f "$tmp"; return 1; }
+  else
+    rm -f "$tmp"; err_msg "curl or wget is required to install transparent forwarding." >&2; return 1
+  fi
+  if [ "$(sha256sum "$tmp" | awk '{print $1}')" != "$TRANSPARENT_SHA256" ]; then
+    rm -f "$tmp"; err_msg "Helper checksum mismatch. Upload matching GRETUN.sh and transparent_forward.py from the same release." >&2; return 1
+  fi
+  python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 755 "$tmp" && mv -f -- "$tmp" "$target" || { rm -f "$tmp"; return 1; }
+  printf '%s' "$target"
+}
+
 transparent_module_path() {
   local local_module
   local_module="$(dirname -- "${BASH_SOURCE[0]}")/transparent_forward.py"
@@ -6007,8 +6034,8 @@ transparent_repair_routes() {
 
 transparent_menu() {
   local module
-  module="$(transparent_module_path)" || return 1
-  ensure_feature_dependencies "transparent-forward" "python3:python3" "ip:iproute2" "ss:iproute2" "iptables:iptables" "iptables-save:iptables" "conntrack:conntrack" || return 1
+  ensure_feature_dependencies "transparent-forward" "python3:python3" "ip:iproute2" "ss:iproute2" "iptables:iptables" "iptables-save:iptables" "conntrack:conntrack" "sha256sum:coreutils" || return 1
+  module="$(transparent_install_module)" || return 1
   install_manager_binary || return 1
   python3 "$module" auto
 }
@@ -6026,6 +6053,7 @@ haproxy_menu() {
     echo -e "  ${C_MAGENTA}6)${C_RESET} change protocol http/tcp ${C_DIM}(UDP auto-sync)${C_RESET}"
     echo -e "  ${C_CYAN}7)${C_RESET} optimize WebSocket / silent HAProxy no access-log"
     echo -e "  ${C_GREEN}8)${C_RESET} repair UDP for all TCP ports ${C_DIM}(detect + rebuild + verify)${C_RESET}"
+    echo -e "  ${C_GREEN}9)${C_RESET} Transparent client IP: ON / OFF (Iran / Outside)"
     echo -e "  ${C_DIM}00) Back to main menu${C_RESET}"
     echo
     read -rp "Choose HAProxy option [1-9/00]: " HAP_CHOICE
@@ -6188,9 +6216,10 @@ show_menu() {
   echo -e "  ${C_YELLOW}7)${C_RESET} disconnect / error / restart logs"
   echo -e "  ${C_CYAN}8)${C_RESET} performance / capacity / migration tools"
   echo -e "  ${C_DIM}00) Main menu / back${C_RESET}"
+  echo -e "  ${C_GREEN}9)${C_RESET} Transparent client IP: ON / OFF (Iran / Outside)"
   echo -e "  ${C_DIM}0) Exit${C_RESET}"
   echo
-  read -rp "Choose an option [0-8]: " CHOICE
+  read -rp "Choose an option [0-9]: " CHOICE
   case "$CHOICE" in
     1) if run_maintenance_action menu_config_tunnel; then pause; fi ;;
     2) if run_maintenance_action remove_tun; then pause; fi ;;
@@ -6200,6 +6229,7 @@ show_menu() {
     6) haproxy_menu || true ;;
     7) diagnostics_menu || true ;;
     8) performance_menu || true ;;
+    9) transparent_menu || true ;;
     00) return_main_msg ;;
     0) echo "Bye"; exit 0 ;;
     *) err_msg "Invalid option"; sleep 1 ;;
