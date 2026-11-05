@@ -47,7 +47,7 @@ set -euo pipefail
 # - HAProxy fix: preserve an existing global maxconn, use the known-working defaults,
 #   and stop changing system limits or restarting HAProxy simply by opening its menu.
 
-APP_VERSION="12.6.0"
+APP_VERSION="12.6.3"
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -947,44 +947,7 @@ restart_wg_dependents_for_transport() (
 )
 
 install_health_monitor() {
-  command -v systemctl >/dev/null 2>&1 || return 0
-  mkdir -p "$(dirname "$INSTALL_BIN")" "$HEALTH_STATE_DIR" 2>/dev/null || true
-  diagnostic_install_logrotate || true
-  if [ ! -s "$INSTALL_BIN" ]; then
-    install_manager_binary >/dev/null 2>&1 || return 1
-  fi
-
-  cat > "$HEALTH_SERVICE_UNIT" <<EOF_HEALTH_SERVICE
-[Unit]
-Description=GRE/GRE Plus/WireGuard dependency-aware health check
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/bin/bash $INSTALL_BIN --service health-check-all
-StandardOutput=append:$DIAG_SERVICE_LOG
-StandardError=append:$DIAG_SERVICE_LOG
-EOF_HEALTH_SERVICE
-
-  cat > "$HEALTH_TIMER_UNIT" <<'EOF_HEALTH_TIMER'
-[Unit]
-Description=Run GRE/GRE Plus/WireGuard health check periodically
-
-[Timer]
-OnBootSec=25s
-OnUnitActiveSec=20s
-AccuracySec=3s
-RandomizedDelaySec=2s
-Persistent=true
-Unit=gretun-health.service
-
-[Install]
-WantedBy=timers.target
-EOF_HEALTH_TIMER
-
-  systemctl daemon-reload >/dev/null 2>&1 || true
-  systemctl enable --now gretun-health.timer >/dev/null 2>&1 || true
+  return 0 # Automatic monitoring and repair removed.
 }
 
 # GRE uses a persistent supervisor instead of a oneshot service. A oneshot unit
@@ -992,85 +955,22 @@ EOF_HEALTH_TIMER
 # systemd from repairing it. The supervisor verifies both interface presence and
 # inner reachability, then recreates only this GRE and restarts dependent WG.
 gre_supervisor() {
-  local id="${1:-}" ifc target failures=0
-  validate_tunnel_id "$id" || return 1
-  trap 'exit 0' TERM INT HUP
-
-  while true; do
-    if maintenance_is_active; then
-      sleep "$GRE_SUPERVISOR_INTERVAL" & wait $! || true
-      continue
-    fi
-    if ! gre_load_config "$id"; then
-      echo "GRE supervisor: missing config for tunnel $id" >&2
-      diagnostic_event "ERROR" "gre-$id" "supervisor stopped: saved configuration is missing or invalid"
-      return 1
-    fi
-    ifc="$(gre_iface "$id")"
-    target="${REMOTE_GRE_IP:-$(gre_remote_inner_ip_for_role "$id" "${ROLE:-2}")}"
-    apply_tunnel_sysctls
-    ensure_public_endpoint_route "${REMOTE_PUBLIC_IP:-}" "${LOCAL_PUBLIC_IP:-}"
-
-    if ! tunnel_iface_is_up "$ifc"; then
-      if [ "$AUTO_REPAIR_MISSING_INTERFACE" -eq 1 ]; then
-        echo "GRE supervisor: $ifc is missing/down; recreating tunnel $id" >&2
-        diagnostic_event "ERROR" "gre-$id" "interface $ifc is missing/down; recreating tunnel"
-        diagnostic_capture "gre" "$id" "$ifc" "$(gre_service_name "$id")" "$target" "interface missing or down"
-        if gre_create_tunnel 0; then
-          diagnostic_event "RESTART" "gre-$id" "tunnel recreation succeeded after interface disappeared"
-          failures=0
-          restart_wg_dependents_for_transport gre "$id"
-        else
-          diagnostic_event "ERROR" "gre-$id" "tunnel recreation FAILED after interface disappeared"
-          sleep "$GRE_SUPERVISOR_INTERVAL"
-          continue
-        fi
-      else
-        diagnostic_event "ERROR" "gre-$id" "interface $ifc is missing/down; automatic repair is disabled"
-      fi
-    elif transport_has_recent_wg_handshake gre "$id" || quick_tunnel_ping "$ifc" "$target"; then
-      if [ "$failures" -gt 0 ]; then
-        diagnostic_event "RECOVERED" "gre-$id" "inner reachability recovered after $failures failed probe(s); tunnel was not recreated"
-      fi
-      failures=0
-    else
-      failures=$((failures + 1))
-      # Log the first few failures, then only once every ~5 minutes to avoid log spam.
-      if [ "$failures" -le "$GRE_SUPERVISOR_FAIL_LIMIT" ] || [ $((failures % 30)) -eq 0 ]; then
-        diagnostic_event "WARN" "gre-$id" "inner reachability probe failed ($failures), interface=$ifc target=$target; live tunnel left untouched"
-      fi
-      if [ "$AUTO_REPAIR_ON_PROBE_FAILURE" -eq 1 ] && [ "$failures" -ge "$GRE_SUPERVISOR_FAIL_LIMIT" ]; then
-        diagnostic_capture "gre" "$id" "$ifc" "$(gre_service_name "$id")" "$target" "$failures consecutive inner reachability failures"
-        if gre_create_tunnel 0; then
-          diagnostic_event "RESTART" "gre-$id" "tunnel recreation succeeded after $failures failed probes"
-          restart_wg_dependents_for_transport gre "$id"
-        else
-          diagnostic_event "ERROR" "gre-$id" "tunnel recreation FAILED after $failures failed probes"
-        fi
-        failures=0
-      elif [ "$failures" -eq "$GRE_SUPERVISOR_FAIL_LIMIT" ]; then
-        diagnostic_event "INFO" "gre-$id" "probe threshold reached, but auto-recreate-on-probe-failure is disabled"
-      fi
-    fi
-
-    sleep "$GRE_SUPERVISOR_INTERVAL" &
-    wait $! || true
-  done
+  gre_service_start "${1:-}"
 }
 
 gre_write_service_template() {
   cat > "$GRE_SERVICE_TEMPLATE" <<EOF_SERVICE
 [Unit]
-Description=Normal GRE Tunnel %i Self-Healing Service
+Description=Normal GRE Tunnel %i Boot Service
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=0
 
 [Service]
-Type=simple
+Type=oneshot
+RemainAfterExit=yes
 ExecStart=/bin/bash $INSTALL_BIN --service supervise-gre %i
-Restart=on-failure
-RestartSec=2
+Restart=no
 TimeoutStopSec=10
 LimitNOFILE=262144
 StandardOutput=append:$DIAG_SERVICE_LOG
@@ -1082,176 +982,11 @@ EOF_SERVICE
 }
 
 tunnel_health_check_all() {
-  # Do not fight a manual create/remove/reset operation. The flag self-expires
-  # after 15 minutes so an interrupted SSH session cannot disable healing forever.
-  maintenance_is_active && return 0
-  local lockdir="/run/gretun-health.lock"
-  mkdir "$lockdir" 2>/dev/null || return 0
-  trap 'rmdir /run/gretun-health.lock 2>/dev/null || true' EXIT
-  apply_tunnel_sysctls
-
-  local ids id ifc svc target count transport_ok
-
-  # GRE first: the persistent service handles inner-ping repair itself. Here we
-  # only revive a stopped service or a missing interface immediately.
-  ids="$(gre_collect_ids || true)"
-  while IFS= read -r id; do
-    [ -n "$id" ] || continue
-    svc="$(gre_service_name "$id")"
-    if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
-      ifc="$(gre_iface "$id")"
-      if ! systemctl is-active --quiet "$svc" 2>/dev/null; then
-        restart_service_with_diagnostics "gre" "$id" "$ifc" "$svc" "" "supervisor service inactive during periodic health check" || true
-      elif ! tunnel_iface_is_up "$ifc"; then
-        # The active supervisor owns interface recovery. Do not restart it here and race its repair.
-        diagnostic_event "WARN" "gre-$id" "interface $ifc is missing/down; active supervisor will handle recovery"
-      fi
-    fi
-  done <<< "$ids"
-
-  # GRE Plus is independent of normal GRE and has its own interface/service.
-  ids="$(greplus_collect_ids || true)"
-  while IFS= read -r id; do
-    [ -n "$id" ] || continue
-    svc="$(greplus_service_name "$id")"
-    if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
-      ifc="$(greplus_iface "$id")"
-      if ! systemctl is-active --quiet "$svc" 2>/dev/null; then
-        restart_service_with_diagnostics "greplus" "$id" "$ifc" "$svc" "" "supervisor service inactive during periodic health check" || true
-      elif ! tunnel_iface_is_up "$ifc"; then
-        # The active supervisor owns interface recovery. Do not restart it here and race its repair.
-        diagnostic_event "WARN" "greplus-$id" "interface $ifc is missing/down; active supervisor will handle recovery"
-      fi
-    fi
-  done <<< "$ids"
-
-  # WireGuard is checked last so its GRE/GRE Plus transport is repaired first.
-  ids="$(wg_collect_ids || true)"
-  while IFS= read -r id; do
-    [ -n "$id" ] || continue
-    wg_load_meta "$id" || continue
-    [ -n "${REMOTE_WG_PUBLIC_KEY:-}" ] || continue
-    svc="$(wg_service_name "$id")"
-    systemctl is-enabled --quiet "$svc" 2>/dev/null || continue
-    ifc="$(wg_iface_name "$id")"
-    target="${REMOTE_WG_IP:-}"
-    transport_ok=1
-    case "${WG_ENDPOINT_MODE:-public}" in
-      gre|greplus)
-        if ! tunnel_iface_is_up "${WG_TRANSPORT_IFACE:-}"; then transport_ok=0; fi
-        ;;
-    esac
-    if [ "$transport_ok" -ne 1 ]; then
-      diagnostic_event "WARN" "wireguard-$id" "health check skipped because transport interface ${WG_TRANSPORT_IFACE:-unknown} is down"
-      health_counter_reset wireguard "$id"
-      continue
-    fi
-    wg_apply_firewall_rules "$id" >/dev/null 2>&1 || true
-
-    if ! systemctl is-active --quiet "$svc" 2>/dev/null || ! tunnel_iface_is_up "$ifc"; then
-      restart_service_with_diagnostics "wireguard" "$id" "$ifc" "$svc" "$target" "service inactive or interface missing" || true
-      health_counter_reset wireguard "$id"
-    elif wg_iface_has_recent_handshake "$ifc" || quick_tunnel_ping "$ifc" "$target"; then
-      health_counter_reset wireguard "$id"
-    else
-      count="$(health_counter_fail wireguard "$id")"
-      if [ "$count" -le "$HEALTH_FAIL_LIMIT" ] || [ $((count % 15)) -eq 0 ]; then
-        diagnostic_event "WARN" "wireguard-$id" "handshake is stale and inner ping failed ($count), interface=$ifc target=$target; interface left untouched"
-      fi
-      if [ "$AUTO_REPAIR_ON_PROBE_FAILURE" -eq 1 ] && [ "$count" -ge "$HEALTH_FAIL_LIMIT" ]; then
-        restart_service_with_diagnostics "wireguard" "$id" "$ifc" "$svc" "$target" "$count stale-handshake/inner-ping failures" || true
-        health_counter_reset wireguard "$id"
-      elif [ "$count" -eq "$HEALTH_FAIL_LIMIT" ]; then
-        diagnostic_event "INFO" "wireguard-$id" "probe threshold reached, but auto-restart-on-probe-failure is disabled"
-      fi
-    fi
-  done <<< "$ids"
-
-  # HAProxy UDP companions are checked last. This is intentionally lightweight:
-  # when all four managed rules exist for every TCP row, nothing is changed.
-  # If firewall/NAT rules disappear, run the same rebuild+verify logic as menu option 8.
-  haproxy_udp_self_heal_check || true
+  return 0 # Automatic monitoring and repair removed.
 }
 
 bootstrap_runtime_repairs() {
-  command -v systemctl >/dev/null 2>&1 || return 0
-  local migrate=0 ids id svc ifc
-  mkdir -p "$(dirname "$INSTALL_BIN")" 2>/dev/null || true
-  install_manager_binary >/dev/null 2>&1 || true
-  # Detect an older supervisor template before overwriting it. This makes the
-  # v12.0.2 behavior take effect immediately with one controlled service restart,
-  # but avoids restarting healthy tunnels every time the manager menu is opened.
-  if [ ! -f "$GRE_SERVICE_TEMPLATE" ] ||
-     ! grep -q 'supervise-gre' "$GRE_SERVICE_TEMPLATE" 2>/dev/null ||
-     ! grep -q '^Restart=on-failure$' "$GRE_SERVICE_TEMPLATE" 2>/dev/null; then
-    migrate=1
-  fi
-  if [ -d "$GREPLUS_CONFIG_DIR" ] && {
-       [ ! -f "$GREPLUS_SERVICE_TEMPLATE" ] ||
-       ! grep -q 'supervise-greplus' "$GREPLUS_SERVICE_TEMPLATE" 2>/dev/null ||
-       ! grep -q '^Restart=on-failure$' "$GREPLUS_SERVICE_TEMPLATE" 2>/dev/null;
-     }; then
-    migrate=1
-  fi
-  gre_write_service_template
-  [ -d "$GREPLUS_CONFIG_DIR" ] && greplus_write_service_template >/dev/null 2>&1 || true
-  install_health_monitor
-  apply_tunnel_sysctls
-  systemctl daemon-reload >/dev/null 2>&1 || true
-
-  # v11 does not run removed tunnel engines. Stop legacy instances during
-  # migration; menu 8 offers explicit deletion of their files after confirmation.
-  ids="$(vira7_collect_ids || true)"
-  while IFS= read -r id; do
-    [ -n "$id" ] || continue
-    systemctl disable --now "$(vira7_service_name "$id")" >/dev/null 2>&1 || true
-    ip link delete "$(vira7_iface_name "$id")" >/dev/null 2>&1 || true
-  done <<< "$ids"
-  ids="$(viratcp_collect_ids || true)"
-  while IFS= read -r id; do
-    [ -n "$id" ] || continue
-    systemctl disable --now "$(viratcp_service_name "$id")" >/dev/null 2>&1 || true
-    ip link delete "$(viratcp_iface_name "$id")" >/dev/null 2>&1 || true
-  done <<< "$ids"
-  ids="$(aggregate_collect_ids || true)"
-  while IFS= read -r id; do
-    [ -n "$id" ] || continue
-    systemctl disable --now "$(aggregate_service_name "$id")" >/dev/null 2>&1 || true
-    ip link delete "$(aggregate_iface_name "$id")" >/dev/null 2>&1 || true
-  done <<< "$ids"
-  for ifc in $(ip -o link show 2>/dev/null | awk -F': ' '$2 ~ /^(vira7|viratcp|ga|gtagg)[0-9]+(@|$)/ {sub(/@.*/, "", $2); print $2}'); do
-    ip link delete "$ifc" >/dev/null 2>&1 || true
-  done
-
-  ids="$(gre_collect_ids || true)"
-  while IFS= read -r id; do
-    [ -n "$id" ] || continue
-    svc="$(gre_service_name "$id")"
-    ifc="$(gre_iface "$id")"
-    if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
-      if [ "$migrate" -eq 1 ] || ! systemctl is-active --quiet "$svc" 2>/dev/null || ! tunnel_iface_is_up "$ifc"; then
-        restart_service_with_diagnostics "gre" "$id" "$ifc" "$svc" "" "startup repair: supervisor template migration, inactive service, or missing interface" || true
-      fi
-    fi
-  done <<< "$ids"
-
-  ids="$(greplus_collect_ids || true)"
-  while IFS= read -r id; do
-    [ -n "$id" ] || continue
-    svc="$(greplus_service_name "$id")"
-    ifc="$(greplus_iface "$id")"
-    if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
-      if [ "$migrate" -eq 1 ] || ! systemctl is-active --quiet "$svc" 2>/dev/null || ! tunnel_iface_is_up "$ifc"; then
-        restart_service_with_diagnostics "greplus" "$id" "$ifc" "$svc" "" "startup repair: supervisor template migration, inactive service, or missing interface" || true
-      fi
-    fi
-  done <<< "$ids"
-
-  # Existing HAProxy users upgrading to v8.8.3 get the UDP repair timer
-  # automatically on the next manager launch; no need to enter the HAProxy menu.
-  if [ -f "$HAPROXY_CONFIG" ] && command -v haproxy >/dev/null 2>&1; then
-    haproxy_install_udp_service >/dev/null 2>&1 || true
-  fi
+  return 0 # Automatic monitoring and repair removed.
 }
 
 # -----------------------------
@@ -1963,16 +1698,16 @@ greplus_create_tunnel() {
 greplus_write_service_template() {
   cat > "$GREPLUS_SERVICE_TEMPLATE" <<EOF_GREPLUS_SERVICE
 [Unit]
-Description=GRE Plus Tunnel %i High-Capacity Self-Healing Service
+Description=GRE Plus Tunnel %i High-Capacity Boot Service
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=0
 
 [Service]
-Type=simple
+Type=oneshot
+RemainAfterExit=yes
 ExecStart=/bin/bash $INSTALL_BIN --service supervise-greplus %i
-Restart=on-failure
-RestartSec=2
+Restart=no
 TimeoutStopSec=10
 LimitNOFILE=262144
 StandardOutput=append:$DIAG_SERVICE_LOG
@@ -1995,66 +1730,8 @@ greplus_install_service() {
 }
 
 greplus_supervisor() {
-  local id="$1" ifc target failures=0
-  validate_tunnel_id "$id" || return 1
-  trap 'exit 0' TERM INT HUP
-  while true; do
-    if maintenance_is_active; then
-      sleep "$GRE_SUPERVISOR_INTERVAL" & wait $! || true
-      continue
-    fi
-    greplus_load_config "$id" || return 1
-    ifc="$(greplus_iface "$id")"; target="$REMOTE_GREPLUS_IP"
-    apply_tunnel_sysctls
-    ensure_public_endpoint_route "$REMOTE_PUBLIC_IP" "$LOCAL_PUBLIC_IP"
-    # UFW rules are persistent. Repair the runtime rules only if they went
-    # missing (for example after a firewall reload), not on every poll.
-    if ! command -v iptables >/dev/null 2>&1 ||
-       ! iptables -C INPUT -p gre -s "$REMOTE_PUBLIC_IP" -d "$LOCAL_PUBLIC_IP" -j ACCEPT 2>/dev/null ||
-       ! iptables -C FORWARD -i "$ifc" -j ACCEPT 2>/dev/null; then
-      greplus_apply_firewall "$id" >/dev/null 2>&1 || true
-    fi
-    if ! tunnel_iface_is_up "$ifc"; then
-      if [ "$AUTO_REPAIR_MISSING_INTERFACE" -eq 1 ]; then
-        diagnostic_event "ERROR" "greplus-$id" "interface $ifc is missing/down; recreating tunnel"
-        diagnostic_capture "greplus" "$id" "$ifc" "$(greplus_service_name "$id")" "$target" "interface missing or down"
-        if greplus_create_tunnel 0; then
-          diagnostic_event "RESTART" "greplus-$id" "tunnel recreation succeeded after interface disappeared"
-          failures=0
-          restart_wg_dependents_for_transport greplus "$id"
-        else
-          diagnostic_event "ERROR" "greplus-$id" "tunnel recreation FAILED after interface disappeared"
-        fi
-      else
-        diagnostic_event "ERROR" "greplus-$id" "interface $ifc is missing/down; automatic repair is disabled"
-      fi
-    elif transport_has_recent_wg_handshake greplus "$id" || quick_tunnel_ping "$ifc" "$target"; then
-      if [ "$failures" -gt 0 ]; then
-        diagnostic_event "RECOVERED" "greplus-$id" "inner ping recovered after $failures failed probe(s); tunnel was not recreated"
-      fi
-      failures=0
-    else
-      failures=$((failures + 1))
-      # ICMP can be dropped/throttled while GRE traffic itself is still healthy.
-      # Never destroy a live GRE Plus interface only because ping missed a few times.
-      if [ "$failures" -le "$GRE_SUPERVISOR_FAIL_LIMIT" ] || [ $((failures % 30)) -eq 0 ]; then
-        diagnostic_event "WARN" "greplus-$id" "inner ping failed ($failures), target=$target; live tunnel left untouched"
-      fi
-      if [ "$AUTO_REPAIR_ON_PROBE_FAILURE" -eq 1 ] && [ "$failures" -ge "$GRE_SUPERVISOR_FAIL_LIMIT" ]; then
-        diagnostic_capture "greplus" "$id" "$ifc" "$(greplus_service_name "$id")" "$target" "$failures consecutive ping failures"
-        if greplus_create_tunnel 0; then
-          diagnostic_event "RESTART" "greplus-$id" "tunnel recreation succeeded after $failures failed probes"
-          restart_wg_dependents_for_transport greplus "$id"
-        else
-          diagnostic_event "ERROR" "greplus-$id" "tunnel recreation FAILED after $failures failed probes"
-        fi
-        failures=0
-      elif [ "$failures" -eq "$GRE_SUPERVISOR_FAIL_LIMIT" ]; then
-        diagnostic_event "INFO" "greplus-$id" "probe threshold reached, but auto-recreate-on-probe-failure is disabled"
-      fi
-    fi
-    sleep "$GRE_SUPERVISOR_INTERVAL" & wait $! || true
-  done
+  greplus_load_config "${1:-}" || return 1
+  greplus_create_tunnel 0
 }
 
 greplus_menu_config_tunnel() {
@@ -3887,7 +3564,7 @@ remove_tun() {
   if [ "$remove_failed" -gt 0 ]; then
     err_msg "Removal incomplete: $remove_failed tunnel(s) failed. Saved configs were retained where possible."; return 1
   fi
-  heal_remaining_tunnels_after_remove || true
+  # Remaining tunnels are not automatically repaired.
   ok_msg "Selected tunnel removal finished."
 }
 
@@ -5014,41 +4691,8 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF_UDP_SERVICE
 
-  # v8.8.3: non-interactive equivalent of HAProxy menu option 8.
-  # It uses the existing haproxy_repair_udp() function, so no HAProxy rows,
-  # target IPs, tunnel definitions, or unrelated firewall rules are modified.
-  cat > "$HAPROXY_UDP_REPAIR_SERVICE_UNIT" <<EOF_UDP_REPAIR_SERVICE
-[Unit]
-Description=GRE-TUN HAProxy UDP automatic repair (same as menu option 8)
-After=network-online.target haproxy.service
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/bin/bash $INSTALL_BIN --service haproxy-udp-repair
-TimeoutStartSec=90
-EOF_UDP_REPAIR_SERVICE
-
-  # Force one full repair every hour. The 20-second health monitor below also
-  # repairs immediately when it detects that one of our managed rules vanished.
-  cat > "$HAPROXY_UDP_REPAIR_TIMER_UNIT" <<EOF_UDP_REPAIR_TIMER
-[Unit]
-Description=Run GRE-TUN HAProxy UDP repair hourly
-
-[Timer]
-OnBootSec=2min
-OnUnitActiveSec=1h
-AccuracySec=20s
-Persistent=true
-Unit=$HAPROXY_UDP_REPAIR_SERVICE_NAME
-
-[Install]
-WantedBy=timers.target
-EOF_UDP_REPAIR_TIMER
-
   systemctl daemon-reload >/dev/null 2>&1 || true
   systemctl enable "$HAPROXY_UDP_SERVICE_NAME" >/dev/null 2>&1 || true
-  systemctl enable --now "$HAPROXY_UDP_REPAIR_TIMER_NAME" >/dev/null 2>&1 || true
 }
 
 haproxy_list_forwards() {
@@ -5410,35 +5054,13 @@ haproxy_udp_rules_healthy() {
 # UDP rules are healthy; when any managed rule is missing it runs option-8
 # repair immediately. A lock prevents overlap with the hourly forced repair.
 haproxy_udp_self_heal_check() {
-  command -v haproxy >/dev/null 2>&1 || return 0
-  command -v iptables >/dev/null 2>&1 || return 0
-  [ -f "$HAPROXY_CONFIG" ] || return 0
-
-  if haproxy_udp_rules_healthy; then
-    return 0
-  fi
-
-  local lockdir="/run/gretun-haproxy-udp-repair.lock"
-  mkdir "$lockdir" 2>/dev/null || return 0
-  info_msg "HAProxy UDP self-heal detected missing/stale managed rules; running automatic repair..."
-  local rc=0
-  haproxy_repair_udp || rc=$?
-  rmdir "$lockdir" 2>/dev/null || true
-  return "$rc"
+  return 0 # Automatic monitoring and repair removed.
 }
 
 # Non-interactive hourly service wrapper. This intentionally force-runs the
 # exact same repair as menu option 8 even if the rules still look present.
 haproxy_periodic_udp_repair() {
-  command -v haproxy >/dev/null 2>&1 || return 0
-  [ -f "$HAPROXY_CONFIG" ] || return 0
-
-  local lockdir="/run/gretun-haproxy-udp-repair.lock"
-  mkdir "$lockdir" 2>/dev/null || return 0
-  local rc=0
-  haproxy_repair_udp || rc=$?
-  rmdir "$lockdir" 2>/dev/null || true
-  return "$rc"
+  return 0 # Automatic monitoring and repair removed.
 }
 
 # Rebuild UDP companions for every existing HAProxy TCP row without touching
@@ -5781,10 +5403,10 @@ reset_saved_configs_check() (
   done < <(wg_collect_ids)
 )
 
-TRANSPARENT_SHA256="585f575af826c2ccbef335f94f1c9ba72e19175754ab92f1d9942472dd6b0928"
+TRANSPARENT_SHA256="fc4464c9bf1b7c9c3ebe0fe75ca30d7b6b177ffdf9350f9ae5997e261eaa09df"
 # Embedded fallback keeps one-file curl installs in sync with their helper.
 transparent_embedded_to_file() {
-  python3 -c "import base64,gzip,pathlib,sys; pathlib.Path(sys.argv[1]).write_bytes(gzip.decompress(base64.b64decode('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')))" "$1"
+  python3 -c "import base64,gzip,pathlib,sys; pathlib.Path(sys.argv[1]).write_bytes(gzip.decompress(base64.b64decode('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')))" "$1"
 }
 
 transparent_install_module() {
@@ -5853,10 +5475,10 @@ show_menu() {
   echo -e "  ${C_MAGENTA}6)${C_RESET} haproxy port manager"
   echo -e "  ${C_YELLOW}7)${C_RESET} disconnect / error / restart logs"
   echo -e "  ${C_CYAN}8)${C_RESET} performance / capacity / migration tools"
+  echo -e "  ${C_CYAN}9)${C_RESET} transparent client IP ${C_DIM}(ON / OFF)${C_RESET}"
   echo -e "  ${C_DIM}00) Main menu / back${C_RESET}"
   echo -e "  ${C_DIM}0) Exit${C_RESET}"
   echo
-  echo "  9) Transparent client IP: ON / OFF (Iran / Outside)"
   read -rp "Choose an option [0-9]: " CHOICE
   case "$CHOICE" in
     1) if run_maintenance_action menu_config_tunnel; then pause; fi ;;
@@ -5874,9 +5496,29 @@ show_menu() {
   esac
 }
 
+disable_legacy_automation() {
+  command -v systemctl >/dev/null 2>&1 || return 0
+  local unit
+  for unit in gretun-health.timer gretun-health.service gretun-haproxy-udp-repair.timer gretun-haproxy-udp-repair.service; do
+    systemctl disable --now "$unit" >/dev/null 2>&1 || true
+    rm -f "/etc/systemd/system/$unit"
+  done
+  # Stop old polling processes without deleting live interfaces. New boot units
+  # create tunnels once; they never poll, repair, or restart them in the background.
+  if grep -q '^Type=simple$' "$GRE_SERVICE_TEMPLATE" 2>/dev/null; then
+    systemctl stop 'gre-tunnel@*.service' >/dev/null 2>&1 || true
+    gre_write_service_template || return 1
+  fi
+  if grep -q '^Type=simple$' "$GREPLUS_SERVICE_TEMPLATE" 2>/dev/null; then
+    systemctl stop 'greplus-tunnel@*.service' >/dev/null 2>&1 || true
+    greplus_write_service_template || return 1
+  fi
+  systemctl daemon-reload || return 1
+}
+
 ### Script entry
 if [[ "${1:-}" == "--version" ]]; then printf "%s\n" "$APP_VERSION"; exit 0; fi
-if [[ "${1:-}" == "--install" ]]; then ensure_root; install_manager_binary; exit $?; fi
+if [[ "${1:-}" == "--install" ]]; then ensure_root; install_manager_binary && disable_legacy_automation; exit $?; fi
 if [[ "${1:-}" == "--transparent" ]]; then ensure_root; transparent_menu; exit $?; fi
 if [[ "${1:-}" == "--fix-wg-port" ]]; then
   ensure_root
@@ -5940,7 +5582,7 @@ if [[ "${1:-}" == "--service" ]]; then
 fi
 
 ensure_root
-bootstrap_runtime_repairs >/dev/null 2>&1 || true
+disable_legacy_automation || { err_msg "Could not disable old automation"; exit 1; }
 while true; do
   show_menu
 done
