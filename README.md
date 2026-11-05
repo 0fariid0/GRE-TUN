@@ -1,4 +1,4 @@
-# GRE-TUN v12.6.4
+# GRE-TUN v12.6.5
 
 مدیریت **GRE، GRE Plus و WireGuard** با تست پینگ، تست سرعت، مدیریت پورت HAProxy و فوروارد IP واقعی کاربر.
 
