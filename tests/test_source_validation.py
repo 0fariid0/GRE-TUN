@@ -36,3 +36,8 @@ class SourceValidation(unittest.TestCase):
     def test_reset_check_rejects_incomplete_transaction(self):
         p=self.plan();tp.stage(p,'iran');r=tp.load(p['id']);r['phase']='preparing';tp.save(r)
         with self.assertRaises(tp.Error):tp.reset_check()
+
+    def test_edit_preflight_ignores_unrelated_incomplete_profiles(self):
+        p=self.plan();tp.stage(p,'iran');r=tp.load(p['id']);r['phase']='preparing';tp.save(r)
+        tp.reset_check('gre99')
+        with self.assertRaises(tp.Error):tp.reset_check(p['iface'])

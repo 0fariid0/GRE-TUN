@@ -22,7 +22,7 @@ import sys
 import tempfile
 import time
 
-VERSION = '12.5.3'
+VERSION = '12.5.4'
 STATE = Path('/etc/gretun-transparent')
 CONFIG = Path('/etc/haproxy/haproxy.cfg')
 MODULE = Path('/usr/local/lib/gretun/transparent_forward.py')
@@ -1184,8 +1184,9 @@ def menu():
                 with locked(): cleanup(identifier)
         else: print('Invalid option.')
 
-def reset_check():
+def reset_check(iface=None):
     for r in records():
+        if iface and r['plan']['iface']!=iface: continue
         validate_plan(r['plan'])
         if r['phase'] not in ('active','trial','ready','draining'):
             raise Error('Incomplete transparent transaction; recover before resetting tunnels: '+r['plan']['id'])
@@ -1202,7 +1203,7 @@ def main():
     parser.add_argument('value',nargs='?')
     args=parser.parse_args()
     if args.action=='reset-check':
-        with locked(): reset_check()
+        with locked(): reset_check(args.value)
         return 0
     if args.action=='guard':
         active=records()

@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + GRE Plus + WireGuard + HAProxy tunnel manager v12.5.3
+# GRE + GRE Plus + WireGuard + HAProxy tunnel manager v12.5.4
 # v12.2.0: optional transparent TCP module with trial, connection-aware return routes and drain.
 # v12.1.1: Kharej generates the token; Iran pastes it visibly. Existing tokens preserved.
 # v12.1.0: deferred startup repairs, optional BackPack L3 adapter (ports=[]).
@@ -51,7 +51,7 @@ set -euo pipefail
 # - HAProxy fix: preserve an existing global maxconn, use the known-working defaults,
 #   and stop changing system limits or restarting HAProxy simply by opening its menu.
 
-APP_VERSION="12.5.3"
+APP_VERSION="12.5.4"
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -1984,6 +1984,56 @@ gre_create_tunnel() {
   fi
 }
 
+# Existing IDs edit public endpoints only; saved role, inner IPs and keys remain.
+tunnel_edit_public_ips() {
+  local kind="$1" id="$2" old_local old_remote config loader iface module backup rc=0
+  case "$kind" in
+    gre) loader=gre_load_config; config="$(gre_config_file "$id")"; iface="$(gre_iface "$id")" ;;
+    greplus) loader=greplus_load_config; config="$(greplus_config_file "$id")"; iface="$(greplus_iface "$id")" ;;
+    *) return 1 ;;
+  esac
+  "$loader" "$id" || return 1
+  old_local="$LOCAL_PUBLIC_IP"; old_remote="$REMOTE_PUBLIC_IP"
+  echo "Editing saved $kind tunnel $id ($iface). Saved role: $ROLE"
+  if [ "$ROLE" = 1 ]; then
+    echo "Iran IP: $old_local | Outside IP: $old_remote"
+  else
+    echo "Iran IP: $old_remote | Outside IP: $old_local"
+  fi
+  echo "Press Enter to keep each saved address. 00 returns without applying."
+  prompt_local_tunnel_ip "$old_local" "LOCAL public IPv4 (this server)" || return $?
+  prompt_remote_public_ip "$old_remote" || return $?
+  if [ "$LOCAL_PUBLIC_IP" = "$old_local" ] && [ "$REMOTE_PUBLIC_IP" = "$old_remote" ]; then
+    ok_msg "No IP changes; tunnel left running."; return 0
+  fi
+    if compgen -G '/etc/gretun-transparent/profile-*.json' >/dev/null; then
+      module="$(transparent_module_path)" || return 1
+      python3 "$module" reset-check "$iface" || return 1
+    fi
+    backup="$(mktemp)" || return 1
+    if [ -f "$config" ]; then cp -p "$config" "$backup" || { rm -f "$backup"; return 1; }
+    else
+      # Migrate a legacy GRE config into the numbered path before editing.
+      local new_local="$LOCAL_PUBLIC_IP" new_remote="$REMOTE_PUBLIC_IP"
+      LOCAL_PUBLIC_IP="$old_local"; REMOTE_PUBLIC_IP="$old_remote"
+      gre_save_config || { rm -f "$backup"; return 1; }
+      LOCAL_PUBLIC_IP="$new_local"; REMOTE_PUBLIC_IP="$new_remote"
+      cp -p "$config" "$backup" || { rm -f "$backup"; return 1; }
+    fi
+    if [ "$kind" = gre ]; then gre_create_tunnel 1 || rc=$?
+    else greplus_create_tunnel 1 || rc=$?; fi
+    if [ "$rc" -ne 0 ]; then
+      cp -p "$backup" "$config" || { rm -f "$backup"; return 1; }
+      "$loader" "$id" || { rm -f "$backup"; return 1; }
+      if [ "$kind" = gre ]; then gre_create_tunnel 0 || warn_msg "Old GRE runtime could not be restored."
+      else greplus_create_tunnel 0 || warn_msg "Old GRE Plus runtime could not be restored."; fi
+      rm -f "$backup"; return "$rc"
+    fi
+    rm -f "$backup"
+    transparent_repair_routes "$iface" || return 1
+  ok_msg "Saved tunnel $id public IPs updated. Update the peer server too if its remote address changed."
+}
+
 gre_menu_config_tunnel() {
   show_header "Configure Normal GRE Tunnel"
   prompt_role || return
@@ -1991,6 +2041,10 @@ gre_menu_config_tunnel() {
   selected_role="$ROLE"
   echo
   prompt_tunnel_id "Enter GRE tunnel number before IP [1-254]: " || return
+  if (gre_load_config "$TUNNEL_ID"); then
+    tunnel_edit_public_ips gre "$TUNNEL_ID"
+    return $?
+  fi
   transparent_guard "$(gre_iface "$TUNNEL_ID")" || return 1
 
   existing_local_ip=""
@@ -2481,6 +2535,10 @@ greplus_menu_config_tunnel() {
   prompt_role || return
   local selected_role="$ROLE" existing_local="" existing_remote=""
   prompt_tunnel_id "Enter GRE Plus tunnel number [1-254]: " || return
+  if (greplus_load_config "$TUNNEL_ID"); then
+    tunnel_edit_public_ips greplus "$TUNNEL_ID"
+    return $?
+  fi
   transparent_guard "$(greplus_iface "$TUNNEL_ID")" || return 1
   if greplus_load_config "$TUNNEL_ID"; then
     existing_local="${LOCAL_PUBLIC_IP:-}"; existing_remote="${REMOTE_PUBLIC_IP:-}"
@@ -6045,7 +6103,7 @@ haproxy_run_action() {
 }
 
 # Pinned to the helper shipped with this manager; mutable upstream cannot mix versions.
-TRANSPARENT_SHA256="e568763432828fd0cb42aec2b8317db3e4b2ee8a69c3e195d18e27bad7613474"
+TRANSPARENT_SHA256="c897a0afbc0d57df4cb1804717c992d9d33609fcabf369e3882b6ad92553182f"
 transparent_install_module() {
   local target=/usr/local/lib/gretun/transparent_forward.py candidate tmp
   if [ -f "$target" ] && [ "$(sha256sum "$target" | awk '{print $1}')" = "$TRANSPARENT_SHA256" ]; then
