@@ -47,7 +47,7 @@ set -euo pipefail
 # - HAProxy fix: preserve an existing global maxconn, use the known-working defaults,
 #   and stop changing system limits or restarting HAProxy simply by opening its menu.
 
-APP_VERSION="12.0.6"
+APP_VERSION="12.6.0"
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -574,7 +574,8 @@ ensure_feature_dependencies() {
 # a complete regular-file copy instead; for normal file execution copy locally.
 install_manager_binary() {
   local source_path="${BASH_SOURCE[0]:-$0}"
-  local target_dir tmp
+  local target_dir tmp candidate_version
+  if [ "${MANAGER_INSTALLED_THIS_SESSION:-0}" = 1 ] && [ -s "$INSTALL_BIN" ]; then return 0; fi
   target_dir="$(dirname "$INSTALL_BIN")"
   tmp="${INSTALL_BIN}.tmp.$$"
 
@@ -584,9 +585,9 @@ install_manager_binary() {
   case "$source_path" in
     /dev/fd/*|/proc/*/fd/*)
       if command -v curl >/dev/null 2>&1; then
-        curl -fLsS --ipv4 "$SELF_RAW_URL" -o "$tmp" || { rm -f "$tmp"; return 1; }
+        curl -fLsS --ipv4 --connect-timeout 10 --max-time 45 "$SELF_RAW_URL" -o "$tmp" || { rm -f "$tmp"; return 1; }
       elif command -v wget >/dev/null 2>&1; then
-        wget -qO "$tmp" "$SELF_RAW_URL" || { rm -f "$tmp"; return 1; }
+        wget -q --timeout=15 --tries=2 -O "$tmp" "$SELF_RAW_URL" || { rm -f "$tmp"; return 1; }
       else
         return 1
       fi
@@ -598,9 +599,17 @@ install_manager_binary() {
   esac
 
   [ -s "$tmp" ] || { rm -f "$tmp"; return 1; }
+  candidate_version="$(sed -n 's/^APP_VERSION="\([^"]*\)"/\1/p' "$tmp" | head -n1)"
+  if [ "$candidate_version" != "$APP_VERSION" ]; then
+    rm -f "$tmp"
+    err_msg "Manager version mismatch: running $APP_VERSION, downloaded ${candidate_version:-unknown}. Upload the matching GRETUN.sh, or run this downloaded file directly." >&2
+    return 1
+  fi
+  if [ -f "$INSTALL_BIN" ] && cmp -s "$tmp" "$INSTALL_BIN"; then rm -f "$tmp"; MANAGER_INSTALLED_THIS_SESSION=1; return 0; fi
   bash -n "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; return 1; }
   chmod 755 "$tmp" || { rm -f "$tmp"; return 1; }
-  mv -f "$tmp" "$INSTALL_BIN"
+  mv -f "$tmp" "$INSTALL_BIN" || return 1
+  MANAGER_INSTALLED_THIS_SESSION=1
 }
 
 # -----------------------------
@@ -1551,6 +1560,8 @@ gre_create_tunnel() {
       fi
     fi
   fi
+  transparent_repair_routes "$TUN_IFACE" || return 1
+
 }
 
 gre_menu_config_tunnel() {
@@ -1560,6 +1571,7 @@ gre_menu_config_tunnel() {
   selected_role="$ROLE"
   echo
   prompt_tunnel_id "Enter GRE tunnel number before IP [1-254]: " || return
+  transparent_guard "$(gre_iface "$TUNNEL_ID")" || return 1
 
   existing_local_ip=""
   existing_remote_ip=""
@@ -1649,15 +1661,15 @@ gre_status_check() {
 
 gre_remove_one_tunnel() {
   local id="$1"
+  remove_transport_dependency_check gre "$id" || return 1
+  transparent_remove_interface "$(gre_iface "$id")" || return 1
   local ifc file
   ifc="$(gre_iface "$id")"
   file="$(gre_config_file "$id")"
 
   echo "Removing GRE tunnel $id ($ifc)..."
 
-  if command -v systemctl >/dev/null 2>&1; then
-    systemctl disable --now "$(gre_service_name "$id")" 2>/dev/null || true
-  fi
+  stop_tunnel_for_remove "$(gre_service_name "$id")" || return 1
 
   ip link set dev "$ifc" down 2>/dev/null || true
   if ip tunnel del "$ifc" 2>/dev/null; then
@@ -1668,6 +1680,7 @@ gre_remove_one_tunnel() {
     echo "- $ifc was not found or could not be removed automatically."
   fi
 
+  verify_interface_removed "$ifc" || return 1
   rm -f "$file"
   if [ "$id" = "1" ]; then
     rm -f "$GRE_LEGACY_CONF_FILE"
@@ -1943,6 +1956,8 @@ greplus_create_tunnel() {
   echo "Local/remote inner IP: $LOCAL_GREPLUS_IP -> $REMOTE_GREPLUS_IP"
   echo "MTU / TX queue / qdisc: $GREPLUS_MTU / $GREPLUS_TXQUEUELEN / fq"
   echo "GRE key: $GREPLUS_TUN_KEY (separate namespace; this is not encryption)"
+  transparent_repair_routes "$ifc" || return 1
+
 }
 
 greplus_write_service_template() {
@@ -2047,6 +2062,7 @@ greplus_menu_config_tunnel() {
   prompt_role || return
   local selected_role="$ROLE" existing_local="" existing_remote=""
   prompt_tunnel_id "Enter GRE Plus tunnel number [1-254]: " || return
+  transparent_guard "$(greplus_iface "$TUNNEL_ID")" || return 1
   if greplus_load_config "$TUNNEL_ID"; then
     existing_local="${LOCAL_PUBLIC_IP:-}"; existing_remote="${REMOTE_PUBLIC_IP:-}"
   fi
@@ -2074,11 +2090,14 @@ greplus_list_tunnels() {
 
 greplus_remove_one_tunnel() {
   local id="$1" ifc
+  remove_transport_dependency_check greplus "$id" || return 1
+  transparent_remove_interface "$(greplus_iface "$id")" || return 1
   ifc="$(greplus_iface "$id")"
-  systemctl disable --now "$(greplus_service_name "$id")" >/dev/null 2>&1 || true
+  stop_tunnel_for_remove "$(greplus_service_name "$id")" || return 1
   greplus_remove_firewall "$id" || true
   ip link set "$ifc" down 2>/dev/null || true
   ip tunnel del "$ifc" 2>/dev/null || ip link delete "$ifc" 2>/dev/null || true
+  verify_interface_removed "$ifc" || return 1
   rm -f "$(greplus_config_file "$id")"
   systemctl daemon-reload >/dev/null 2>&1 || true
   ok_msg "GRE Plus tunnel $id removed."
@@ -2382,6 +2401,7 @@ wg_list_tunnels() {
 }
 
 wg_write_config() {
+  transparent_guard "$(wg_iface_name "$1")" || return 1
   local id="$1" temporary
   local private_file conf allowed_ips private_key endpoint_ip endpoint_mode_note mtu_value endpoint_line=""
   private_file="$(wg_private_key_file "$id")"
@@ -2802,6 +2822,7 @@ wg_menu_config_tunnel() {
   selected_role="$ROLE"
   echo
   prompt_tunnel_id "Enter WireGuard tunnel number before IP [1-254]: " || return
+  transparent_guard "$(wg_iface_name "$TUNNEL_ID")" || return 1
 
   existing_local_ip=""
   existing_remote_ip=""
@@ -3340,6 +3361,7 @@ wg_remove_firewall_rules() {
 
 wg_remove_one_tunnel() {
   local id="$1"
+  transparent_remove_interface "$(wg_iface_name "$id")" || return 1
   local ifc conf meta private public endpoint_mode=""
   ifc="$(wg_iface_name "$id")"
   conf="$(wg_config_file "$id")"
@@ -3350,18 +3372,18 @@ wg_remove_one_tunnel() {
 
   echo "Removing WireGuard tunnel $id ($ifc)..."
 
-  if command -v systemctl >/dev/null 2>&1; then
-    systemctl disable --now "$(wg_service_name "$id")" 2>/dev/null || true
-  fi
+  stop_tunnel_for_remove "$(wg_service_name "$id")" || return 1
 
   # Safe cleanup only for this WireGuard tunnel. Do not touch the main route table.
   wg_safe_cleanup_runtime "$id" >/dev/null 2>&1 || true
+  verify_interface_removed "$ifc" || return 1
   wg_remove_firewall_rules "$id"
   if [ -f "$(wss_config_file "$id")" ]; then
     wss_remove_one "$id"
   fi
 
-  rm -rf "/etc/systemd/system/wg-quick@$ifc.service.d"
+  rm -f "/etc/systemd/system/wg-quick@$ifc.service.d/10-gretun-firewall.conf"
+  rmdir "/etc/systemd/system/wg-quick@$ifc.service.d" 2>/dev/null || true
   rm -f "$conf" "$meta" "$private" "$public"
   echo "- Config removed: $conf"
   echo "- Metadata removed: $meta"
@@ -3792,23 +3814,9 @@ remove_tun() {
   if is_main_menu_token "$selected"; then return_main_msg; return 99; fi
 
   if [ "$selected" = "88" ]; then
-    echo
-    echo -e "${C_RED}${C_BOLD}WARNING:${C_RESET} this will remove ALL managed GRE, GRE Plus, and WireGuard tunnels."
-    if ! confirm_yes "Are you sure?"; then
-      echo "Cancelled."
-      return
-    fi
-
-    local ids id
-    # Remove WireGuard first because it may depend on GRE or GRE Plus.
-    ids="$(wg_collect_ids || true)"
-    while IFS= read -r id; do [ -n "$id" ] && wg_remove_one_tunnel "$id"; done <<< "$ids"
-    ids="$(greplus_collect_ids || true)"
-    while IFS= read -r id; do [ -n "$id" ] && greplus_remove_one_tunnel "$id"; done <<< "$ids"
-    ids="$(gre_collect_ids || true)"
-    while IFS= read -r id; do [ -n "$id" ] && gre_remove_one_tunnel "$id"; done <<< "$ids"
-    ok_msg "All tunnels removed."
-    return
+    selected=""
+    for ((idx=1; idx<=${#INV_TYPE[@]}; idx++)); do selected+="$idx "; done
+    echo "All managed tunnels selected."
   fi
 
   normalized="$(printf '%s' "$selected" | tr ',' ' ')"
@@ -3826,6 +3834,7 @@ remove_tun() {
       err_msg "Tunnel row number out of range: $token"
       return
     fi
+    token="$((10#$token))"
     # de-duplicate while preserving user's order.
     if [[ "$seen" != *" $token "* ]]; then
       SELECTED_INDEXES+=("$token")
@@ -3860,6 +3869,7 @@ remove_tun() {
   fi
 
   # Remove in dependency-safe order: WireGuard before its GRE transport.
+  local remove_failed=0
   for phase in wireguard greplus gre; do
     for idx in "${SELECTED_INDEXES[@]}"; do
       i=$((idx - 1))
@@ -3867,12 +3877,16 @@ remove_tun() {
         echo
         echo -e "${C_CYAN}Removing row $idx: ${INV_TYPE[$i]} ${INV_ID[$i]} (${INV_IFACE[$i]})${C_RESET}"
         if ! remove_inventory_item "$idx"; then
+          remove_failed=$((remove_failed + 1))
           warn_msg "Could not fully remove row $idx (${INV_TYPE[$i]} ${INV_ID[$i]}). Continue with the next selected tunnel."
         fi
       fi
     done
   done
 
+  if [ "$remove_failed" -gt 0 ]; then
+    err_msg "Removal incomplete: $remove_failed tunnel(s) failed. Saved configs were retained where possible."; return 1
+  fi
   heal_remaining_tunnels_after_remove || true
   ok_msg "Selected tunnel removal finished."
 }
@@ -4242,6 +4256,7 @@ test_tunnels_menu() {
 
 
 reset_all_tunnels() {
+  transparent_reset_check || return 1
   show_header "Reset All Tunnels"
   echo "This will restart/recreate all saved normal GRE, GRE Plus, and WireGuard tunnels from their saved configs."
   echo "It will also re-enable their systemd services for boot."
@@ -4251,6 +4266,8 @@ reset_all_tunnels() {
     return
   fi
 
+  reset_saved_configs_check || return 1
+  install_manager_binary || return 1
   diagnostic_event "MANUAL" "manager" "manual reset-all started by operator"
 
   echo
@@ -4294,6 +4311,8 @@ reset_all_tunnels() {
       else
         failed=$((failed + 1)); echo "[WARN] GRE tunnel $id reset failed"
       fi
+    else
+      failed=$((failed + 1)); echo "[WARN] GRE tunnel $id config could not be loaded"
     fi
   done <<< "$ids"
 
@@ -4308,6 +4327,8 @@ reset_all_tunnels() {
       else
         failed=$((failed + 1)); echo "[WARN] GRE Plus tunnel $id reset failed"
       fi
+    else
+      failed=$((failed + 1)); echo "[WARN] GRE Plus tunnel $id config could not be loaded"
     fi
   done <<< "$ids"
 
@@ -4316,11 +4337,14 @@ reset_all_tunnels() {
   ids="$(wg_collect_ids || true)"
   while IFS= read -r id; do
     [ -n "$id" ] || continue
-    if wg_load_meta "$id" && [ -z "${REMOTE_WG_PUBLIC_KEY:-}" ]; then
+    if ! wg_load_meta "$id"; then
+      failed=$((failed + 1)); echo "[WARN] WireGuard tunnel $id metadata could not be loaded"; continue
+    fi
+    if [ -z "${REMOTE_WG_PUBLIC_KEY:-}" ]; then
       echo "[SKIP] WireGuard tunnel $id is pending peer key"
       continue
     fi
-    if wg_restart_one_tunnel "$id"; then
+    if wg_reset_saved_tunnel "$id"; then
       echo "[OK] WireGuard tunnel $id reset"
     else
       failed=$((failed + 1)); echo "[WARN] WireGuard tunnel $id reset failed"
@@ -4328,6 +4352,9 @@ reset_all_tunnels() {
   done <<< "$ids"
 
   echo
+  if ! transparent_reset_restore; then
+    failed=$((failed + 1)); err_msg "Transparent route restore failed; inspect the error above."
+  fi
   if [ "$failed" -gt 0 ]; then err_msg "Reset completed with $failed tunnel failure(s)."; return 1; fi
   echo "[OK] Reset all finished."
   diagnostic_event "MANUAL" "manager" "manual reset-all finished"
@@ -5055,6 +5082,7 @@ haproxy_open_firewall_tcp() {
 }
 
 haproxy_validate_and_restart() {
+  transparent_guard haproxy || return 1
   local tmp="$1" backup=""
   # Validate quietly first so HAProxy NOTICE/WARNING lines do not confuse the menu output.
   # If validation fails, run it again without -q to print the real error.
@@ -5093,6 +5121,7 @@ haproxy_validate_and_restart() {
 }
 
 haproxy_write_entries_file() {
+  transparent_guard haproxy || return 1
   local entries_file="$1"
   local tmp proto
   tmp="$(mktemp)"
@@ -5668,6 +5697,151 @@ performance_menu() {
   done
 }
 
+stop_tunnel_for_remove() {
+  local svc="$1"
+  if command -v systemctl >/dev/null 2>&1; then
+    if ! systemctl disable --now "$svc"; then
+      if systemctl is-active --quiet "$svc"; then
+        err_msg "Service $svc is still active; its tunnel config was retained."; return 1
+      fi
+    fi
+  fi
+}
+
+verify_interface_removed() {
+  if ip link show dev "$1" >/dev/null 2>&1; then
+    err_msg "Interface $1 still exists; its saved config was retained."; return 1
+  fi
+}
+
+remove_transport_dependency_check() {
+  local kind="$1" id="$2" wg_id
+  while IFS= read -r wg_id; do
+    [ -n "$wg_id" ] || continue
+    if wg_uses_transport_tunnel "$wg_id" "$kind" "$id"; then
+      err_msg "Cannot remove $kind $id: WireGuard $wg_id still depends on it. Remove its row first or select both rows."; return 1
+    fi
+  done < <(wg_collect_ids)
+}
+
+transparent_remove_interface() {
+  local module iface="$1"
+  compgen -G '/etc/gretun-transparent/profile-*.json' >/dev/null || return 0
+  module="$(transparent_module_path)" || return 1
+  python3 "$module" remove-interface "$iface"
+}
+
+wg_reset_saved_tunnel() {
+  local id="$1" ifc svc conf
+  ifc="$(wg_iface_name "$id")"; svc="$(wg_service_name "$id")"; conf="$(wg_config_file "$id")"
+  [ -s "$conf" ] || { err_msg "Missing saved WireGuard config: $conf"; return 1; }
+  wg_ensure_tools || return 1
+  wg_ensure_transport_ready "$id" || return 1
+  wg_apply_firewall_rules "$id" || return 1
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl enable "$svc" || return 1
+    systemctl restart "$svc" || { wg_print_service_failure "$id"; return 1; }
+  else
+    wg-quick up "$ifc" || return 1
+  fi
+  transparent_repair_routes "$ifc" || return 1
+  ip link show dev "$ifc" >/dev/null 2>&1
+}
+
+transparent_reset_check() {
+  local module
+  compgen -G '/etc/gretun-transparent/profile-*.json' >/dev/null || return 0
+  module="$(transparent_module_path)" || return 1
+  python3 "$module" reset-check
+}
+
+transparent_reset_restore() {
+  local module
+  compgen -G '/etc/gretun-transparent/profile-*.json' >/dev/null || return 0
+  module="$(transparent_module_path)" || return 1
+  python3 "$module" restore
+}
+
+reset_saved_configs_check() (
+  local id
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    gre_load_config "$id" || { err_msg "Cannot load GRE config $id; nothing stopped."; return 1; }
+  done < <(gre_collect_ids)
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    greplus_load_config "$id" || { err_msg "Cannot load GRE Plus config $id; nothing stopped."; return 1; }
+  done < <(greplus_collect_ids)
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    wg_load_meta "$id" || { err_msg "Cannot load WireGuard metadata $id; nothing stopped."; return 1; }
+    if [ -n "${REMOTE_WG_PUBLIC_KEY:-}" ] && [ ! -s "$(wg_config_file "$id")" ]; then
+      err_msg "Missing saved WireGuard config $id; nothing stopped."; return 1
+    fi
+  done < <(wg_collect_ids)
+)
+
+TRANSPARENT_SHA256="585f575af826c2ccbef335f94f1c9ba72e19175754ab92f1d9942472dd6b0928"
+# Embedded fallback keeps one-file curl installs in sync with their helper.
+transparent_embedded_to_file() {
+  python3 -c "import base64,gzip,pathlib,sys; pathlib.Path(sys.argv[1]).write_bytes(gzip.decompress(base64.b64decode('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')))" "$1"
+}
+
+transparent_install_module() {
+  local target=/usr/local/lib/gretun/transparent_forward.py candidate tmp
+  if [ -f "$target" ] && [ "$(sha256sum "$target" | awk '{print $1}')" = "$TRANSPARENT_SHA256" ]; then
+    printf '%s' "$target"; return 0
+  fi
+  mkdir -p /usr/local/lib/gretun || return 1
+  tmp="$(mktemp /usr/local/lib/gretun/.transparent.XXXXXXXX)" || return 1
+  candidate="$(dirname -- "${BASH_SOURCE[0]}")/transparent_forward.py"
+  if [ -f "$candidate" ] && [ "$(sha256sum "$candidate" | awk '{print $1}')" = "$TRANSPARENT_SHA256" ]; then
+    cp -- "$candidate" "$tmp" || { rm -f "$tmp"; return 1; }
+  elif transparent_embedded_to_file "$tmp"; then
+    :
+  elif command -v curl >/dev/null 2>&1; then
+    curl -fLsS --ipv4 --connect-timeout 10 --max-time 45 "${SELF_RAW_URL%/*}/transparent_forward.py" -o "$tmp" || { rm -f "$tmp"; return 1; }
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q --timeout=15 --tries=2 -O "$tmp" "${SELF_RAW_URL%/*}/transparent_forward.py" || { rm -f "$tmp"; return 1; }
+  else
+    rm -f "$tmp"; err_msg "curl or wget is required to install transparent forwarding." >&2; return 1
+  fi
+  if [ "$(sha256sum "$tmp" | awk '{print $1}')" != "$TRANSPARENT_SHA256" ]; then
+    rm -f "$tmp"; err_msg "Helper checksum mismatch. Upload matching GRETUN.sh and transparent_forward.py from the same release." >&2; return 1
+  fi
+  python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 755 "$tmp" && mv -f -- "$tmp" "$target" || { rm -f "$tmp"; return 1; }
+  printf '%s' "$target"
+}
+
+transparent_module_path() {
+  # Never return an arbitrary old adjacent or installed helper.
+  transparent_install_module
+}
+
+transparent_guard() {
+  local scope="${1:-all}" module
+  compgen -G '/etc/gretun-transparent/profile-*.json' >/dev/null || return 0
+  module="$(transparent_module_path)" || return 1
+  python3 "$module" guard "$scope"
+}
+
+transparent_repair_routes() {
+  local iface="$1" module
+  compgen -G '/etc/gretun-transparent/profile-*.json' >/dev/null || return 0
+  module="$(transparent_module_path)" || return 1
+  python3 "$module" restore "$iface"
+}
+
+transparent_menu() {
+  local module
+  ensure_feature_dependencies "transparent-forward" "python3:python3" "ip:iproute2" "ss:iproute2" "iptables:iptables" "iptables-save:iptables" "conntrack:conntrack" "sha256sum:coreutils" || return 1
+  module="$(transparent_install_module)" || return 1
+  install_manager_binary || return 1
+  python3 "$module" auto
+}
+
+
 show_menu() {
   show_header "GRE + GRE Plus + WireGuard Management v${APP_VERSION}"
   echo -e "${C_BOLD}${C_WHITE}Main Menu${C_RESET}"
@@ -5682,7 +5856,8 @@ show_menu() {
   echo -e "  ${C_DIM}00) Main menu / back${C_RESET}"
   echo -e "  ${C_DIM}0) Exit${C_RESET}"
   echo
-  read -rp "Choose an option [0-8]: " CHOICE
+  echo "  9) Transparent client IP: ON / OFF (Iran / Outside)"
+  read -rp "Choose an option [0-9]: " CHOICE
   case "$CHOICE" in
     1) if run_maintenance_action menu_config_tunnel; then pause; fi ;;
     2) if run_maintenance_action remove_tun; then pause; fi ;;
@@ -5692,6 +5867,7 @@ show_menu() {
     6) haproxy_menu || true ;;
     7) diagnostics_menu || true ;;
     8) performance_menu || true ;;
+    9) transparent_menu || true ;;
     00) return_main_msg ;;
     0) echo "Bye"; exit 0 ;;
     *) err_msg "Invalid option"; sleep 1 ;;
@@ -5699,6 +5875,9 @@ show_menu() {
 }
 
 ### Script entry
+if [[ "${1:-}" == "--version" ]]; then printf "%s\n" "$APP_VERSION"; exit 0; fi
+if [[ "${1:-}" == "--install" ]]; then ensure_root; install_manager_binary; exit $?; fi
+if [[ "${1:-}" == "--transparent" ]]; then ensure_root; transparent_menu; exit $?; fi
 if [[ "${1:-}" == "--fix-wg-port" ]]; then
   ensure_root
   run_maintenance_action wg_fix_peer_port "${2:-}" "${3:-}"
