@@ -19,6 +19,7 @@ for asset in backpack_linux_amd64.tar.gz backpack_linux_arm64.tar.gz; do
 done
 install -m 0755 "$package_dir/GRETUN.sh" /usr/local/bin/gretun-manager.sh.new
 mv -f /usr/local/bin/gretun-manager.sh.new /usr/local/bin/gretun-manager.sh
+echo "Installed GRE-TUN $(sed -n 's/^APP_VERSION="\([^"]*\)"/\1/p' "$package_dir/GRETUN.sh")"
 echo 'Installed. Running tunnels and their configurations were not restarted or replaced.'
 echo 'Next time, open instantly from the installed local file:'
 echo 'sudo bash /usr/local/bin/gretun-manager.sh'

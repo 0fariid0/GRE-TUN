@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + GRE Plus + WireGuard + HAProxy tunnel manager v12.5.4
+# GRE + GRE Plus + WireGuard + HAProxy tunnel manager v12.5.5
 # v12.2.0: optional transparent TCP module with trial, connection-aware return routes and drain.
 # v12.1.1: Kharej generates the token; Iran pastes it visibly. Existing tokens preserved.
 # v12.1.0: deferred startup repairs, optional BackPack L3 adapter (ports=[]).
@@ -51,7 +51,7 @@ set -euo pipefail
 # - HAProxy fix: preserve an existing global maxconn, use the known-working defaults,
 #   and stop changing system limits or restarting HAProxy simply by opening its menu.
 
-APP_VERSION="12.5.4"
+APP_VERSION="12.5.5"
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -581,7 +581,8 @@ ensure_feature_dependencies() {
 # a complete regular-file copy instead; for normal file execution copy locally.
 install_manager_binary() {
   local source_path="${BASH_SOURCE[0]:-$0}"
-  local target_dir tmp
+  local target_dir tmp candidate_version
+  if [ "${MANAGER_INSTALLED_THIS_SESSION:-0}" = 1 ] && [ -s "$INSTALL_BIN" ]; then return 0; fi
   target_dir="$(dirname "$INSTALL_BIN")"
   tmp="${INSTALL_BIN}.tmp.$$"
 
@@ -605,10 +606,17 @@ install_manager_binary() {
   esac
 
   [ -s "$tmp" ] || { rm -f "$tmp"; return 1; }
-  if [ -f "$INSTALL_BIN" ] && cmp -s "$tmp" "$INSTALL_BIN"; then rm -f "$tmp"; return 0; fi
+  candidate_version="$(sed -n 's/^APP_VERSION="\([^"]*\)"/\1/p' "$tmp" | head -n1)"
+  if [ "$candidate_version" != "$APP_VERSION" ]; then
+    rm -f "$tmp"
+    err_msg "Manager version mismatch: running $APP_VERSION, downloaded ${candidate_version:-unknown}. Publish matching release files, or run install-local.sh from the full ZIP." >&2
+    return 1
+  fi
+  if [ -f "$INSTALL_BIN" ] && cmp -s "$tmp" "$INSTALL_BIN"; then rm -f "$tmp"; MANAGER_INSTALLED_THIS_SESSION=1; return 0; fi
   bash -n "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; return 1; }
   chmod 755 "$tmp" || { rm -f "$tmp"; return 1; }
-  mv -f "$tmp" "$INSTALL_BIN"
+  mv -f "$tmp" "$INSTALL_BIN" || return 1
+  MANAGER_INSTALLED_THIS_SESSION=1
 }
 
 # -----------------------------
@@ -1922,7 +1930,8 @@ gre_create_tunnel() {
   fi
 
   apply_tunnel_sysctls
-  ensure_public_endpoint_route "$REMOTE_PUBLIC_IP" "$LOCAL_PUBLIC_IP"
+  ensure_public_endpoint_route "$REMOTE_PUBLIC_IP" "$LOCAL_PUBLIC_IP" || return 1
+  if [ "$interactive" -eq 1 ]; then install_manager_binary || return 1; fi
   modprobe gre || true
   modprobe ip_gre || true
 
@@ -1979,6 +1988,7 @@ gre_create_tunnel() {
         echo "GRE persistence enabled for $(gre_service_name "$TUNNEL_ID")."
       else
         echo "Failed to enable GRE persistence. Tunnel is currently created, but it may not survive reboot." >&2
+        return 1
       fi
     fi
   fi
@@ -2010,6 +2020,7 @@ tunnel_edit_public_ips() {
       module="$(transparent_module_path)" || return 1
       python3 "$module" reset-check "$iface" || return 1
     fi
+    install_manager_binary || return 1
     backup="$(mktemp)" || return 1
     if [ -f "$config" ]; then cp -p "$config" "$backup" || { rm -f "$backup"; return 1; }
     else
@@ -2133,18 +2144,51 @@ gre_status_check() {
   done <<< "$ids"
 }
 
+remove_transport_dependency_check() {
+  local kind="$1" id="$2" wg_id
+  while IFS= read -r wg_id; do
+    [ -n "$wg_id" ] || continue
+    if wg_uses_transport_tunnel "$wg_id" "$kind" "$id"; then
+      err_msg "Cannot remove $kind $id: WireGuard $wg_id still depends on it. Remove its row first or select both rows."; return 1
+    fi
+  done < <(wg_collect_ids)
+}
+
+stop_tunnel_for_remove() {
+  local svc="$1"
+  if command -v systemctl >/dev/null 2>&1; then
+    if ! systemctl disable --now "$svc"; then
+      if systemctl is-active --quiet "$svc"; then
+        err_msg "Service $svc is still active; its tunnel config was retained."; return 1
+      fi
+    fi
+  fi
+}
+
+verify_interface_removed() {
+  if ip link show dev "$1" >/dev/null 2>&1; then
+    err_msg "Interface $1 still exists; its saved config was retained."; return 1
+  fi
+}
+
+transparent_remove_interface() {
+  local module iface="$1"
+  compgen -G '/etc/gretun-transparent/profile-*.json' >/dev/null || return 0
+  module="$(transparent_module_path)" || return 1
+  python3 "$module" remove-interface "$iface"
+}
+
 gre_remove_one_tunnel() {
   local id="$1"
-  transparent_guard "$(gre_iface "$id")" || return 1
+  remove_transport_dependency_check gre "$id" || return 1
+  transparent_remove_interface "$(gre_iface "$id")" || return 1
   local ifc file
   ifc="$(gre_iface "$id")"
   file="$(gre_config_file "$id")"
 
   echo "Removing GRE tunnel $id ($ifc)..."
 
-  if command -v systemctl >/dev/null 2>&1; then
-    systemctl disable --now "$(gre_service_name "$id")" 2>/dev/null || true
-  fi
+  stop_tunnel_for_remove "$(gre_service_name "$id")" || return 1
 
   ip link set dev "$ifc" down 2>/dev/null || true
   if ip tunnel del "$ifc" 2>/dev/null; then
@@ -2155,6 +2199,7 @@ gre_remove_one_tunnel() {
     echo "- $ifc was not found or could not be removed automatically."
   fi
 
+  verify_interface_removed "$ifc" || return 1
   rm -f "$file"
   if [ "$id" = "1" ]; then
     rm -f "$GRE_LEGACY_CONF_FILE"
@@ -2410,7 +2455,8 @@ greplus_create_tunnel() {
   GREPLUS_MTU="$(greplus_detect_mtu "$REMOTE_PUBLIC_IP")"
   GREPLUS_TXQUEUELEN="${GREPLUS_TXQUEUELEN:-$GREPLUS_DEFAULT_TXQUEUELEN}"
   apply_tunnel_sysctls
-  ensure_public_endpoint_route "$REMOTE_PUBLIC_IP" "$LOCAL_PUBLIC_IP"
+  ensure_public_endpoint_route "$REMOTE_PUBLIC_IP" "$LOCAL_PUBLIC_IP" || return 1
+  if [ "$interactive" -eq 1 ]; then install_manager_binary || return 1; fi
   modprobe gre >/dev/null 2>&1 || true
   modprobe ip_gre >/dev/null 2>&1 || true
   ip link set "$ifc" down 2>/dev/null || true
@@ -2567,12 +2613,14 @@ greplus_list_tunnels() {
 
 greplus_remove_one_tunnel() {
   local id="$1" ifc
-  transparent_guard "$(greplus_iface "$id")" || return 1
+  remove_transport_dependency_check greplus "$id" || return 1
+  transparent_remove_interface "$(greplus_iface "$id")" || return 1
   ifc="$(greplus_iface "$id")"
-  systemctl disable --now "$(greplus_service_name "$id")" >/dev/null 2>&1 || true
+  stop_tunnel_for_remove "$(greplus_service_name "$id")" || return 1
   greplus_remove_firewall "$id" || true
   ip link set "$ifc" down 2>/dev/null || true
   ip tunnel del "$ifc" 2>/dev/null || ip link delete "$ifc" 2>/dev/null || true
+  verify_interface_removed "$ifc" || return 1
   rm -f "$(greplus_config_file "$id")"
   systemctl daemon-reload >/dev/null 2>&1 || true
   ok_msg "GRE Plus tunnel $id removed."
@@ -3836,7 +3884,7 @@ wg_remove_firewall_rules() {
 
 wg_remove_one_tunnel() {
   local id="$1"
-  transparent_guard "$(wg_iface_name "$id")" || return 1
+  transparent_remove_interface "$(wg_iface_name "$id")" || return 1
   local ifc conf meta private public endpoint_mode=""
   ifc="$(wg_iface_name "$id")"
   conf="$(wg_config_file "$id")"
@@ -3847,18 +3895,18 @@ wg_remove_one_tunnel() {
 
   echo "Removing WireGuard tunnel $id ($ifc)..."
 
-  if command -v systemctl >/dev/null 2>&1; then
-    systemctl disable --now "$(wg_service_name "$id")" 2>/dev/null || true
-  fi
+  stop_tunnel_for_remove "$(wg_service_name "$id")" || return 1
 
   # Safe cleanup only for this WireGuard tunnel. Do not touch the main route table.
   wg_safe_cleanup_runtime "$id" >/dev/null 2>&1 || true
+  verify_interface_removed "$ifc" || return 1
   wg_remove_firewall_rules "$id"
   if [ -f "$(wss_config_file "$id")" ]; then
     wss_remove_one "$id"
   fi
 
-  rm -rf "/etc/systemd/system/wg-quick@$ifc.service.d"
+  rm -f "/etc/systemd/system/wg-quick@$ifc.service.d/10-gretun-firewall.conf"
+  rmdir "/etc/systemd/system/wg-quick@$ifc.service.d" 2>/dev/null || true
   rm -f "$conf" "$meta" "$private" "$public"
   echo "- Config removed: $conf"
   echo "- Metadata removed: $meta"
@@ -4294,30 +4342,9 @@ remove_tun() {
   if is_main_menu_token "$selected"; then return_main_msg; return 99; fi
 
   if [ "$selected" = "88" ]; then
-    echo
-    echo -e "${C_RED}${C_BOLD}WARNING:${C_RESET} this will remove ALL managed GRE, GRE Plus, and WireGuard tunnels."
-    if ! confirm_yes "Are you sure?"; then
-      echo "Cancelled."
-      return
-    fi
-
-    local ids id
-    # Remove WireGuard first because it may depend on GRE or GRE Plus.
-    ids="$(wg_collect_ids || true)"
-    while IFS= read -r id; do [ -n "$id" ] && wg_remove_one_tunnel "$id"; done <<< "$ids"
-    ids="$(greplus_collect_ids || true)"
-    while IFS= read -r id; do [ -n "$id" ] && greplus_remove_one_tunnel "$id"; done <<< "$ids"
-    ids="$(gre_collect_ids || true)"
-    while IFS= read -r id; do [ -n "$id" ] && gre_remove_one_tunnel "$id"; done <<< "$ids"
-    ids="$(bp_collect_ids || true)"
-    local bp_failed=0
-    while IFS= read -r id; do
-      [ -n "$id" ] || continue
-      bp_remove "$id" || bp_failed=$((bp_failed + 1))
-    done <<< "$ids"
-    if [ "$bp_failed" -gt 0 ]; then err_msg "Could not remove $bp_failed BackPack tunnel(s)."; return 1; fi
-    ok_msg "All tunnels removed."
-    return
+    selected=""
+    for ((idx=1; idx<=${#INV_TYPE[@]}; idx++)); do selected+="$idx "; done
+    echo "All managed tunnels selected (including BackPack)."
   fi
 
   normalized="$(printf '%s' "$selected" | tr ',' ' ')"
@@ -4335,6 +4362,7 @@ remove_tun() {
       err_msg "Tunnel row number out of range: $token"
       return
     fi
+    token="$((10#$token))"
     # de-duplicate while preserving user's order.
     if [[ "$seen" != *" $token "* ]]; then
       SELECTED_INDEXES+=("$token")
@@ -4369,6 +4397,7 @@ remove_tun() {
   fi
 
   # Remove in dependency-safe order: WireGuard before its GRE transport.
+  local remove_failed=0
   for phase in wireguard greplus gre backpack; do
     for idx in "${SELECTED_INDEXES[@]}"; do
       i=$((idx - 1))
@@ -4376,6 +4405,7 @@ remove_tun() {
         echo
         echo -e "${C_CYAN}Removing row $idx: ${INV_TYPE[$i]} ${INV_ID[$i]} (${INV_IFACE[$i]})${C_RESET}"
         if ! remove_inventory_item "$idx"; then
+          remove_failed=$((remove_failed + 1))
           warn_msg "Could not fully remove row $idx (${INV_TYPE[$i]} ${INV_ID[$i]}). Continue with the next selected tunnel."
         fi
       fi
@@ -4383,6 +4413,9 @@ remove_tun() {
   done
 
   heal_remaining_tunnels_after_remove || true
+  if [ "$remove_failed" -gt 0 ]; then
+    err_msg "Removal incomplete: $remove_failed tunnel(s) failed. Saved configs were retained where possible."; return 1
+  fi
   ok_msg "Selected tunnel removal finished."
 }
 
@@ -4821,6 +4854,7 @@ reset_all_tunnels() {
   fi
 
   reset_saved_configs_check || return 1
+  install_manager_binary || return 1
   diagnostic_event "MANUAL" "manager" "manual reset-all started by operator"
 
   echo
@@ -6103,7 +6137,7 @@ haproxy_run_action() {
 }
 
 # Pinned to the helper shipped with this manager; mutable upstream cannot mix versions.
-TRANSPARENT_SHA256="c897a0afbc0d57df4cb1804717c992d9d33609fcabf369e3882b6ad92553182f"
+TRANSPARENT_SHA256="b8db74417ab0192f16311d839ff794f3268130cc55f9bed801b2a7e8be04f903"
 transparent_install_module() {
   local target=/usr/local/lib/gretun/transparent_forward.py candidate tmp
   if [ -f "$target" ] && [ "$(sha256sum "$target" | awk '{print $1}')" = "$TRANSPARENT_SHA256" ]; then
@@ -6357,6 +6391,7 @@ show_menu() {
 }
 
 ### Script entry
+if [[ "${1:-}" == "--version" ]]; then printf '%s\n' "$APP_VERSION"; exit 0; fi
 if [[ "${1:-}" == "--transparent" ]]; then
   ensure_root
   transparent_menu

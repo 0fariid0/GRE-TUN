@@ -8,7 +8,7 @@ class Reset(unittest.TestCase):
             script=Path(d)/'test.sh'
             prefix=(ROOT/'GRETUN.sh').read_text().split('### Script entry')[0]
             stubs='''
-show_header(){ :; }; confirm_yes(){ return 0; }; diagnostic_event(){ :; }
+install_manager_binary(){ :; }; show_header(){ :; }; confirm_yes(){ return 0; }; diagnostic_event(){ :; }
 transparent_guard(){ echo BLOCKED; return 1; }
 transparent_reset_check(){ echo PREFLIGHT; }
 transparent_reset_restore(){ echo RESTORED; }

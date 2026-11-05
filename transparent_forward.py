@@ -22,7 +22,7 @@ import sys
 import tempfile
 import time
 
-VERSION = '12.5.4'
+VERSION = '12.5.5'
 STATE = Path('/etc/gretun-transparent')
 CONFIG = Path('/etc/haproxy/haproxy.cfg')
 MODULE = Path('/usr/local/lib/gretun/transparent_forward.py')
@@ -476,7 +476,8 @@ def restore_wg(r):
     if hashlib.sha256(path.read_bytes()).hexdigest()!=w['patched_hash']:
         raise Error('WireGuard file changed; backup retained, no overwrite attempted.')
     atomic(path,Path(w['backup']).read_bytes())
-    run('wg','set',r['plan']['iface'],'peer',w['key'],'allowed-ips',w['allowed'])
+    if run('ip','link','show','dev',r['plan']['iface'],check=False).returncode==0:
+        run('wg','set',r['plan']['iface'],'peer',w['key'],'allowed-ips',w['allowed'])
 
 def apply_network(r):
     p=r['plan']; check_interface(p,r['role'])
@@ -519,9 +520,9 @@ def remove_network(r):
         run('ip','-4','route','del','default','via',r['plan']['iran'],'dev',r['plan']['iface'],'table',table,check=False)
     restore_wg(r)
     if not any(x['plan']['id']!=r['plan']['id'] and x['plan']['iface']==r['plan']['iface'] for x in records()):
-        rp_path(r['plan']['iface']).write_text(r['original_rp'])
+        if rp_path(r['plan']['iface']).exists(): rp_path(r['plan']['iface']).write_text(r['original_rp'])
         original=r.get('original_accept_local',load(r['plan']['id']).get('original_accept_local'))
-        if original is not None: accept_local_path(r['plan']['iface']).write_text(original)
+        if original is not None and accept_local_path(r['plan']['iface']).exists(): accept_local_path(r['plan']['iface']).write_text(original)
 
 def persist():
     MODULE.parent.mkdir(parents=True,exist_ok=True)
@@ -701,6 +702,25 @@ def cleanup(identifier):
             run('systemctl','disable','--now',READY_UNIT)
             ready_path.unlink(); run('systemctl','daemon-reload')
     print('Profile removed after its connections drained. Backups retained under',STATE)
+
+def remove_interface(iface):
+    selected=[r for r in records() if r['plan']['iface']==iface]
+    # Validate all selected records before the first destructive operation.
+    for r in selected:
+        validate_plan(r['plan'])
+        if r['phase'] not in ('active','trial','ready','draining'):
+            raise Error('Recover incomplete Transparent profile before removing its tunnel: '+r['plan']['id'])
+    for r in selected:
+        identifier=r['plan']['id']
+        drain(identifier)
+        mark=hex(0x6d000000+(r['slot']<<16))+'/'+MASK
+        # Deleting a tunnel explicitly ends its flows. Never flush global conntrack.
+        result=run('conntrack','-D','-p','tcp','--mark',mark,check=False)
+        if result.returncode not in (0,1):
+            raise Error('Could not delete this profile connection entries; tunnel retained.')
+        cleanup(identifier)
+    print('Transparent profiles removed for interface:',iface)
+
 
 def status():
     for r in records():
@@ -1199,9 +1219,13 @@ def reset_check(iface=None):
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action',choices=['auto','serve-ready','menu','outside','iran','promote','drain','cleanup','status','restore','guard','reset-check'],nargs='?',default='menu')
+    parser.add_argument('action',choices=['auto','serve-ready','menu','outside','iran','promote','drain','cleanup','status','restore','guard','reset-check','remove-interface'],nargs='?',default='menu')
     parser.add_argument('value',nargs='?')
     args=parser.parse_args()
+    if args.action=='remove-interface':
+        if not args.value: raise Error('Interface is required.')
+        with locked(): remove_interface(args.value)
+        return 0
     if args.action=='reset-check':
         with locked(): reset_check(args.value)
         return 0

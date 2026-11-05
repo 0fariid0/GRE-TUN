@@ -11,7 +11,7 @@ gre_config_file(){ echo CFG; }; greplus_config_file(){ echo CFG; }
 gre_load_config(){ source CFG; TUNNEL_ID=3; }; greplus_load_config(){ gre_load_config "$@"; }
 prompt_local_tunnel_ip(){ echo LOCAL_DEFAULT=$1; LOCAL_PUBLIC_IP=NEWLOCAL; }
 prompt_remote_public_ip(){ echo REMOTE_DEFAULT=$1; REMOTE_PUBLIC_IP=NEWREMOTE; }
-transparent_repair_routes(){ echo RESTORE:$1; }
+install_manager_binary(){ :; }; transparent_repair_routes(){ echo RESTORE:$1; }
 transparent_guard(){ echo BAD_GUARD; return 1; }
 ok_msg(){ echo "$@"; }; warn_msg(){ echo "$@"; }
 gre_create_tunnel(){ echo APPLY:$1:$LOCAL_PUBLIC_IP:$REMOTE_PUBLIC_IP; if [ "$1" = 1 ]; then printf 'ROLE=%s\\nLOCAL_PUBLIC_IP=%s\\nREMOTE_PUBLIC_IP=%s\\n' "$ROLE" "$LOCAL_PUBLIC_IP" "$REMOTE_PUBLIC_IP" > CFG; FAIL; fi; }
