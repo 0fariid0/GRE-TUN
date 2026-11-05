@@ -1,11 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + GRE Plus + WireGuard + HAProxy tunnel manager v12.5.5
-# v12.2.0: optional transparent TCP module with trial, connection-aware return routes and drain.
-# v12.1.1: Kharej generates the token; Iran pastes it visibly. Existing tokens preserved.
-# v12.1.0: deferred startup repairs, optional BackPack L3 adapter (ports=[]).
-# Main menu and original forwarding workflow retained.
+# GRE + GRE Plus + WireGuard + HAProxy tunnel manager v12.0.6
 # - Normal GRE tunnels keep the old/current behavior and naming: greN + 10.10.N.x
 # - WireGuard tunnels use separate names/ranges/files: wgtunN + 10.20.N.x
 # - WireGuard can use public UDP or ride over an existing GRE / GRE Plus tunnel as transport
@@ -51,7 +47,7 @@ set -euo pipefail
 # - HAProxy fix: preserve an existing global maxconn, use the known-working defaults,
 #   and stop changing system limits or restarting HAProxy simply by opening its menu.
 
-APP_VERSION="12.5.5"
+APP_VERSION="12.0.6"
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -321,7 +317,6 @@ maintenance_is_active() {
 
 run_maintenance_action() {
   local rc
-  prepare_runtime_once || return 1
   maintenance_begin
   set +e
   "$@"
@@ -473,15 +468,13 @@ ask_tunnel_type() {
   echo "1) Normal GRE tunnel"
   echo "2) WireGuard tunnel (direct UDP or over same-number GRE / GRE Plus)"
   echo "3) GRE Plus (separate high-capacity GRE, no encryption)"
-  echo "4) BackPack L3 (private tunnel only; existing HAProxy forwarding)"
   echo
-  read -rp "Choose [1-4] (00=menu): " TUNNEL_TYPE_CHOICE
+  read -rp "Choose [1-3] (00=menu): " TUNNEL_TYPE_CHOICE
   if is_main_menu_token "$TUNNEL_TYPE_CHOICE"; then return_main_msg; return 99; fi
   case "$TUNNEL_TYPE_CHOICE" in
     1) SELECTED_TUNNEL_TYPE="gre" ;;
     2) SELECTED_TUNNEL_TYPE="wireguard" ;;
     3) SELECTED_TUNNEL_TYPE="greplus" ;;
-    4) SELECTED_TUNNEL_TYPE="backpack" ;;
     *) echo "Invalid tunnel type"; return 1 ;;
   esac
 }
@@ -549,13 +542,13 @@ ensure_feature_dependencies() {
   elif command -v dnf >/dev/null 2>&1; then
     packages=()
     for pkg in "${unique_packages[@]}"; do
-      case "$pkg" in iproute2) packages+=(iproute) ;; iputils-ping) packages+=(iputils) ;; conntrack) packages+=(conntrack-tools) ;; *) packages+=("$pkg") ;; esac
+      case "$pkg" in iproute2) packages+=(iproute) ;; iputils-ping) packages+=(iputils) ;; *) packages+=("$pkg") ;; esac
     done
     dnf install -y "${packages[@]}" || return 1
   elif command -v yum >/dev/null 2>&1; then
     packages=()
     for pkg in "${unique_packages[@]}"; do
-      case "$pkg" in iproute2) packages+=(iproute) ;; iputils-ping) packages+=(iputils) ;; conntrack) packages+=(conntrack-tools) ;; *) packages+=("$pkg") ;; esac
+      case "$pkg" in iproute2) packages+=(iproute) ;; iputils-ping) packages+=(iputils) ;; *) packages+=("$pkg") ;; esac
     done
     yum install -y "${packages[@]}" || return 1
   else
@@ -581,8 +574,7 @@ ensure_feature_dependencies() {
 # a complete regular-file copy instead; for normal file execution copy locally.
 install_manager_binary() {
   local source_path="${BASH_SOURCE[0]:-$0}"
-  local target_dir tmp candidate_version
-  if [ "${MANAGER_INSTALLED_THIS_SESSION:-0}" = 1 ] && [ -s "$INSTALL_BIN" ]; then return 0; fi
+  local target_dir tmp
   target_dir="$(dirname "$INSTALL_BIN")"
   tmp="${INSTALL_BIN}.tmp.$$"
 
@@ -592,9 +584,9 @@ install_manager_binary() {
   case "$source_path" in
     /dev/fd/*|/proc/*/fd/*)
       if command -v curl >/dev/null 2>&1; then
-        curl -fLsS --ipv4 --connect-timeout 10 --max-time 45 "$SELF_RAW_URL" -o "$tmp" || { rm -f "$tmp"; return 1; }
+        curl -fLsS --ipv4 "$SELF_RAW_URL" -o "$tmp" || { rm -f "$tmp"; return 1; }
       elif command -v wget >/dev/null 2>&1; then
-        wget -q --timeout=15 --tries=2 -O "$tmp" "$SELF_RAW_URL" || { rm -f "$tmp"; return 1; }
+        wget -qO "$tmp" "$SELF_RAW_URL" || { rm -f "$tmp"; return 1; }
       else
         return 1
       fi
@@ -606,17 +598,9 @@ install_manager_binary() {
   esac
 
   [ -s "$tmp" ] || { rm -f "$tmp"; return 1; }
-  candidate_version="$(sed -n 's/^APP_VERSION="\([^"]*\)"/\1/p' "$tmp" | head -n1)"
-  if [ "$candidate_version" != "$APP_VERSION" ]; then
-    rm -f "$tmp"
-    err_msg "Manager version mismatch: running $APP_VERSION, downloaded ${candidate_version:-unknown}. Publish matching release files, or run install-local.sh from the full ZIP." >&2
-    return 1
-  fi
-  if [ -f "$INSTALL_BIN" ] && cmp -s "$tmp" "$INSTALL_BIN"; then rm -f "$tmp"; MANAGER_INSTALLED_THIS_SESSION=1; return 0; fi
   bash -n "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; return 1; }
   chmod 755 "$tmp" || { rm -f "$tmp"; return 1; }
-  mv -f "$tmp" "$INSTALL_BIN" || return 1
-  MANAGER_INSTALLED_THIS_SESSION=1
+  mv -f "$tmp" "$INSTALL_BIN"
 }
 
 # -----------------------------
@@ -1174,25 +1158,10 @@ tunnel_health_check_all() {
     fi
   done <<< "$ids"
 
-  bp_health_check || true
-
   # HAProxy UDP companions are checked last. This is intentionally lightweight:
   # when all four managed rules exist for every TCP row, nothing is changed.
   # If firewall/NAT rules disappear, run the same rebuild+verify logic as menu option 8.
   haproxy_udp_self_heal_check || true
-}
-
-# Defer legacy migrations until an operator requests a mutating action.
-# Opening/exiting the menu never downloads, repairs or restarts any tunnel.
-prepare_runtime_once() {
-  if compgen -G '/etc/gretun-transparent/profile-*.json' >/dev/null; then
-    RUNTIME_PREPARED=1
-    return 0
-  fi
-  [ "${RUNTIME_PREPARED:-0}" = 1 ] && return 0
-  info_msg "Preparing tunnel services for this management session..."
-  bootstrap_runtime_repairs || return 1
-  RUNTIME_PREPARED=1
 }
 
 bootstrap_runtime_repairs() {
@@ -1275,413 +1244,6 @@ bootstrap_runtime_repairs() {
     haproxy_install_udp_service >/dev/null 2>&1 || true
   fi
 }
-
-# BackPack v1.8.5 adapter: L3 only. No BackPack menu, port forwarder,
-# web panel, monitor, auto-update or global optimization is started.
-BP_CONFIG_DIR="/etc/gretun-backpack"
-BP_BINARY="/usr/local/lib/gretun/backpack-v1.8.5"
-BP_SERVICE_TEMPLATE="/etc/systemd/system/gretun-backpack@.service"
-BP_ASSET_BASE="https://raw.githubusercontent.com/0fariid0/GRE-TUN/main/engines/backpack"
-BP_SCRIPT_DIR=""
-case "${BASH_SOURCE[0]}" in /dev/fd/*|/proc/*/fd/*) ;; *) BP_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)" ;; esac
-
-bp_iface() { echo "bptun$1"; }
-bp_service() { echo "gretun-backpack@$1.service"; }
-bp_meta() { echo "$BP_CONFIG_DIR/tunnel-$1.conf"; }
-bp_config() { echo "$BP_CONFIG_DIR/tunnel-$1.toml"; }
-bp_collect_ids() {
-  local f id
-  for f in "$BP_CONFIG_DIR"/tunnel-*.conf; do
-    [ -f "$f" ] || continue
-    id="${f##*/tunnel-}"; id="${id%.conf}"
-    validate_tunnel_id "$id" && printf '%s\n' "$id"
-  done | sort -n
-}
-bp_load() {
-  validate_tunnel_id "${1:-}" || return 1
-  BP_ID="$((10#$1))"; BP_ROLE=""; BP_LOCAL_PUBLIC=""; BP_REMOTE_PUBLIC=""
-  BP_CARRIER=""; BP_PORT=""; BP_TOKEN=""; BP_MTU=""
-  [ -f "$(bp_meta "$BP_ID")" ] || return 1
-  # Root-owned files, written only with write_var; never source setup links.
-  source "$(bp_meta "$BP_ID")"
-  bp_validate
-}
-bp_validate() {
-  validate_tunnel_id "${BP_ID:-}" || return 1
-  [[ "${BP_ROLE:-}" == 1 || "${BP_ROLE:-}" == 2 ]] || return 1
-  validate_ipv4 "${BP_LOCAL_PUBLIC:-}" && validate_ipv4 "${BP_REMOTE_PUBLIC:-}" || return 1
-  [ "$BP_LOCAL_PUBLIC" != "$BP_REMOTE_PUBLIC" ] || return 1
-  case "${BP_CARRIER:-}" in udp|quic|pck|xdi) ;; *) return 1 ;; esac
-  validate_port "${BP_PORT:-}" || return 1
-  [[ "${BP_TOKEN:-}" =~ ^[a-fA-F0-9]{64}$ ]] || return 1
-  [[ "${BP_MTU:-}" =~ ^[0-9]{4}$ ]] && ((10#$BP_MTU >= 1280 && 10#$BP_MTU <= 1400)) || return 1
-  BP_LOCAL="10.40.$BP_ID.$BP_ROLE"
-  BP_PEER="10.40.$BP_ID.$((3 - BP_ROLE))"
-  BP_IFACE="$(bp_iface "$BP_ID")"
-}
-bp_save_meta() {
-  local key
-  for key in BP_ID BP_ROLE BP_LOCAL_PUBLIC BP_REMOTE_PUBLIC BP_CARRIER BP_PORT BP_TOKEN BP_MTU; do
-    write_var "$key" "${!key}"
-  done
-}
-bp_render() {
-  bp_validate || return 1
-  local mode=dial addr="$BP_REMOTE_PUBLIC:$BP_PORT"
-  if [ "$BP_ROLE" = 2 ]; then mode=listen; addr="$BP_LOCAL_PUBLIC:$BP_PORT"; fi
-  cat <<EOF_CONFIG
-[l3]
-mode = "$mode"
-addr = "$addr"
-token = "$BP_TOKEN"
-carrier = "$BP_CARRIER"
-encap = "gre"
-gre_key = $((40000 + BP_ID))
-iface = "$BP_IFACE"
-local_ip = "$BP_LOCAL/30"
-peer_ip = "$BP_PEER"
-mtu = $BP_MTU
-auto_mtu = true
-ports = []
-accept_udp = false
-EOF_CONFIG
-}
-bp_asset_details() {
-  case "$(uname -m)" in
-    x86_64|amd64) BP_ASSET=backpack_linux_amd64.tar.gz; BP_SHA=e80c4da9bdcece9e7a82305e572fdfde9a395a68a985fdd835c1af8ff248b395 ;;
-    aarch64|arm64) BP_ASSET=backpack_linux_arm64.tar.gz; BP_SHA=9d9eaa951f8bd3f7b786be94916517c4ec900af0eeaac893b89d03d9867643f4 ;;
-    *) err_msg "BackPack bundle supports Linux amd64 and arm64 only."; return 1 ;;
-  esac
-}
-bp_install_engine() (
-  bp_asset_details || exit 1
-  if [ -x "$BP_BINARY" ] && [ "$("$BP_BINARY" version 2>/dev/null | head -n 1)" = v1.8.5 ]; then exit 0; fi
-  local_dir="${BP_SCRIPT_DIR:+$BP_SCRIPT_DIR/engines/backpack}"
-  tmp="$(mktemp -d)" || exit 1
-  trap 'rm -rf -- "$tmp"' EXIT
-  if [ -n "$local_dir" ] && [ -f "$local_dir/$BP_ASSET" ]; then
-    cp "$local_dir/$BP_ASSET" "$tmp/$BP_ASSET" || exit 1
-  elif [ -f "/usr/local/share/gretun/engines/backpack/$BP_ASSET" ]; then
-    cp "/usr/local/share/gretun/engines/backpack/$BP_ASSET" "$tmp/$BP_ASSET" || exit 1
-  else
-    info_msg "Downloading pinned BackPack v1.8.5 engine from your GRE-TUN repository..."
-    ensure_feature_dependencies backpack-download curl:curl || exit 1
-    curl -fLsS --connect-timeout 10 --max-time 180 --retry 1 "$BP_ASSET_BASE/$BP_ASSET" -o "$tmp/$BP_ASSET" || exit 1
-  fi
-  printf '%s  %s\n' "$BP_SHA" "$tmp/$BP_ASSET" | sha256sum -c - || exit 1
-  # Extract only the expected regular executable, without archive ownership.
-  tar --no-same-owner -xzf "$tmp/$BP_ASSET" -C "$tmp" backpack || exit 1
-  [ -f "$tmp/backpack" ] && [ ! -L "$tmp/backpack" ] || exit 1
-  [ "$("$tmp/backpack" version | head -n 1)" = v1.8.5 ] || exit 1
-  mkdir -p "$(dirname "$BP_BINARY")" || exit 1
-  install -m 0755 "$tmp/backpack" "$BP_BINARY.new" && mv -f "$BP_BINARY.new" "$BP_BINARY"
-)
-
-# Only adapter-owned rules are changed. No global flush and no port forwarding.
-bp_rule() {
-  local action="$1" chain="$2"; shift 2
-  if [ "$action" = add ]; then
-    iptables -w 3 -C "$chain" "$@" 2>/dev/null || iptables -w 3 -I "$chain" 1 "$@"
-  else
-    if iptables -w 3 -C "$chain" "$@" 2>/dev/null; then iptables -w 3 -D "$chain" "$@"; fi
-  fi
-}
-bp_firewall() (
-  local action="$1" id="$2" proto
-  bp_load "$id" || return 1
-  command -v iptables >/dev/null 2>&1 || return 1
-  local -a tag=(-m comment --comment "gretun-bp-$id")
-  case "$BP_CARRIER" in udp|quic) proto=udp ;; pck) proto=tcp ;; xdi) proto=icmp ;; esac
-  if [ "$proto" = icmp ]; then
-    bp_rule "$action" INPUT -s "$BP_REMOTE_PUBLIC" -d "$BP_LOCAL_PUBLIC" -p icmp "${tag[@]}" -j ACCEPT || return 1
-    bp_rule "$action" OUTPUT -s "$BP_LOCAL_PUBLIC" -d "$BP_REMOTE_PUBLIC" -p icmp "${tag[@]}" -j ACCEPT || return 1
-  elif [ "$BP_ROLE" = 2 ]; then
-    bp_rule "$action" INPUT -s "$BP_REMOTE_PUBLIC" -d "$BP_LOCAL_PUBLIC" -p "$proto" --dport "$BP_PORT" "${tag[@]}" -j ACCEPT || return 1
-    bp_rule "$action" OUTPUT -s "$BP_LOCAL_PUBLIC" -d "$BP_REMOTE_PUBLIC" -p "$proto" --sport "$BP_PORT" "${tag[@]}" -j ACCEPT || return 1
-  else
-    bp_rule "$action" OUTPUT -d "$BP_REMOTE_PUBLIC" -p "$proto" --dport "$BP_PORT" "${tag[@]}" -j ACCEPT || return 1
-    bp_rule "$action" INPUT -s "$BP_REMOTE_PUBLIC" -p "$proto" --sport "$BP_PORT" "${tag[@]}" -j ACCEPT || return 1
-  fi
-  bp_rule "$action" INPUT -i "$BP_IFACE" -s "$BP_PEER" "${tag[@]}" -j ACCEPT || return 1
-  bp_rule "$action" OUTPUT -o "$BP_IFACE" -d "$BP_PEER" "${tag[@]}" -j ACCEPT || return 1
-  # Forwarding remains owned by the existing HAProxy/UDP manager.
-  return 0
-)
-bp_health_check() (
-  local id
-  while IFS= read -r id; do
-    [ -n "$id" ] || continue
-    # Respect manual stops. systemd handles crashes; never reset on ping loss.
-    systemctl is-active --quiet "$(bp_service "$id")" || continue
-    bp_firewall add "$id" || diagnostic_event "WARN" "backpack-$id" "Could not repair BackPack firewall rules"
-  done < <(bp_collect_ids)
-)
-bp_preflight() (
-  bp_load "$1" || exit 1
-  [ -x "$BP_BINARY" ] || exit 1
-  [ -c /dev/net/tun ] || modprobe tun || exit 1
-  [ -c /dev/net/tun ] || { err_msg "/dev/net/tun is unavailable"; exit 1; }
-  bp_firewall add "$1" || exit 1
-)
-bp_write_unit() {
-  local tmp="${BP_SERVICE_TEMPLATE}.tmp.$$"
-  cat > "$tmp" <<EOF_UNIT
-[Unit]
-Description=GRE-TUN BackPack L3 tunnel %i
-After=network-online.target ufw.service
-Wants=network-online.target
-StartLimitIntervalSec=0
-
-[Service]
-Type=simple
-UMask=0077
-ExecStartPre=/bin/bash $INSTALL_BIN --service prepare-backpack %i
-ExecStart=$BP_BINARY -c $BP_CONFIG_DIR/tunnel-%i.toml
-Restart=on-failure
-RestartSec=5
-TimeoutStopSec=15
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF_UNIT
-  chmod 644 "$tmp" && mv -f "$tmp" "$BP_SERVICE_TEMPLATE"
-}
-bp_start() {
-  local id="$1" attempt svc
-  svc="$(bp_service "$id")"
-  systemctl restart "$svc" || return 1
-  for attempt in {1..12}; do
-    if systemctl is-active --quiet "$svc" && tunnel_iface_is_up "$(bp_iface "$id")"; then return 0; fi
-    sleep 1
-  done
-  # QUIC opens its TUN only after the remote QUIC handshake. Saving Iran
-  # before Kharej is configured must remain possible, without claiming a link.
-  if ( bp_load "$id" && [ "$BP_ROLE" = 1 ] && [ "$BP_CARRIER" = quic ] ) &&
-      systemctl is-active --quiet "$svc"; then
-    warn_msg "BackPack $id is running but has no interface yet (QUIC peer not ready or carrier error). Check its journal and test after configuring Kharej."
-    return 0
-  fi
-  err_msg "BackPack $id has no running interface. Check journalctl -u $svc."
-  return 1
-}
-bp_port_available() {
-  local proto=udp
-  [ "$BP_CARRIER" = xdi ] && return 0
-  [ "$BP_CARRIER" = pck ] && proto=tcp
-  local flag=-Hlun
-  [ "$proto" = tcp ] && flag=-Hltn
-  ! ss "$flag" 2>/dev/null | awk -v p="$BP_PORT" '$4 ~ (":" p "$") {found=1} END {exit !found}'
-}
-bp_check_conflicts() {
-  local f id old_port="$BP_PORT" old_carrier="$BP_CARRIER"
-  # An existing adapter tunnel may own its interface and its port. New IDs
-  # must not adopt an unrelated device/address or a saved listener.
-  if [ ! -f "$(bp_meta "$BP_ID")" ]; then
-    if ip link show "$BP_IFACE" >/dev/null 2>&1 || ip -o -4 addr show | awk -v p="10.40.$BP_ID." 'index($4,p)==1 {found=1} END {exit !found}'; then
-      err_msg "Interface/address already exists for $BP_IFACE; choose another tunnel number."; return 1
-    fi
-  fi
-  for f in "$BP_CONFIG_DIR"/tunnel-*.conf; do
-    [ -f "$f" ] || continue
-    id="${f##*/tunnel-}"; id="${id%.conf}"
-    [ "$id" = "$BP_ID" ] && continue
-    if ( bp_load "$id" && [ "$BP_ROLE" = 2 ] && [ "$BP_PORT" = "$old_port" ] && {
-      [[ "$BP_CARRIER" == "$old_carrier" ]] || [[ "$BP_CARRIER" =~ ^(udp|quic)$ && "$old_carrier" =~ ^(udp|quic)$ ]];
-    } ); then
-      err_msg "Transport port/identifier is already assigned to BackPack $id."; return 1
-    fi
-  done
-}
-bp_commit() (
-  local id="$BP_ID" cfg meta svc tmp had_old=0 was_active=0 was_enabled=0 committed=0
-  cfg="$(bp_config "$id")"; meta="$(bp_meta "$id")"; svc="$(bp_service "$id")"
-  mkdir -p "$BP_CONFIG_DIR" || exit 1
-  chmod 700 "$BP_CONFIG_DIR" || exit 1
-  exec 9>"$BP_CONFIG_DIR/.lock" || exit 1
-  flock -n 9 || { err_msg "Another BackPack operation is in progress."; exit 1; }
-  tmp="$(mktemp -d "$BP_CONFIG_DIR/.transaction.XXXXXX")" || exit 1
-  chmod 700 "$tmp"
-  [ ! -f "$meta" ] || { had_old=1; cp -p "$meta" "$tmp/old.conf" || exit 1; cp -p "$cfg" "$tmp/old.toml" || exit 1; }
-  systemctl is-active --quiet "$svc" && was_active=1
-  systemctl is-enabled --quiet "$svc" && was_enabled=1
-  bp_rollback() {
-    local rc=$?
-    trap - EXIT INT TERM
-    if [ "$committed" = 1 ]; then rm -rf "$tmp"; return; fi
-    if [ -f "$tmp/changed" ]; then
-      systemctl stop "$svc" >/dev/null 2>&1 || true
-      bp_firewall remove "$id" >/dev/null 2>&1 || true
-      if [ "$had_old" = 1 ]; then
-        cp -p "$tmp/old.conf" "$meta"; cp -p "$tmp/old.toml" "$cfg"
-        if [ "$was_active" = 1 ]; then systemctl restart "$svc" || true; fi
-      else
-        rm -f "$meta" "$cfg" "${cfg%.toml}.metrics.json"
-      fi
-      [ "$was_enabled" = 1 ] || systemctl disable "$svc" >/dev/null 2>&1 || true
-      err_msg "BackPack change failed; previous configuration restored."
-    fi
-    rm -rf "$tmp"
-    return "$rc"
-  }
-  trap bp_rollback EXIT
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
-  bp_render > "$tmp/new.toml" && bp_save_meta > "$tmp/new.conf" || exit 1
-  chmod 600 "$tmp/new.toml" "$tmp/new.conf"
-  "$BP_BINARY" check -c "$tmp/new.toml" || exit 1
-  # From this point failures restore both files and the old service state.
-  touch "$tmp/changed"
-  if [ "$had_old" = 1 ] || [ "$was_active" = 1 ]; then systemctl stop "$svc" || exit 1; fi
-  if [ "$BP_ROLE" = 2 ] && ! bp_port_available; then err_msg "BackPack listener port is busy."; exit 1; fi
-  if [ "$had_old" = 1 ]; then bp_firewall remove "$id" || exit 1; fi
-  mv -f "$tmp/new.toml" "$cfg" && mv -f "$tmp/new.conf" "$meta" || exit 1
-  systemctl enable "$svc" || exit 1
-  bp_start "$id" || exit 1
-  committed=1
-)
-# Kharej owns token creation. Iran pastes it visibly with readline editing.
-# Existing secrets are never regenerated just by opening the edit wizard.
-bp_prepare_token() {
-  local existing="${1:-}" answer
-  case "$BP_ROLE" in
-    2)
-      if [ -n "$existing" ]; then
-        BP_TOKEN="$existing"
-        echo "Keeping the existing Kharej token."
-      else
-        BP_TOKEN="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')" || return 1
-        echo "New shared token generated on Kharej."
-      fi
-      [[ "$BP_TOKEN" =~ ^[a-fA-F0-9]{64}$ ]] || { err_msg "Could not obtain a valid token."; return 1; }
-      echo "Copy this token and paste it on Iran:"
-      printf '\n%s\n\n' "$BP_TOKEN"
-      ;;
-    1)
-      echo "Set up Kharej first, then paste its token here. Pasted text is visible."
-      if [ -n "$existing" ]; then echo "Enter keeps the existing token; paste Kharej's token to replace it."; fi
-      while true; do
-        IFS= read -er -p "Kharej token (00=menu): " answer || return 1
-        # Accept a copied Token: line, surrounding spaces, tabs and Windows CR.
-        answer="${answer//$'\r'/}"; answer="${answer// /}"; answer="${answer//$'\t'/}"
-        answer="${answer#Token:}"; answer="${answer#token:}"
-        if is_main_menu_token "$answer"; then return 99; fi
-        answer="${answer:-$existing}"
-        if [[ "$answer" =~ ^[a-fA-F0-9]{64}$ ]]; then
-          BP_TOKEN="$answer"
-          ok_msg "Token accepted."
-          return 0
-        fi
-        err_msg "Paste the complete 64-character hexadecimal token from Kharej (or 00 to return)."
-      done
-      ;;
-    *) err_msg "Invalid server role"; return 1 ;;
-  esac
-}
-
-bp_menu_config() (
-  local ROLE TUNNEL_ID LOCAL_PUBLIC_IP REMOTE_PUBLIC_IP answer old_token="" old_local="" old_remote="" old_carrier=udp old_port="" old_mtu=1380
-  show_header "Configure BackPack L3 Tunnel"
-  prompt_role || return
-  prompt_tunnel_id "Enter BackPack tunnel number [1-254] (00=menu): " || return
-  if [ -f "$(bp_meta "$TUNNEL_ID")" ]; then
-    bp_load "$TUNNEL_ID" || { err_msg "Existing BackPack metadata is invalid."; return 1; }
-    [ "$BP_ROLE" = "$ROLE" ] || { err_msg "Existing tunnel has a different role; use its original role."; return 1; }
-    old_token="$BP_TOKEN"; old_local="$BP_LOCAL_PUBLIC"; old_remote="$BP_REMOTE_PUBLIC"
-    old_carrier="$BP_CARRIER"; old_port="$BP_PORT"; old_mtu="$BP_MTU"
-  fi
-  prompt_local_tunnel_ip "$old_local" || return
-  prompt_remote_public_ip "$old_remote" || return
-  BP_ID="$TUNNEL_ID"; BP_ROLE="$ROLE"; BP_LOCAL_PUBLIC="$LOCAL_PUBLIC_IP"; BP_REMOTE_PUBLIC="$REMOTE_PUBLIC_IP"
-  echo "1) UDP  2) QUIC  3) PCK (raw TCP)  4) xDi (ICMP)"
-  read -rp "Transport [$old_carrier] (00=menu): " answer || return 1
-  is_main_menu_token "$answer" && return 99
-  case "${answer:-$old_carrier}" in 1|udp) BP_CARRIER=udp ;; 2|quic) BP_CARRIER=quic ;; 3|pck) BP_CARRIER=pck ;; 4|xdi) BP_CARRIER=xdi ;; *) err_msg "Invalid transport"; return 1 ;; esac
-  read -rp "Kharej tunnel port / xDi identifier [${old_port:-$((52000 + BP_ID))}] (00=menu): " answer || return 1
-  is_main_menu_token "$answer" && return 99
-  BP_PORT="${answer:-${old_port:-$((52000 + BP_ID))}}"
-  validate_port "$BP_PORT" || { err_msg "Invalid port"; return 1; }
-  BP_PORT="$((10#$BP_PORT))"
-  bp_prepare_token "$old_token" || return
-  read -rp "Starting MTU 1280-1400 [$old_mtu] (00=menu): " answer || return 1
-  is_main_menu_token "$answer" && return 99
-  BP_MTU="${answer:-$old_mtu}"
-  bp_validate || { err_msg "Invalid BackPack settings (token must be 64 hex characters)."; return 1; }
-  bp_check_conflicts || return 1
-  if [ "$BP_ROLE" = 2 ] && ! local_ipv4_is_assigned "$BP_LOCAL_PUBLIC"; then
-    err_msg "Kharej listen IPv4 must be assigned to this host."; return 1
-  fi
-  if [ "$BP_ROLE" = 1 ]; then
-    local routed_source
-    routed_source="$(ip -4 route get "$BP_REMOTE_PUBLIC" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}')"
-    if [ "$routed_source" != "$BP_LOCAL_PUBLIC" ]; then
-      err_msg "This engine uses the route's source IPv4 ($routed_source); select that local IP."; return 1
-    fi
-  fi
-  echo "BackPack $BP_ID: $BP_CARRIER, $BP_IFACE, $BP_LOCAL/30 -> $BP_PEER, port $BP_PORT"
-  echo "Only a private tunnel is created. Use your existing HAProxy menu (6) for forwarding."
-  confirm_yes "Create/update this tunnel?" || return
-  ensure_feature_dependencies backpack ip:iproute2 ss:iproute2 iptables:iptables ping:iputils-ping tar:tar sha256sum:coreutils flock:util-linux || return 1
-  command -v systemctl >/dev/null 2>&1 || { err_msg "systemd is required"; return 1; }
-  bp_install_engine || return 1
-  install_manager_binary || return 1
-  bp_write_unit && systemctl daemon-reload || return 1
-  bp_commit || return 1
-  diagnostic_event "MANUAL" "backpack-$BP_ID" "L3 tunnel configured: $BP_CARRIER, $BP_IFACE, $BP_LOCAL -> $BP_PEER"
-  ok_msg "BackPack configuration saved and engine running."
-  if tunnel_iface_is_up "$BP_IFACE"; then
-    echo "Local interface is up; peer connectivity still needs a ping test after BOTH servers are configured."
-  else
-    warn_msg "Interface pending: configure the QUIC peer, then use ping test / logs."
-  fi
-  echo "Use the same ID, carrier, port and token on the other server:"
-  printf 'ID: %s | carrier: %s | port: %s | MTU: %s\nToken: %s\n' "$BP_ID" "$BP_CARRIER" "$BP_PORT" "$BP_MTU" "$BP_TOKEN"
-)
-bp_list_tunnels() {
-  build_tunnel_inventory
-  local i
-  for i in "${!INV_TYPE[@]}"; do
-    [ "${INV_TYPE[$i]}" = backpack ] || continue
-    printf 'BackPack %s | %s | %s -> %s | %s\n' "${INV_ID[$i]}" "${INV_IFACE[$i]}" "${INV_LOCAL[$i]}" "${INV_TARGET[$i]}" "${INV_STATE[$i]}"
-  done
-}
-bp_show_journal() {
-  local id
-  while IFS= read -r id; do
-    [ -n "$id" ] || continue
-    echo "BackPack tunnel $id:"
-    journalctl -u "$(bp_service "$id")" -n 40 --no-pager -o short-iso || true
-  done < <(bp_collect_ids)
-}
-
-bp_inventory_append() {
-  local BP_ID BP_ROLE BP_LOCAL_PUBLIC BP_REMOTE_PUBLIC BP_CARRIER BP_PORT BP_TOKEN BP_MTU BP_LOCAL BP_PEER BP_IFACE
-  local id state
-  while IFS= read -r id; do
-    [ -n "$id" ] || continue
-    bp_load "$id" || continue
-    state=inactive
-    if systemctl is-active --quiet "$(bp_service "$id")"; then
-      if tunnel_iface_is_up "$BP_IFACE"; then state=active; else state=pending; fi
-    fi
-    INV_TYPE+=(backpack); INV_ID+=("$id"); INV_IFACE+=("$BP_IFACE"); INV_LOCAL+=("$BP_LOCAL/30"); INV_TARGET+=("$BP_PEER")
-    INV_LOCAL_PUBLIC+=("$BP_LOCAL_PUBLIC"); INV_REMOTE_PUBLIC+=("$BP_REMOTE_PUBLIC"); INV_STATE+=("$state"); INV_DESC+=("BackPack/$BP_CARRIER")
-  done < <(bp_collect_ids)
-}
-bp_ping() (
-  bp_load "$1" || return 1
-  ping4_target "BackPack $BP_ID ($BP_CARRIER)" "$BP_PEER" "$BP_IFACE"
-)
-bp_remove() (
-  bp_load "$1" || return 1
-  exec 9>"$BP_CONFIG_DIR/.lock" || return 1
-  flock -n 9 || { err_msg "Another BackPack operation is in progress."; return 1; }
-  systemctl disable --now "$(bp_service "$1")" || return 1
-  bp_firewall remove "$1" || return 1
-  rm -f "$(bp_meta "$1")" "$(bp_config "$1")" "$BP_CONFIG_DIR/tunnel-$1.metrics.json"
-  diagnostic_event "MANUAL" "backpack-$1" "BackPack tunnel removed"
-)
 
 # -----------------------------
 # GRE helpers
@@ -1930,8 +1492,7 @@ gre_create_tunnel() {
   fi
 
   apply_tunnel_sysctls
-  ensure_public_endpoint_route "$REMOTE_PUBLIC_IP" "$LOCAL_PUBLIC_IP" || return 1
-  if [ "$interactive" -eq 1 ]; then install_manager_binary || return 1; fi
+  ensure_public_endpoint_route "$REMOTE_PUBLIC_IP" "$LOCAL_PUBLIC_IP"
   modprobe gre || true
   modprobe ip_gre || true
 
@@ -1975,7 +1536,6 @@ gre_create_tunnel() {
   firewall_allow_ip_peer "GRE tunnel $TUNNEL_ID remote public" "$REMOTE_PUBLIC_IP" "$TUN_IFACE"
   firewall_allow_ip_peer "GRE tunnel $TUNNEL_ID remote inner" "$REMOTE_GRE_IP" "$TUN_IFACE"
 
-  transparent_repair_routes "$TUN_IFACE" || warn_msg "Review transparent return routes for $TUN_IFACE"
   echo "[OK] GRE tunnel created as $TUN_IFACE"
   echo "Local GRE IP : $LOCAL_GRE_IP"
   echo "Remote GRE IP: $REMOTE_GRE_IP"
@@ -1988,61 +1548,9 @@ gre_create_tunnel() {
         echo "GRE persistence enabled for $(gre_service_name "$TUNNEL_ID")."
       else
         echo "Failed to enable GRE persistence. Tunnel is currently created, but it may not survive reboot." >&2
-        return 1
       fi
     fi
   fi
-}
-
-# Existing IDs edit public endpoints only; saved role, inner IPs and keys remain.
-tunnel_edit_public_ips() {
-  local kind="$1" id="$2" old_local old_remote config loader iface module backup rc=0
-  case "$kind" in
-    gre) loader=gre_load_config; config="$(gre_config_file "$id")"; iface="$(gre_iface "$id")" ;;
-    greplus) loader=greplus_load_config; config="$(greplus_config_file "$id")"; iface="$(greplus_iface "$id")" ;;
-    *) return 1 ;;
-  esac
-  "$loader" "$id" || return 1
-  old_local="$LOCAL_PUBLIC_IP"; old_remote="$REMOTE_PUBLIC_IP"
-  echo "Editing saved $kind tunnel $id ($iface). Saved role: $ROLE"
-  if [ "$ROLE" = 1 ]; then
-    echo "Iran IP: $old_local | Outside IP: $old_remote"
-  else
-    echo "Iran IP: $old_remote | Outside IP: $old_local"
-  fi
-  echo "Press Enter to keep each saved address. 00 returns without applying."
-  prompt_local_tunnel_ip "$old_local" "LOCAL public IPv4 (this server)" || return $?
-  prompt_remote_public_ip "$old_remote" || return $?
-  if [ "$LOCAL_PUBLIC_IP" = "$old_local" ] && [ "$REMOTE_PUBLIC_IP" = "$old_remote" ]; then
-    ok_msg "No IP changes; tunnel left running."; return 0
-  fi
-    if compgen -G '/etc/gretun-transparent/profile-*.json' >/dev/null; then
-      module="$(transparent_module_path)" || return 1
-      python3 "$module" reset-check "$iface" || return 1
-    fi
-    install_manager_binary || return 1
-    backup="$(mktemp)" || return 1
-    if [ -f "$config" ]; then cp -p "$config" "$backup" || { rm -f "$backup"; return 1; }
-    else
-      # Migrate a legacy GRE config into the numbered path before editing.
-      local new_local="$LOCAL_PUBLIC_IP" new_remote="$REMOTE_PUBLIC_IP"
-      LOCAL_PUBLIC_IP="$old_local"; REMOTE_PUBLIC_IP="$old_remote"
-      gre_save_config || { rm -f "$backup"; return 1; }
-      LOCAL_PUBLIC_IP="$new_local"; REMOTE_PUBLIC_IP="$new_remote"
-      cp -p "$config" "$backup" || { rm -f "$backup"; return 1; }
-    fi
-    if [ "$kind" = gre ]; then gre_create_tunnel 1 || rc=$?
-    else greplus_create_tunnel 1 || rc=$?; fi
-    if [ "$rc" -ne 0 ]; then
-      cp -p "$backup" "$config" || { rm -f "$backup"; return 1; }
-      "$loader" "$id" || { rm -f "$backup"; return 1; }
-      if [ "$kind" = gre ]; then gre_create_tunnel 0 || warn_msg "Old GRE runtime could not be restored."
-      else greplus_create_tunnel 0 || warn_msg "Old GRE Plus runtime could not be restored."; fi
-      rm -f "$backup"; return "$rc"
-    fi
-    rm -f "$backup"
-    transparent_repair_routes "$iface" || return 1
-  ok_msg "Saved tunnel $id public IPs updated. Update the peer server too if its remote address changed."
 }
 
 gre_menu_config_tunnel() {
@@ -2052,11 +1560,6 @@ gre_menu_config_tunnel() {
   selected_role="$ROLE"
   echo
   prompt_tunnel_id "Enter GRE tunnel number before IP [1-254]: " || return
-  if (gre_load_config "$TUNNEL_ID"); then
-    tunnel_edit_public_ips gre "$TUNNEL_ID"
-    return $?
-  fi
-  transparent_guard "$(gre_iface "$TUNNEL_ID")" || return 1
 
   existing_local_ip=""
   existing_remote_ip=""
@@ -2144,51 +1647,17 @@ gre_status_check() {
   done <<< "$ids"
 }
 
-remove_transport_dependency_check() {
-  local kind="$1" id="$2" wg_id
-  while IFS= read -r wg_id; do
-    [ -n "$wg_id" ] || continue
-    if wg_uses_transport_tunnel "$wg_id" "$kind" "$id"; then
-      err_msg "Cannot remove $kind $id: WireGuard $wg_id still depends on it. Remove its row first or select both rows."; return 1
-    fi
-  done < <(wg_collect_ids)
-}
-
-stop_tunnel_for_remove() {
-  local svc="$1"
-  if command -v systemctl >/dev/null 2>&1; then
-    if ! systemctl disable --now "$svc"; then
-      if systemctl is-active --quiet "$svc"; then
-        err_msg "Service $svc is still active; its tunnel config was retained."; return 1
-      fi
-    fi
-  fi
-}
-
-verify_interface_removed() {
-  if ip link show dev "$1" >/dev/null 2>&1; then
-    err_msg "Interface $1 still exists; its saved config was retained."; return 1
-  fi
-}
-
-transparent_remove_interface() {
-  local module iface="$1"
-  compgen -G '/etc/gretun-transparent/profile-*.json' >/dev/null || return 0
-  module="$(transparent_module_path)" || return 1
-  python3 "$module" remove-interface "$iface"
-}
-
 gre_remove_one_tunnel() {
   local id="$1"
-  remove_transport_dependency_check gre "$id" || return 1
-  transparent_remove_interface "$(gre_iface "$id")" || return 1
   local ifc file
   ifc="$(gre_iface "$id")"
   file="$(gre_config_file "$id")"
 
   echo "Removing GRE tunnel $id ($ifc)..."
 
-  stop_tunnel_for_remove "$(gre_service_name "$id")" || return 1
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl disable --now "$(gre_service_name "$id")" 2>/dev/null || true
+  fi
 
   ip link set dev "$ifc" down 2>/dev/null || true
   if ip tunnel del "$ifc" 2>/dev/null; then
@@ -2199,7 +1668,6 @@ gre_remove_one_tunnel() {
     echo "- $ifc was not found or could not be removed automatically."
   fi
 
-  verify_interface_removed "$ifc" || return 1
   rm -f "$file"
   if [ "$id" = "1" ]; then
     rm -f "$GRE_LEGACY_CONF_FILE"
@@ -2455,8 +1923,7 @@ greplus_create_tunnel() {
   GREPLUS_MTU="$(greplus_detect_mtu "$REMOTE_PUBLIC_IP")"
   GREPLUS_TXQUEUELEN="${GREPLUS_TXQUEUELEN:-$GREPLUS_DEFAULT_TXQUEUELEN}"
   apply_tunnel_sysctls
-  ensure_public_endpoint_route "$REMOTE_PUBLIC_IP" "$LOCAL_PUBLIC_IP" || return 1
-  if [ "$interactive" -eq 1 ]; then install_manager_binary || return 1; fi
+  ensure_public_endpoint_route "$REMOTE_PUBLIC_IP" "$LOCAL_PUBLIC_IP"
   modprobe gre >/dev/null 2>&1 || true
   modprobe ip_gre >/dev/null 2>&1 || true
   ip link set "$ifc" down 2>/dev/null || true
@@ -2472,7 +1939,6 @@ greplus_create_tunnel() {
   greplus_save_config || return 1
   greplus_apply_firewall "$TUNNEL_ID" || return 1
   if [ "$interactive" -eq 1 ]; then greplus_install_service "$TUNNEL_ID" || return 1; fi
-  transparent_repair_routes "$ifc" || warn_msg "Review transparent return routes for $ifc"
   ok_msg "GRE Plus tunnel created: $ifc"
   echo "Local/remote inner IP: $LOCAL_GREPLUS_IP -> $REMOTE_GREPLUS_IP"
   echo "MTU / TX queue / qdisc: $GREPLUS_MTU / $GREPLUS_TXQUEUELEN / fq"
@@ -2581,11 +2047,6 @@ greplus_menu_config_tunnel() {
   prompt_role || return
   local selected_role="$ROLE" existing_local="" existing_remote=""
   prompt_tunnel_id "Enter GRE Plus tunnel number [1-254]: " || return
-  if (greplus_load_config "$TUNNEL_ID"); then
-    tunnel_edit_public_ips greplus "$TUNNEL_ID"
-    return $?
-  fi
-  transparent_guard "$(greplus_iface "$TUNNEL_ID")" || return 1
   if greplus_load_config "$TUNNEL_ID"; then
     existing_local="${LOCAL_PUBLIC_IP:-}"; existing_remote="${REMOTE_PUBLIC_IP:-}"
   fi
@@ -2613,14 +2074,11 @@ greplus_list_tunnels() {
 
 greplus_remove_one_tunnel() {
   local id="$1" ifc
-  remove_transport_dependency_check greplus "$id" || return 1
-  transparent_remove_interface "$(greplus_iface "$id")" || return 1
   ifc="$(greplus_iface "$id")"
-  stop_tunnel_for_remove "$(greplus_service_name "$id")" || return 1
+  systemctl disable --now "$(greplus_service_name "$id")" >/dev/null 2>&1 || true
   greplus_remove_firewall "$id" || true
   ip link set "$ifc" down 2>/dev/null || true
   ip tunnel del "$ifc" 2>/dev/null || ip link delete "$ifc" 2>/dev/null || true
-  verify_interface_removed "$ifc" || return 1
   rm -f "$(greplus_config_file "$id")"
   systemctl daemon-reload >/dev/null 2>&1 || true
   ok_msg "GRE Plus tunnel $id removed."
@@ -2924,7 +2382,6 @@ wg_list_tunnels() {
 }
 
 wg_write_config() {
-  transparent_guard "$(wg_iface_name "$1")" || return 1
   local id="$1" temporary
   local private_file conf allowed_ips private_key endpoint_ip endpoint_mode_note mtu_value endpoint_line=""
   private_file="$(wg_private_key_file "$id")"
@@ -3345,7 +2802,6 @@ wg_menu_config_tunnel() {
   selected_role="$ROLE"
   echo
   prompt_tunnel_id "Enter WireGuard tunnel number before IP [1-254]: " || return
-  transparent_guard "$(wg_iface_name "$TUNNEL_ID")" || return 1
 
   existing_local_ip=""
   existing_remote_ip=""
@@ -3884,7 +3340,6 @@ wg_remove_firewall_rules() {
 
 wg_remove_one_tunnel() {
   local id="$1"
-  transparent_remove_interface "$(wg_iface_name "$id")" || return 1
   local ifc conf meta private public endpoint_mode=""
   ifc="$(wg_iface_name "$id")"
   conf="$(wg_config_file "$id")"
@@ -3895,18 +3350,18 @@ wg_remove_one_tunnel() {
 
   echo "Removing WireGuard tunnel $id ($ifc)..."
 
-  stop_tunnel_for_remove "$(wg_service_name "$id")" || return 1
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl disable --now "$(wg_service_name "$id")" 2>/dev/null || true
+  fi
 
   # Safe cleanup only for this WireGuard tunnel. Do not touch the main route table.
   wg_safe_cleanup_runtime "$id" >/dev/null 2>&1 || true
-  verify_interface_removed "$ifc" || return 1
   wg_remove_firewall_rules "$id"
   if [ -f "$(wss_config_file "$id")" ]; then
     wss_remove_one "$id"
   fi
 
-  rm -f "/etc/systemd/system/wg-quick@$ifc.service.d/10-gretun-firewall.conf"
-  rmdir "/etc/systemd/system/wg-quick@$ifc.service.d" 2>/dev/null || true
+  rm -rf "/etc/systemd/system/wg-quick@$ifc.service.d"
   rm -f "$conf" "$meta" "$private" "$public"
   echo "- Config removed: $conf"
   echo "- Metadata removed: $meta"
@@ -4108,7 +3563,6 @@ build_tunnel_inventory() {
     INV_TYPE+=("wireguard"); INV_ID+=("$id"); INV_IFACE+=("$ifc"); INV_LOCAL+=("$local_ip"); INV_TARGET+=("$target"); INV_LOCAL_PUBLIC+=("$local_pub"); INV_REMOTE_PUBLIC+=("$remote_pub"); INV_STATE+=("$state"); INV_DESC+=("$desc")
   done <<< "$ids"
 
-  bp_inventory_append
 }
 
 
@@ -4145,7 +3599,6 @@ remove_inventory_item() {
     gre) gre_remove_one_tunnel "$id" ;;
     greplus) greplus_remove_one_tunnel "$id" ;;
     wireguard) wg_remove_one_tunnel "$id" ;;
-    backpack) bp_remove "$id" ;;
   esac
 }
 
@@ -4158,7 +3611,6 @@ ping_inventory_item() {
     gre) test_gre_tunnel_ping "$id" ;;
     greplus) test_greplus_tunnel_ping "$id" ;;
     wireguard) test_wg_tunnel_ping "$id" ;;
-    backpack) bp_ping "$id" ;;
   esac
 }
 
@@ -4312,7 +3764,6 @@ menu_config_tunnel() {
       wg_menu_config_tunnel
       ;;
     greplus) greplus_menu_config_tunnel ;;
-    backpack) bp_menu_config ;;
   esac
 }
 
@@ -4323,7 +3774,6 @@ status_check() {
     gre) gre_status_check ;;
     greplus) greplus_list_tunnels ;;
     wireguard) wg_status_check ;;
-    backpack) build_tunnel_inventory; print_tunnel_inventory ;;
   esac
 }
 
@@ -4342,9 +3792,23 @@ remove_tun() {
   if is_main_menu_token "$selected"; then return_main_msg; return 99; fi
 
   if [ "$selected" = "88" ]; then
-    selected=""
-    for ((idx=1; idx<=${#INV_TYPE[@]}; idx++)); do selected+="$idx "; done
-    echo "All managed tunnels selected (including BackPack)."
+    echo
+    echo -e "${C_RED}${C_BOLD}WARNING:${C_RESET} this will remove ALL managed GRE, GRE Plus, and WireGuard tunnels."
+    if ! confirm_yes "Are you sure?"; then
+      echo "Cancelled."
+      return
+    fi
+
+    local ids id
+    # Remove WireGuard first because it may depend on GRE or GRE Plus.
+    ids="$(wg_collect_ids || true)"
+    while IFS= read -r id; do [ -n "$id" ] && wg_remove_one_tunnel "$id"; done <<< "$ids"
+    ids="$(greplus_collect_ids || true)"
+    while IFS= read -r id; do [ -n "$id" ] && greplus_remove_one_tunnel "$id"; done <<< "$ids"
+    ids="$(gre_collect_ids || true)"
+    while IFS= read -r id; do [ -n "$id" ] && gre_remove_one_tunnel "$id"; done <<< "$ids"
+    ok_msg "All tunnels removed."
+    return
   fi
 
   normalized="$(printf '%s' "$selected" | tr ',' ' ')"
@@ -4362,7 +3826,6 @@ remove_tun() {
       err_msg "Tunnel row number out of range: $token"
       return
     fi
-    token="$((10#$token))"
     # de-duplicate while preserving user's order.
     if [[ "$seen" != *" $token "* ]]; then
       SELECTED_INDEXES+=("$token")
@@ -4397,15 +3860,13 @@ remove_tun() {
   fi
 
   # Remove in dependency-safe order: WireGuard before its GRE transport.
-  local remove_failed=0
-  for phase in wireguard greplus gre backpack; do
+  for phase in wireguard greplus gre; do
     for idx in "${SELECTED_INDEXES[@]}"; do
       i=$((idx - 1))
       if [ "${INV_TYPE[$i]}" = "$phase" ]; then
         echo
         echo -e "${C_CYAN}Removing row $idx: ${INV_TYPE[$i]} ${INV_ID[$i]} (${INV_IFACE[$i]})${C_RESET}"
         if ! remove_inventory_item "$idx"; then
-          remove_failed=$((remove_failed + 1))
           warn_msg "Could not fully remove row $idx (${INV_TYPE[$i]} ${INV_ID[$i]}). Continue with the next selected tunnel."
         fi
       fi
@@ -4413,9 +3874,6 @@ remove_tun() {
   done
 
   heal_remaining_tunnels_after_remove || true
-  if [ "$remove_failed" -gt 0 ]; then
-    err_msg "Removal incomplete: $remove_failed tunnel(s) failed. Saved configs were retained where possible."; return 1
-  fi
   ok_msg "Selected tunnel removal finished."
 }
 
@@ -4428,7 +3886,6 @@ list_saved_tunnels() {
   greplus_list_tunnels
   echo
   wg_list_tunnels
-  bp_list_tunnels
 }
 
 ping4_target() {
@@ -4533,7 +3990,6 @@ test_one_tunnel_ping_menu() {
     gre) test_gre_tunnel_ping "$TUNNEL_ID" ;;
     greplus) test_greplus_tunnel_ping "$TUNNEL_ID" ;;
     wireguard) test_wg_tunnel_ping "$TUNNEL_ID" ;;
-    backpack) bp_ping "$TUNNEL_ID" ;;
   esac
 }
 
@@ -4569,12 +4025,6 @@ test_all_tunnels_ping() {
 
   echo
   echo "============================================================"
-  ids="$(bp_collect_ids || true)"
-  while IFS= read -r id; do
-    [ -n "$id" ] || continue
-    total=$((total + 1))
-    if bp_ping "$id"; then ok=$((ok + 1)); else fail=$((fail + 1)); fi
-  done <<< "$ids"
   echo "Ping test summary: total=$total ok=$ok failed_or_skipped=$fail"
   echo "============================================================"
 }
@@ -4749,7 +4199,7 @@ iperf3_prepare_firewall() {
     command -v ufw >/dev/null 2>&1 && ufw allow in on "$ifc" to any port "$port" proto tcp >/dev/null 2>&1 || true
   else
     # Current and future managed tunnels can reach the shared listener without a tunnel picker.
-    for source_range in 10.10.0.0/16 10.20.0.0/16 10.30.0.0/16 10.40.0.0/16; do
+    for source_range in 10.10.0.0/16 10.20.0.0/16 10.30.0.0/16; do
       rule=(-s "$source_range" -p tcp --dport "$port")
       if command -v iptables >/dev/null 2>&1; then
         iptables -C INPUT "${rule[@]}" -j ACCEPT >/dev/null 2>&1 || iptables -I INPUT "${rule[@]}" -j ACCEPT || return 1
@@ -4791,61 +4241,9 @@ test_tunnels_menu() {
 }
 
 
-# Reset restarts saved services; it must not regenerate protected WG files.
-wg_reset_saved_tunnel() {
-  local id="$1" ifc svc conf
-  ifc="$(wg_iface_name "$id")"; svc="$(wg_service_name "$id")"; conf="$(wg_config_file "$id")"
-  [ -s "$conf" ] || { err_msg "Missing saved WireGuard config: $conf"; return 1; }
-  wg_ensure_tools || return 1
-  wg_ensure_transport_ready "$id" || return 1
-  wg_apply_firewall_rules "$id" || return 1
-  if command -v systemctl >/dev/null 2>&1; then
-    systemctl enable "$svc" || return 1
-    systemctl restart "$svc" || { wg_print_service_failure "$id"; return 1; }
-  else
-    wg-quick up "$ifc" || return 1
-  fi
-  transparent_repair_routes "$ifc" || return 1
-  ip link show dev "$ifc" >/dev/null 2>&1
-}
-
-transparent_reset_check() {
-  local module
-  compgen -G '/etc/gretun-transparent/profile-*.json' >/dev/null || return 0
-  module="$(transparent_module_path)" || return 1
-  python3 "$module" reset-check
-}
-
-transparent_reset_restore() {
-  local module
-  compgen -G '/etc/gretun-transparent/profile-*.json' >/dev/null || return 0
-  module="$(transparent_module_path)" || return 1
-  python3 "$module" restore
-}
-
-reset_saved_configs_check() (
-  local id
-  while IFS= read -r id; do
-    [ -n "$id" ] || continue
-    gre_load_config "$id" || { err_msg "Cannot load GRE config $id; nothing stopped."; return 1; }
-  done < <(gre_collect_ids)
-  while IFS= read -r id; do
-    [ -n "$id" ] || continue
-    greplus_load_config "$id" || { err_msg "Cannot load GRE Plus config $id; nothing stopped."; return 1; }
-  done < <(greplus_collect_ids)
-  while IFS= read -r id; do
-    [ -n "$id" ] || continue
-    wg_load_meta "$id" || { err_msg "Cannot load WireGuard metadata $id; nothing stopped."; return 1; }
-    if [ -n "${REMOTE_WG_PUBLIC_KEY:-}" ] && [ ! -s "$(wg_config_file "$id")" ]; then
-      err_msg "Missing saved WireGuard config $id; nothing stopped."; return 1
-    fi
-  done < <(wg_collect_ids)
-)
-
 reset_all_tunnels() {
-  transparent_reset_check || return 1
   show_header "Reset All Tunnels"
-  echo "This will restart/recreate all saved normal GRE, GRE Plus, WireGuard, and BackPack tunnels from their saved configs."
+  echo "This will restart/recreate all saved normal GRE, GRE Plus, and WireGuard tunnels from their saved configs."
   echo "It will also re-enable their systemd services for boot."
   echo
   if ! confirm_yes "Continue with reset all tunnels?"; then
@@ -4853,8 +4251,6 @@ reset_all_tunnels() {
     return
   fi
 
-  reset_saved_configs_check || return 1
-  install_manager_binary || return 1
   diagnostic_event "MANUAL" "manager" "manual reset-all started by operator"
 
   echo
@@ -4898,8 +4294,6 @@ reset_all_tunnels() {
       else
         failed=$((failed + 1)); echo "[WARN] GRE tunnel $id reset failed"
       fi
-    else
-      failed=$((failed + 1)); echo "[WARN] GRE tunnel $id config could not be loaded"
     fi
   done <<< "$ids"
 
@@ -4914,8 +4308,6 @@ reset_all_tunnels() {
       else
         failed=$((failed + 1)); echo "[WARN] GRE Plus tunnel $id reset failed"
       fi
-    else
-      failed=$((failed + 1)); echo "[WARN] GRE Plus tunnel $id config could not be loaded"
     fi
   done <<< "$ids"
 
@@ -4924,14 +4316,11 @@ reset_all_tunnels() {
   ids="$(wg_collect_ids || true)"
   while IFS= read -r id; do
     [ -n "$id" ] || continue
-    if ! wg_load_meta "$id"; then
-      failed=$((failed + 1)); echo "[WARN] WireGuard tunnel $id metadata could not be loaded"; continue
-    fi
-    if [ -z "${REMOTE_WG_PUBLIC_KEY:-}" ]; then
+    if wg_load_meta "$id" && [ -z "${REMOTE_WG_PUBLIC_KEY:-}" ]; then
       echo "[SKIP] WireGuard tunnel $id is pending peer key"
       continue
     fi
-    if wg_reset_saved_tunnel "$id"; then
+    if wg_restart_one_tunnel "$id"; then
       echo "[OK] WireGuard tunnel $id reset"
     else
       failed=$((failed + 1)); echo "[WARN] WireGuard tunnel $id reset failed"
@@ -4939,18 +4328,6 @@ reset_all_tunnels() {
   done <<< "$ids"
 
   echo
-  ids="$(bp_collect_ids || true)"
-  while IFS= read -r id; do
-    [ -n "$id" ] || continue
-    if systemctl enable "$(bp_service "$id")" && bp_start "$id"; then
-      echo "[OK] BackPack tunnel $id reset"
-    else
-      failed=$((failed + 1)); echo "[WARN] BackPack tunnel $id reset failed"
-    fi
-  done <<< "$ids"
-  if ! transparent_reset_restore; then
-    failed=$((failed + 1)); err_msg "Transparent route restore failed; inspect the error above."
-  fi
   if [ "$failed" -gt 0 ]; then err_msg "Reset completed with $failed tunnel failure(s)."; return 1; fi
   echo "[OK] Reset all finished."
   diagnostic_event "MANUAL" "manager" "manual reset-all finished"
@@ -4974,7 +4351,6 @@ diagnostics_collect_current() {
       gre) svc="$(gre_service_name "$id")" ;;
       greplus) svc="$(greplus_service_name "$id")" ;;
       wireguard) svc="$(wg_service_name "$id")" ;;
-      backpack) svc="$(bp_service "$id")" ;;
       *) svc="" ;;
     esac
     diagnostic_capture "$kind" "$id" "$ifc" "$svc" "$target" "manual diagnostic snapshot"
@@ -5015,14 +4391,12 @@ diagnostics_show_services() {
   if [ ! -s "$DIAG_SERVICE_LOG" ]; then
     warn_msg "No tunnel service message has been recorded yet."
     echo "Services will write here after their next start/restart."
-    bp_show_journal
     return 0
   fi
   echo "Log file: $DIAG_SERVICE_LOG"
   echo "Showing the latest 300 service messages:"
   echo
   tail -n 300 "$DIAG_SERVICE_LOG"
-  bp_show_journal
 }
 
 diagnostics_export_report() {
@@ -5074,7 +4448,6 @@ diagnostics_menu() {
     echo -e "  ${C_GREEN}4)${C_RESET} capture current tunnel state now"
     echo -e "  ${C_MAGENTA}5)${C_RESET} export complete report to /root"
     echo -e "  ${C_RED}6)${C_RESET} clear saved logs"
-    echo -e "  ${C_CYAN}9)${C_RESET} automatic transparent IP (Iran / outside)"
     echo -e "  ${C_DIM}00) Back to main menu${C_RESET}"
     echo
     echo "Automatic event log : $DIAG_EVENT_LOG"
@@ -5682,7 +5055,6 @@ haproxy_open_firewall_tcp() {
 }
 
 haproxy_validate_and_restart() {
-  transparent_guard haproxy || return 1
   local tmp="$1" backup=""
   # Validate quietly first so HAProxy NOTICE/WARNING lines do not confuse the menu output.
   # If validation fails, run it again without -q to print the real error.
@@ -5721,7 +5093,6 @@ haproxy_validate_and_restart() {
 }
 
 haproxy_write_entries_file() {
-  transparent_guard haproxy || return 1
   local entries_file="$1"
   local tmp proto
   tmp="$(mktemp)"
@@ -6136,64 +5507,6 @@ haproxy_run_action() {
   return 0
 }
 
-# Pinned to the helper shipped with this manager; mutable upstream cannot mix versions.
-TRANSPARENT_SHA256="b8db74417ab0192f16311d839ff794f3268130cc55f9bed801b2a7e8be04f903"
-transparent_install_module() {
-  local target=/usr/local/lib/gretun/transparent_forward.py candidate tmp
-  if [ -f "$target" ] && [ "$(sha256sum "$target" | awk '{print $1}')" = "$TRANSPARENT_SHA256" ]; then
-    printf '%s' "$target"; return 0
-  fi
-  mkdir -p /usr/local/lib/gretun || return 1
-  tmp="$(mktemp /usr/local/lib/gretun/.transparent.XXXXXXXX)" || return 1
-  candidate="$(dirname -- "${BASH_SOURCE[0]}")/transparent_forward.py"
-  if [ -f "$candidate" ] && [ "$(sha256sum "$candidate" | awk '{print $1}')" = "$TRANSPARENT_SHA256" ]; then
-    cp -- "$candidate" "$tmp" || { rm -f "$tmp"; return 1; }
-  elif command -v curl >/dev/null 2>&1; then
-    curl -fLsS --ipv4 --connect-timeout 10 --max-time 45 "${SELF_RAW_URL%/*}/transparent_forward.py" -o "$tmp" || { rm -f "$tmp"; return 1; }
-  elif command -v wget >/dev/null 2>&1; then
-    wget -q --timeout=15 --tries=2 -O "$tmp" "${SELF_RAW_URL%/*}/transparent_forward.py" || { rm -f "$tmp"; return 1; }
-  else
-    rm -f "$tmp"; err_msg "curl or wget is required to install transparent forwarding." >&2; return 1
-  fi
-  if [ "$(sha256sum "$tmp" | awk '{print $1}')" != "$TRANSPARENT_SHA256" ]; then
-    rm -f "$tmp"; err_msg "Helper checksum mismatch. Upload matching GRETUN.sh and transparent_forward.py from the same release." >&2; return 1
-  fi
-  python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$tmp" || { rm -f "$tmp"; return 1; }
-  chmod 755 "$tmp" && mv -f -- "$tmp" "$target" || { rm -f "$tmp"; return 1; }
-  printf '%s' "$target"
-}
-
-transparent_module_path() {
-  local local_module
-  local_module="$(dirname -- "${BASH_SOURCE[0]}")/transparent_forward.py"
-  if [ -f "$local_module" ]; then printf '%s' "$local_module"
-  elif [ -f /usr/local/lib/gretun/transparent_forward.py ]; then printf '%s' /usr/local/lib/gretun/transparent_forward.py
-  else err_msg "Use the full ZIP and install-local.sh; the optional transparent module is missing." >&2; return 1
-  fi
-}
-
-transparent_guard() {
-  local scope="${1:-all}" module
-  compgen -G '/etc/gretun-transparent/profile-*.json' >/dev/null || return 0
-  module="$(transparent_module_path)" || return 1
-  python3 "$module" guard "$scope"
-}
-
-transparent_repair_routes() {
-  local iface="$1" module
-  compgen -G '/etc/gretun-transparent/profile-*.json' >/dev/null || return 0
-  module="$(transparent_module_path)" || return 1
-  python3 "$module" restore "$iface"
-}
-
-transparent_menu() {
-  local module
-  ensure_feature_dependencies "transparent-forward" "python3:python3" "ip:iproute2" "ss:iproute2" "iptables:iptables" "iptables-save:iptables" "conntrack:conntrack" "sha256sum:coreutils" || return 1
-  module="$(transparent_install_module)" || return 1
-  install_manager_binary || return 1
-  python3 "$module" auto
-}
-
 haproxy_menu() {
   haproxy_ensure_ready || return 1
   while true; do
@@ -6207,10 +5520,9 @@ haproxy_menu() {
     echo -e "  ${C_MAGENTA}6)${C_RESET} change protocol http/tcp ${C_DIM}(UDP auto-sync)${C_RESET}"
     echo -e "  ${C_CYAN}7)${C_RESET} optimize WebSocket / silent HAProxy no access-log"
     echo -e "  ${C_GREEN}8)${C_RESET} repair UDP for all TCP ports ${C_DIM}(detect + rebuild + verify)${C_RESET}"
-    echo -e "  ${C_GREEN}9)${C_RESET} Transparent client IP: ON / OFF (Iran / Outside)"
     echo -e "  ${C_DIM}00) Back to main menu${C_RESET}"
     echo
-    read -rp "Choose HAProxy option [1-9/00]: " HAP_CHOICE
+    read -rp "Choose HAProxy option [1-8/00]: " HAP_CHOICE
     case "$HAP_CHOICE" in
       1) haproxy_run_action haproxy_list_forwards || return 0 ;;
       2) haproxy_run_action haproxy_add_port || return 0 ;;
@@ -6220,7 +5532,6 @@ haproxy_menu() {
       6) haproxy_run_action haproxy_change_protocol || return 0 ;;
       7) haproxy_run_action haproxy_optimize_websocket_nolog || return 0 ;;
       8) haproxy_run_action haproxy_repair_udp || return 0 ;;
-      9) transparent_menu || true ;;
       00) return_main_msg; return 0 ;;
       *) err_msg "Invalid option"; sleep 1 ;;
     esac
@@ -6256,7 +5567,6 @@ performance_status() {
 }
 
 apply_capacity_profile() {
-  transparent_guard all || return 1
   mkdir -p /etc/sysctl.d /etc/systemd/system/haproxy.service.d 2>/dev/null || true
   cat > "$PERFORMANCE_SYSCTL_FILE" <<'EOF_PERFORMANCE'
 # GRETUN v12 balanced high-capacity profile. Buffer values are maxima, not pre-allocation.
@@ -6370,10 +5680,9 @@ show_menu() {
   echo -e "  ${C_YELLOW}7)${C_RESET} disconnect / error / restart logs"
   echo -e "  ${C_CYAN}8)${C_RESET} performance / capacity / migration tools"
   echo -e "  ${C_DIM}00) Main menu / back${C_RESET}"
-  echo -e "  ${C_GREEN}9)${C_RESET} Transparent client IP: ON / OFF (Iran / Outside)"
   echo -e "  ${C_DIM}0) Exit${C_RESET}"
   echo
-  read -rp "Choose an option [0-9]: " CHOICE
+  read -rp "Choose an option [0-8]: " CHOICE
   case "$CHOICE" in
     1) if run_maintenance_action menu_config_tunnel; then pause; fi ;;
     2) if run_maintenance_action remove_tun; then pause; fi ;;
@@ -6383,7 +5692,6 @@ show_menu() {
     6) haproxy_menu || true ;;
     7) diagnostics_menu || true ;;
     8) performance_menu || true ;;
-    9) transparent_menu || true ;;
     00) return_main_msg ;;
     0) echo "Bye"; exit 0 ;;
     *) err_msg "Invalid option"; sleep 1 ;;
@@ -6391,14 +5699,6 @@ show_menu() {
 }
 
 ### Script entry
-if [[ "${1:-}" == "--version" ]]; then printf '%s\n' "$APP_VERSION"; exit 0; fi
-if [[ "${1:-}" == "--transparent" ]]; then
-  ensure_root
-  transparent_menu
-  exit $?
-fi
-# Allow function-level tests without executing privileged startup.
-if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then return 0; fi
 if [[ "${1:-}" == "--fix-wg-port" ]]; then
   ensure_root
   run_maintenance_action wg_fix_peer_port "${2:-}" "${3:-}"
@@ -6407,11 +5707,6 @@ fi
 
 if [[ "${1:-}" == "--service" ]]; then
   case "${2:-}" in
-    prepare-backpack)
-      ensure_root
-      bp_preflight "${3:-}"
-      exit $?
-      ;;
     start-gre)
       ensure_root
       gre_service_start "${3:-}"
@@ -6466,6 +5761,7 @@ if [[ "${1:-}" == "--service" ]]; then
 fi
 
 ensure_root
+bootstrap_runtime_repairs >/dev/null 2>&1 || true
 while true; do
   show_menu
 done
