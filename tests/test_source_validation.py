@@ -29,3 +29,10 @@ class SourceValidation(unittest.TestCase):
     def test_outside_does_not_change_accept_local(self):
         p=self.plan();self.rp(p['iface']+'.accept').write_text('0');tp.stage(p,'outside')
         self.assertEqual(tp.accept_local_path(p['iface']).read_text(),'0')
+
+    def test_reset_check_allows_active_profiles(self):
+        tp.stage(self.plan(),'iran')
+        tp.reset_check()
+    def test_reset_check_rejects_incomplete_transaction(self):
+        p=self.plan();tp.stage(p,'iran');r=tp.load(p['id']);r['phase']='preparing';tp.save(r)
+        with self.assertRaises(tp.Error):tp.reset_check()

@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# GRE + GRE Plus + WireGuard + HAProxy tunnel manager v12.5.2
+# GRE + GRE Plus + WireGuard + HAProxy tunnel manager v12.5.3
 # v12.2.0: optional transparent TCP module with trial, connection-aware return routes and drain.
 # v12.1.1: Kharej generates the token; Iran pastes it visibly. Existing tokens preserved.
 # v12.1.0: deferred startup repairs, optional BackPack L3 adapter (ports=[]).
@@ -51,7 +51,7 @@ set -euo pipefail
 # - HAProxy fix: preserve an existing global maxconn, use the known-working defaults,
 #   and stop changing system limits or restarting HAProxy simply by opening its menu.
 
-APP_VERSION="12.5.2"
+APP_VERSION="12.5.3"
 
 GRE_CONFIG_DIR="/etc/gre-tunnels"
 GRE_LEGACY_CONF_FILE="/etc/gre-tunnel.conf"
@@ -4700,8 +4700,59 @@ test_tunnels_menu() {
 }
 
 
+# Reset restarts saved services; it must not regenerate protected WG files.
+wg_reset_saved_tunnel() {
+  local id="$1" ifc svc conf
+  ifc="$(wg_iface_name "$id")"; svc="$(wg_service_name "$id")"; conf="$(wg_config_file "$id")"
+  [ -s "$conf" ] || { err_msg "Missing saved WireGuard config: $conf"; return 1; }
+  wg_ensure_tools || return 1
+  wg_ensure_transport_ready "$id" || return 1
+  wg_apply_firewall_rules "$id" || return 1
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl enable "$svc" || return 1
+    systemctl restart "$svc" || { wg_print_service_failure "$id"; return 1; }
+  else
+    wg-quick up "$ifc" || return 1
+  fi
+  transparent_repair_routes "$ifc" || return 1
+  ip link show dev "$ifc" >/dev/null 2>&1
+}
+
+transparent_reset_check() {
+  local module
+  compgen -G '/etc/gretun-transparent/profile-*.json' >/dev/null || return 0
+  module="$(transparent_module_path)" || return 1
+  python3 "$module" reset-check
+}
+
+transparent_reset_restore() {
+  local module
+  compgen -G '/etc/gretun-transparent/profile-*.json' >/dev/null || return 0
+  module="$(transparent_module_path)" || return 1
+  python3 "$module" restore
+}
+
+reset_saved_configs_check() (
+  local id
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    gre_load_config "$id" || { err_msg "Cannot load GRE config $id; nothing stopped."; return 1; }
+  done < <(gre_collect_ids)
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    greplus_load_config "$id" || { err_msg "Cannot load GRE Plus config $id; nothing stopped."; return 1; }
+  done < <(greplus_collect_ids)
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    wg_load_meta "$id" || { err_msg "Cannot load WireGuard metadata $id; nothing stopped."; return 1; }
+    if [ -n "${REMOTE_WG_PUBLIC_KEY:-}" ] && [ ! -s "$(wg_config_file "$id")" ]; then
+      err_msg "Missing saved WireGuard config $id; nothing stopped."; return 1
+    fi
+  done < <(wg_collect_ids)
+)
+
 reset_all_tunnels() {
-  transparent_guard all || return 1
+  transparent_reset_check || return 1
   show_header "Reset All Tunnels"
   echo "This will restart/recreate all saved normal GRE, GRE Plus, WireGuard, and BackPack tunnels from their saved configs."
   echo "It will also re-enable their systemd services for boot."
@@ -4711,6 +4762,7 @@ reset_all_tunnels() {
     return
   fi
 
+  reset_saved_configs_check || return 1
   diagnostic_event "MANUAL" "manager" "manual reset-all started by operator"
 
   echo
@@ -4754,6 +4806,8 @@ reset_all_tunnels() {
       else
         failed=$((failed + 1)); echo "[WARN] GRE tunnel $id reset failed"
       fi
+    else
+      failed=$((failed + 1)); echo "[WARN] GRE tunnel $id config could not be loaded"
     fi
   done <<< "$ids"
 
@@ -4768,6 +4822,8 @@ reset_all_tunnels() {
       else
         failed=$((failed + 1)); echo "[WARN] GRE Plus tunnel $id reset failed"
       fi
+    else
+      failed=$((failed + 1)); echo "[WARN] GRE Plus tunnel $id config could not be loaded"
     fi
   done <<< "$ids"
 
@@ -4776,11 +4832,14 @@ reset_all_tunnels() {
   ids="$(wg_collect_ids || true)"
   while IFS= read -r id; do
     [ -n "$id" ] || continue
-    if wg_load_meta "$id" && [ -z "${REMOTE_WG_PUBLIC_KEY:-}" ]; then
+    if ! wg_load_meta "$id"; then
+      failed=$((failed + 1)); echo "[WARN] WireGuard tunnel $id metadata could not be loaded"; continue
+    fi
+    if [ -z "${REMOTE_WG_PUBLIC_KEY:-}" ]; then
       echo "[SKIP] WireGuard tunnel $id is pending peer key"
       continue
     fi
-    if wg_restart_one_tunnel "$id"; then
+    if wg_reset_saved_tunnel "$id"; then
       echo "[OK] WireGuard tunnel $id reset"
     else
       failed=$((failed + 1)); echo "[WARN] WireGuard tunnel $id reset failed"
@@ -4797,6 +4856,9 @@ reset_all_tunnels() {
       failed=$((failed + 1)); echo "[WARN] BackPack tunnel $id reset failed"
     fi
   done <<< "$ids"
+  if ! transparent_reset_restore; then
+    failed=$((failed + 1)); err_msg "Transparent route restore failed; inspect the error above."
+  fi
   if [ "$failed" -gt 0 ]; then err_msg "Reset completed with $failed tunnel failure(s)."; return 1; fi
   echo "[OK] Reset all finished."
   diagnostic_event "MANUAL" "manager" "manual reset-all finished"
@@ -5983,7 +6045,7 @@ haproxy_run_action() {
 }
 
 # Pinned to the helper shipped with this manager; mutable upstream cannot mix versions.
-TRANSPARENT_SHA256="913c1aa316f4963b390b83123f03f830566cfbb005b6d037df7697ae6410671e"
+TRANSPARENT_SHA256="e568763432828fd0cb42aec2b8317db3e4b2ee8a69c3e195d18e27bad7613474"
 transparent_install_module() {
   local target=/usr/local/lib/gretun/transparent_forward.py candidate tmp
   if [ -f "$target" ] && [ "$(sha256sum "$target" | awk '{print $1}')" = "$TRANSPARENT_SHA256" ]; then

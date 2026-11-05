@@ -22,7 +22,7 @@ import sys
 import tempfile
 import time
 
-VERSION = '12.5.2'
+VERSION = '12.5.3'
 STATE = Path('/etc/gretun-transparent')
 CONFIG = Path('/etc/haproxy/haproxy.cfg')
 MODULE = Path('/usr/local/lib/gretun/transparent_forward.py')
@@ -1184,11 +1184,26 @@ def menu():
                 with locked(): cleanup(identifier)
         else: print('Invalid option.')
 
+def reset_check():
+    for r in records():
+        validate_plan(r['plan'])
+        if r['phase'] not in ('active','trial','ready','draining'):
+            raise Error('Incomplete transparent transaction; recover before resetting tunnels: '+r['plan']['id'])
+        if r.get('wg'):
+            w=r['wg']; content=Path(w['path']).read_bytes()
+            if content!=Path(w['backup']).read_bytes() and hashlib.sha256(content).hexdigest()!=w['patched_hash']:
+                raise Error('Protected WireGuard config changed; reset cancelled before stopping tunnels.')
+    print('Transparent reset preflight passed; profiles and forwarding config will be preserved.')
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action',choices=['auto','serve-ready','menu','outside','iran','promote','drain','cleanup','status','restore','guard'],nargs='?',default='menu')
+    parser.add_argument('action',choices=['auto','serve-ready','menu','outside','iran','promote','drain','cleanup','status','restore','guard','reset-check'],nargs='?',default='menu')
     parser.add_argument('value',nargs='?')
     args=parser.parse_args()
+    if args.action=='reset-check':
+        with locked(): reset_check()
+        return 0
     if args.action=='guard':
         active=records()
         if active and (args.value in (None,'all','haproxy') or any(r['plan']['iface']==args.value for r in active)):
